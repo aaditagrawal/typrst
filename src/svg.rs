@@ -1,0 +1,178 @@
+//! SVG export of the display list (debug/preview route).
+use crate::ir::{DrawItem, FontId, Page};
+use std::fmt::Write;
+
+const GAP: f64 = 10.0;
+
+fn esc(s: &str, out: &mut String) {
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&apos;"),
+            _ => out.push(c),
+        }
+    }
+}
+
+fn num(v: f64) -> String {
+    let mut s = format!("{v:.2}");
+    if s.contains('.') {
+        while s.ends_with('0') {
+            s.pop();
+        }
+        if s.ends_with('.') {
+            s.pop();
+        }
+    }
+    if s == "-0" {
+        s = "0".into();
+    }
+    s
+}
+
+fn family(font: FontId) -> (&'static str, bool, bool) {
+    match font {
+        FontId::Regular => ("Helvetica", false, false),
+        FontId::Bold => ("Helvetica", true, false),
+        FontId::Italic => ("Helvetica", false, true),
+        FontId::BoldItalic => ("Helvetica", true, true),
+        FontId::Mono => ("Courier New, monospace", false, false),
+        FontId::MonoBold => ("Courier New, monospace", true, false),
+    }
+}
+
+pub fn render(pages: &[Page]) -> String {
+    let w = pages.iter().map(|p| p.width).fold(0.0, f64::max);
+    let h = pages.iter().map(|p| p.height).sum::<f64>()
+        + GAP * pages.len().saturating_sub(1) as f64;
+    let mut s = String::with_capacity(
+        256 + pages.iter().map(|p| p.items.len() * 96).sum::<usize>(),
+    );
+    writeln!(
+        s,
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{}\" height=\"{}\" viewBox=\"0 0 {} {}\">",
+        num(w),
+        num(h),
+        num(w),
+        num(h)
+    )
+    .unwrap();
+    let mut top = 0.0;
+    for page in pages {
+        writeln!(
+            s,
+            "<rect x=\"4\" y=\"{}\" width=\"{}\" height=\"{}\" fill=\"#d5d5d5\"/>",
+            num(top + 4.0),
+            num(page.width),
+            num(page.height)
+        )
+        .unwrap();
+        writeln!(
+            s,
+            "<rect x=\"0\" y=\"{}\" width=\"{}\" height=\"{}\" fill=\"#fff\" stroke=\"#bbb\" stroke-width=\"0.5\"/>",
+            num(top),
+            num(page.width),
+            num(page.height)
+        )
+        .unwrap();
+        for item in &page.items {
+            match item {
+                DrawItem::Text { x, y, font, size, text } => {
+                    let (fam, bold, italic) = family(*font);
+                    write!(
+                        s,
+                        "<text x=\"{}\" y=\"{}\" font-family=\"{}\" font-size=\"{}\"",
+                        num(*x),
+                        num(top + *y),
+                        fam,
+                        num(*size)
+                    )
+                    .unwrap();
+                    if bold {
+                        s.push_str(" font-weight=\"bold\"");
+                    }
+                    if italic {
+                        s.push_str(" font-style=\"italic\"");
+                    }
+                    s.push('>');
+                    esc(text, &mut s);
+                    s.push_str("</text>\n");
+                }
+            }
+        }
+        top += page.height + GAP;
+    }
+    s.push_str("</svg>\n");
+    s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pages() -> Vec<Page> {
+        vec![
+            Page {
+                width: 595.28,
+                height: 841.89,
+                items: vec![
+                    DrawItem::Text {
+                        x: 70.87,
+                        y: 85.0,
+                        font: FontId::Regular,
+                        size: 11.0,
+                        text: "a<b>&\"'".into(),
+                    },
+                    DrawItem::Text {
+                        x: 70.87,
+                        y: 99.3,
+                        font: FontId::BoldItalic,
+                        size: 16.0,
+                        text: "hi".into(),
+                    },
+                ],
+            },
+            Page {
+                width: 595.28,
+                height: 841.89,
+                items: vec![DrawItem::Text {
+                    x: 10.0,
+                    y: 20.0,
+                    font: FontId::Mono,
+                    size: 10.0,
+                    text: "code".into(),
+                }],
+            },
+        ]
+    }
+
+    #[test]
+    fn stacks_pages_and_escapes() {
+        let s = render(&pages());
+        assert!(s.starts_with("<svg xmlns="));
+        assert!(s.ends_with("</svg>\n"));
+        // viewBox height = 2 pages + 1 gap
+        assert!(s.contains("viewBox=\"0 0 595.28 1693.78\""));
+        // page rects
+        assert!(s.matches("<rect").count() == 4);
+        // text on page 1 keeps its y; page 2 text is offset by page height + gap
+        assert!(s.contains("x=\"70.87\" y=\"85\""));
+        assert!(s.contains("x=\"10\" y=\"871.89\""));
+        // styles
+        assert!(s.contains("font-family=\"Helvetica\""));
+        assert!(s.contains("font-weight=\"bold\" font-style=\"italic\""));
+        assert!(s.contains("font-family=\"Courier New, monospace\""));
+        // escaping
+        assert!(s.contains(">a&lt;b&gt;&amp;&quot;&apos;</text>"));
+    }
+
+    #[test]
+    fn empty_document() {
+        let s = render(&[]);
+        assert!(s.contains("viewBox=\"0 0 0 0\""));
+        assert!(s.ends_with("</svg>\n"));
+    }
+}
