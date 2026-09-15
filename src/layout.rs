@@ -35,6 +35,8 @@ fn bolden(f: FontId) -> FontId {
         FontId::Regular | FontId::Bold => FontId::Bold,
         FontId::Italic | FontId::BoldItalic => FontId::BoldItalic,
         FontId::Mono | FontId::MonoBold => FontId::MonoBold,
+        // Resolved faces have no base-14 sibling; keep the face as-is.
+        FontId::Ext(_) => f,
     }
 }
 
@@ -69,10 +71,10 @@ struct Lx<'a> {
     st: &'a Styles,
     pages: Vec<Page>,
     items: Vec<DrawItem>,
-    y: f64,          // baseline of the previous line (margin_top when fresh)
+    y: f64,           // baseline of the previous line (margin_top when fresh)
     pending_gap: f64, // inter-block spacing applied to the next line's delta
-    after: f64,      // trailing spacing of the previous block
-    fresh: bool,     // nothing drawn on this page yet (top spacing collapses)
+    after: f64,       // trailing spacing of the previous block
+    fresh: bool,      // nothing drawn on this page yet (top spacing collapses)
     toks: Vec<Tok<'a>>,
     lines: Vec<Line>,
 }
@@ -140,7 +142,10 @@ impl<'a> Lx<'a> {
                     HAlign::Left,
                     false,
                     None,
-                    &move |s: TextStyle| TextStyle { font: bolden(s.font), size },
+                    &move |s: TextStyle| TextStyle {
+                        font: bolden(s.font),
+                        size,
+                    },
                 );
                 self.after = 1.1;
             }
@@ -154,7 +159,10 @@ impl<'a> Lx<'a> {
                     } else {
                         "\u{2022}".to_string()
                     };
-                    let mst = TextStyle { font: FontId::Regular, size: self.st.font_size };
+                    let mst = TextStyle {
+                        font: FontId::Regular,
+                        size: self.st.font_size,
+                    };
                     // typst hangs the marker at the margin; item text starts
                     // after the marker + a 0.5em gap, continuations aligned.
                     let ind = self.m.str_width(mst.font, mst.size, &mk) + 0.5 * mst.size;
@@ -165,8 +173,7 @@ impl<'a> Lx<'a> {
                         HAlign::Left,
                         false,
                         Some((mk, mst, ml)),
-                        &ident
-
+                        &ident,
                     );
                 }
                 self.after = self.st.par_spacing;
@@ -201,6 +208,139 @@ impl<'a> Lx<'a> {
                 }
                 self.after = self.st.par_spacing;
             }
+            Block::Table {
+                columns,
+                cells,
+                stroke,
+            } => {
+                const IX: f64 = 5.0; // cell inset, horizontal
+                const IY: f64 = 4.0; // cell inset, vertical
+                const W: f64 = 0.5; // stroke weight
+                self.gap(0.0);
+                self.after = self.st.par_spacing;
+                if cells.is_empty() {
+                    return;
+                }
+                // Empty/absent column specs degrade to a single auto column;
+                // specs beyond `columns.len()` are treated as Auto.
+                let ncols = columns.len().max(1);
+                let total = self.text_w();
+                let mut widths = vec![0.0; ncols];
+                let mut used = 0.0;
+                let mut frsum = 0.0;
+                for c in 0..ncols {
+                    match columns.get(c).copied().unwrap_or(ColSpec::Auto) {
+                        ColSpec::Fixed(p) => widths[c] = p.max(0.0),
+                        ColSpec::Fr(f) => frsum += f,
+                        ColSpec::Auto => {
+                            // Sized to the widest single word + insets; cells
+                            // wrap, so multi-word text isn't measured whole.
+                            let mut w = 0.0f64;
+                            let mut i = c;
+                            while i < cells.len() {
+                                w = w.max(self.cell_word_w(&cells[i]));
+                                i += ncols;
+                            }
+                            widths[c] = w + 2.0 * IX;
+                        }
+                    }
+                    used += widths[c];
+                }
+                if frsum > 0.0 {
+                    let rem = (total - used).max(0.0);
+                    for (c, w) in widths.iter_mut().enumerate() {
+                        if let Some(ColSpec::Fr(f)) = columns.get(c).copied() {
+                            *w = rem * f / frsum;
+                        }
+                    }
+                }
+                let table_w: f64 = widths.iter().sum();
+                let limit = self.st.page_height - self.st.margin_bottom;
+                // Top edge of the next row: margin on a fresh page, else the
+                // previous baseline plus the collapsed inter-block gap.
+                let mut top = if self.fresh {
+                    self.st.margin_top
+                } else {
+                    self.y + self.pending_gap
+                };
+                self.pending_gap = 0.0;
+                let nrows = cells.len().div_ceil(ncols);
+                for r in 0..nrows {
+                    // Measure pass: row height = tallest cell.
+                    let mut row_h = 2.0 * IY;
+                    for c in 0..ncols {
+                        let i = r * ncols + c;
+                        if i >= cells.len() {
+                            break;
+                        }
+                        let (toks, lines) =
+                            self.cell_lines(&cells[i], (widths[c] - 2.0 * IX).max(0.0));
+                        let mut h = 2.0 * IY;
+                        for l in &lines {
+                            h += self.lh(self.extents(&toks, *l, None).0);
+                        }
+                        row_h = row_h.max(h);
+                    }
+                    // Rows are atomic; an oversized row just overflows.
+                    if !self.items.is_empty() && top + row_h > limit {
+                        self.finish_page();
+                        top = self.st.margin_top;
+                    }
+                    if *stroke {
+                        // Grid lines once per row: the top edge here, the
+                        // shared bottom edge after the last row (no doubled
+                        // lines), column edges spanning this row's height.
+                        self.items.push(DrawItem::Rule {
+                            x: ml,
+                            y: top,
+                            w: table_w,
+                            h: W,
+                            gray: 0.0,
+                        });
+                        let mut cx = ml;
+                        for c in 0..=ncols {
+                            self.items.push(DrawItem::Rule {
+                                x: cx,
+                                y: top,
+                                w: W,
+                                h: row_h,
+                                gray: 0.0,
+                            });
+                            if c < ncols {
+                                cx += widths[c];
+                            }
+                        }
+                    }
+                    // Emit pass: cell text, left aligned, body line height.
+                    let mut cx = ml;
+                    for c in 0..ncols {
+                        let i = r * ncols + c;
+                        if i < cells.len() {
+                            let (toks, lines) =
+                                self.cell_lines(&cells[i], (widths[c] - 2.0 * IX).max(0.0));
+                            let mut base = top + IY;
+                            for (k, l) in lines.iter().enumerate() {
+                                let (size, asc, _) = self.extents(&toks, *l, None);
+                                base += if k == 0 { asc } else { self.lh(size) };
+                                emit_line(&mut self.items, &toks, *l, cx + IX, base, 0.0, size);
+                            }
+                        }
+                        cx += widths[c];
+                    }
+                    top += row_h;
+                }
+                if *stroke {
+                    self.items.push(DrawItem::Rule {
+                        x: ml,
+                        y: top,
+                        w: table_w,
+                        h: W,
+                        gray: 0.0,
+                    });
+                }
+                self.y = top;
+                self.fresh = false;
+            }
             Block::VSpace(v) => {
                 self.pending_gap += self.after + v;
                 self.after = 0.0;
@@ -234,7 +374,13 @@ impl<'a> Lx<'a> {
         if n == 0 {
             if let Some((mt, mst, mx)) = marker.take() {
                 self.place_line(
-                    Line { start: 0, end: 0, w: 0.0, spaces: 0, hard: false },
+                    Line {
+                        start: 0,
+                        end: 0,
+                        w: 0.0,
+                        spaces: 0,
+                        hard: false,
+                    },
                     x0,
                     width,
                     align,
@@ -276,27 +422,7 @@ impl<'a> Lx<'a> {
         marker: Option<(&str, TextStyle, f64)>,
     ) {
         // line box extents from the tallest run
-        let mut size = 0.0f64;
-        let mut asc = 0.0f64;
-        let mut desc = 0.0f64;
-        let mut extent = |st: &TextStyle| {
-            size = size.max(st.size);
-            asc = asc.max(self.m.ascent(st.font) * st.size / 1000.0);
-            desc = desc.max(self.m.descent(st.font) * st.size / 1000.0);
-        };
-        for t in &self.toks[l.start..l.end] {
-            if let Tok::W(_, st, _) = t {
-                extent(st);
-            }
-        }
-        if let Some((_, st, _)) = &marker {
-            extent(st);
-        }
-        if size == 0.0 {
-            size = self.st.font_size;
-            asc = self.m.ascent(FontId::Regular) * size / 1000.0;
-            desc = self.m.descent(FontId::Regular) * size / 1000.0;
-        }
+        let (size, asc, desc) = self.extents(&self.toks, l, marker.map(|m| m.1));
         // Baseline delta = this line's own line height + inter-block gap.
         let mut baseline = if self.fresh {
             self.st.margin_top + asc
@@ -322,7 +448,7 @@ impl<'a> Lx<'a> {
             }
         }
         let slack = (width - l.w).max(0.0);
-        let mut x = x0
+        let x = x0
             + match align {
                 HAlign::Center => slack / 2.0,
                 HAlign::Right => slack,
@@ -337,60 +463,130 @@ impl<'a> Lx<'a> {
                 text: mt.to_string(),
             });
         }
-
-        let mut sep = Sep::Brk;
-        let mut buf = String::new();
-        let mut bx = 0.0;
-        let mut bs = TextStyle { font: FontId::Regular, size };
-        let mut has = false;
-        for t in &self.toks[l.start..l.end] {
-            match *t {
-                Tok::W(w, st, wid) => {
-                    if has && bs == st && sep != Sep::Brk {
-                        if sep == Sep::Sp {
-                            buf.push(' ');
-                        }
-                        buf.push_str(w);
-                    } else {
-                        if has {
-                            self.items.push(DrawItem::Text {
-                                x: bx,
-                                y: baseline,
-                                font: bs.font,
-                                size: bs.size,
-                                text: std::mem::take(&mut buf),
-                            });
-                        }
-                        bx = x;
-                        bs = st;
-                        buf.push_str(w);
-                        has = true;
-                    }
-                    x += wid;
-                    sep = Sep::Cat;
-                }
-                Tok::S(nat) => {
-                    x += if extra > 0.0 { nat + extra } else { nat };
-                    sep = if extra > 0.0 { Sep::Brk } else { Sep::Sp };
-                }
-                Tok::G(g) => {
-                    x += g;
-                    sep = Sep::Brk;
-                }
-                Tok::B => {}
-            }
-        }
-        if has {
-            self.items.push(DrawItem::Text {
-                x: bx,
-                y: baseline,
-                font: bs.font,
-                size: bs.size,
-                text: buf,
-            });
-        }
+        emit_line(&mut self.items, &self.toks, l, x, baseline, extra, size);
         self.y = baseline;
         self.fresh = false;
+    }
+
+    /// (size, ascent, descent) of a line's tallest run, in pt. Falls back to
+    /// the body font when the line has no word tokens.
+    fn extents(&self, toks: &[Tok], l: Line, marker: Option<TextStyle>) -> (f64, f64, f64) {
+        let mut size = 0.0f64;
+        let mut asc = 0.0f64;
+        let mut desc = 0.0f64;
+        let mut extent = |st: &TextStyle| {
+            size = size.max(st.size);
+            asc = asc.max(self.m.ascent(st.font) * st.size / 1000.0);
+            desc = desc.max(self.m.descent(st.font) * st.size / 1000.0);
+        };
+        for t in &toks[l.start..l.end] {
+            if let Tok::W(_, st, _) = t {
+                extent(st);
+            }
+        }
+        if let Some(st) = &marker {
+            extent(st);
+        }
+        if size == 0.0 {
+            size = self.st.font_size;
+            asc = self.m.ascent(FontId::Regular) * size / 1000.0;
+            desc = self.m.descent(FontId::Regular) * size / 1000.0;
+        }
+        (size, asc, desc)
+    }
+
+    /// Tokenize and wrap a table cell at the given width.
+    fn cell_lines(&self, cell: &'a [Inline], width: f64) -> (Vec<Tok<'a>>, Vec<Line>) {
+        let mut toks = Vec::new();
+        tokenize(&mut toks, cell, self.m, &ident);
+        let mut lines = Vec::new();
+        break_lines(&toks, width, &mut lines);
+        (toks, lines)
+    }
+
+    /// Widest single word in a cell — the `Auto` column measure.
+    fn cell_word_w(&self, cell: &[Inline]) -> f64 {
+        let mut w = 0.0f64;
+        for i in cell {
+            match i {
+                Inline::Text { text, style } => {
+                    for wd in text.split_whitespace() {
+                        w = w.max(self.m.str_width(style.font, style.size, wd));
+                    }
+                }
+                Inline::HSpace(g) => w = w.max(*g),
+                Inline::LineBreak => {}
+            }
+        }
+        w
+    }
+}
+
+/// Emit merged draw runs for one line of tokens starting at x on `baseline`.
+/// Adjacent same-style words merge into a single `DrawItem::Text`; `extra`
+/// is per-space justification stretch (0 for ragged-right).
+fn emit_line(
+    items: &mut Vec<DrawItem>,
+    toks: &[Tok],
+    l: Line,
+    mut x: f64,
+    baseline: f64,
+    extra: f64,
+    size: f64,
+) {
+    let mut sep = Sep::Brk;
+    let mut buf = String::new();
+    let mut bx = 0.0;
+    let mut bs = TextStyle {
+        font: FontId::Regular,
+        size,
+    };
+    let mut has = false;
+    for t in &toks[l.start..l.end] {
+        match *t {
+            Tok::W(w, st, wid) => {
+                if has && bs == st && sep != Sep::Brk {
+                    if sep == Sep::Sp {
+                        buf.push(' ');
+                    }
+                    buf.push_str(w);
+                } else {
+                    if has {
+                        items.push(DrawItem::Text {
+                            x: bx,
+                            y: baseline,
+                            font: bs.font,
+                            size: bs.size,
+                            text: std::mem::take(&mut buf),
+                        });
+                    }
+                    bx = x;
+                    bs = st;
+                    buf.push_str(w);
+                    has = true;
+                }
+                x += wid;
+                sep = Sep::Cat;
+            }
+            Tok::S(nat) => {
+                x += if extra > 0.0 { nat + extra } else { nat };
+                sep = if extra > 0.0 { Sep::Brk } else { Sep::Sp };
+            }
+            Tok::G(g) => {
+                x += g;
+                sep = Sep::Brk;
+            }
+            Tok::B => {}
+        }
+    }
+    if has {
+        items.push(DrawItem::Text {
+            x: bx,
+            y: baseline,
+            font: bs.font,
+            size: bs.size,
+            text: buf,
+        });
     }
 }
 
@@ -444,7 +640,13 @@ fn break_lines(toks: &[Tok], width: f64, lines: &mut Vec<Line>) {
         match toks[i] {
             Tok::W(_, _, ww) => {
                 if end > start && w + pend_w + ww > width {
-                    lines.push(Line { start, end, w, spaces: sp, hard: false });
+                    lines.push(Line {
+                        start,
+                        end,
+                        w,
+                        spaces: sp,
+                        hard: false,
+                    });
                     start = i;
                     end = i + 1;
                     w = ww;
@@ -468,7 +670,13 @@ fn break_lines(toks: &[Tok], width: f64, lines: &mut Vec<Line>) {
             }
             Tok::G(gw) => {
                 if end > start && w + pend_w + gw > width {
-                    lines.push(Line { start, end, w, spaces: sp, hard: false });
+                    lines.push(Line {
+                        start,
+                        end,
+                        w,
+                        spaces: sp,
+                        hard: false,
+                    });
                     i += 1;
                     start = i;
                     end = i;
@@ -487,7 +695,13 @@ fn break_lines(toks: &[Tok], width: f64, lines: &mut Vec<Line>) {
                 pend_n = 0;
             }
             Tok::B => {
-                lines.push(Line { start, end, w, spaces: sp, hard: true });
+                lines.push(Line {
+                    start,
+                    end,
+                    w,
+                    spaces: sp,
+                    hard: true,
+                });
                 i += 1;
                 start = i;
                 end = i;
@@ -499,7 +713,13 @@ fn break_lines(toks: &[Tok], width: f64, lines: &mut Vec<Line>) {
         }
     }
     if end > start {
-        lines.push(Line { start, end, w, spaces: sp, hard: false });
+        lines.push(Line {
+            start,
+            end,
+            w,
+            spaces: sp,
+            hard: false,
+        });
     }
 }
 
@@ -515,7 +735,12 @@ mod tests {
     }
 
     fn tdoc(blocks: Vec<Block>) -> Document {
-        Document { styles: Styles::default(), blocks, diags: vec![] }
+        Document {
+            styles: Styles::default(),
+            blocks,
+            diags: vec![],
+            fonts: vec![],
+        }
     }
 
     fn para(words: usize) -> Block {
@@ -523,7 +748,10 @@ mod tests {
         Block::Paragraph {
             content: vec![Inline::Text {
                 text,
-                style: TextStyle { font: FontId::Regular, size: 11.0 },
+                style: TextStyle {
+                    font: FontId::Regular,
+                    size: 11.0,
+                },
             }],
             align: HAlign::Left,
         }
@@ -532,10 +760,37 @@ mod tests {
     fn texts(p: &Page) -> Vec<(f64, f64, &str, FontId, f64)> {
         p.items
             .iter()
-            .map(|i| match i {
-                DrawItem::Text { x, y, font, size, text } => (*x, *y, text.as_str(), *font, *size),
+            .filter_map(|i| match i {
+                DrawItem::Text {
+                    x,
+                    y,
+                    font,
+                    size,
+                    text,
+                } => Some((*x, *y, text.as_str(), *font, *size)),
+                _ => None,
             })
             .collect()
+    }
+
+    fn rules(p: &Page) -> Vec<(f64, f64, f64, f64, f64)> {
+        p.items
+            .iter()
+            .filter_map(|i| match i {
+                DrawItem::Rule { x, y, w, h, gray } => Some((*x, *y, *w, *h, *gray)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn cell(t: &str) -> Vec<Inline> {
+        vec![Inline::Text {
+            text: t.into(),
+            style: TextStyle {
+                font: FontId::Regular,
+                size: 11.0,
+            },
+        }]
     }
 
     // Fake metrics: word "aaaa" = 4*500*11/1000 = 22pt; space = 5.5pt.
@@ -585,7 +840,10 @@ mod tests {
                 level: 1,
                 content: vec![Inline::Text {
                     text: "Title".into(),
-                    style: TextStyle { font: FontId::Regular, size: 11.0 },
+                    style: TextStyle {
+                        font: FontId::Regular,
+                        size: 11.0,
+                    },
                 }],
             },
             Block::List {
@@ -593,11 +851,17 @@ mod tests {
                 items: vec![
                     vec![Inline::Text {
                         text: "first".into(),
-                        style: TextStyle { font: FontId::Regular, size: 11.0 },
+                        style: TextStyle {
+                            font: FontId::Regular,
+                            size: 11.0,
+                        },
                     }],
                     vec![Inline::Text {
                         text: "second".into(),
-                        style: TextStyle { font: FontId::Regular, size: 11.0 },
+                        style: TextStyle {
+                            font: FontId::Regular,
+                            size: 11.0,
+                        },
                     }],
                 ],
             },
@@ -635,7 +899,10 @@ mod tests {
         let mut doc = tdoc(vec![Block::Paragraph {
             content: vec![Inline::Text {
                 text: "aaaa".into(),
-                style: TextStyle { font: FontId::Regular, size: 11.0 },
+                style: TextStyle {
+                    font: FontId::Regular,
+                    size: 11.0,
+                },
             }],
             align: HAlign::Center,
         }]);
@@ -650,7 +917,9 @@ mod tests {
     fn layout_raw_and_vspace() {
         let doc = tdoc(vec![
             para(1),
-            Block::RawBlock { text: "code\ntwo".into() },
+            Block::RawBlock {
+                text: "code\ntwo".into(),
+            },
             Block::VSpace(20.0),
             para(1),
         ]);
@@ -674,17 +943,26 @@ mod tests {
             content: vec![
                 Inline::Text {
                     text: "aa".into(),
-                    style: TextStyle { font: FontId::Regular, size: 11.0 },
+                    style: TextStyle {
+                        font: FontId::Regular,
+                        size: 11.0,
+                    },
                 },
                 Inline::HSpace(50.0),
                 Inline::Text {
                     text: "bb".into(),
-                    style: TextStyle { font: FontId::Regular, size: 11.0 },
+                    style: TextStyle {
+                        font: FontId::Regular,
+                        size: 11.0,
+                    },
                 },
                 Inline::LineBreak,
                 Inline::Text {
                     text: "cc".into(),
-                    style: TextStyle { font: FontId::Regular, size: 11.0 },
+                    style: TextStyle {
+                        font: FontId::Regular,
+                        size: 11.0,
+                    },
                 },
             ],
             align: HAlign::Left,
@@ -692,9 +970,111 @@ mod tests {
         let pages = layout(&doc, &Fake);
         let items = texts(&pages[0]);
         assert_eq!(items.len(), 3); // "aa", "bb", "cc"
-        // bb is 11pt (aa width) + 50pt h-space to the right
+                                    // bb is 11pt (aa width) + 50pt h-space to the right
         assert!((items[1].0 - items[0].0 - 11.0 - 50.0).abs() < 1e-6);
         // cc on next baseline
         assert!((items[2].1 - items[0].1 - 14.39).abs() < 1e-6);
+    }
+
+    // Table geometry with Fake metrics: cell inset 5/4pt, asc = 7.898,
+    // lh = 14.39 -> one-line row height = 22.39, first baseline inside a
+    // row = row_top + 4 + 7.898.
+
+    #[test]
+    fn table_fixed_columns() {
+        let doc = tdoc(vec![
+            Block::Table {
+                columns: vec![ColSpec::Fixed(100.0), ColSpec::Fixed(200.0)],
+                cells: vec![cell("aaaa"), cell("bbbb"), cell("cccc"), cell("dddd")],
+                stroke: false,
+            },
+            para(1),
+        ]);
+        let pages = layout(&doc, &Fake);
+        assert_eq!(pages.len(), 1);
+        let items = texts(&pages[0]);
+        assert_eq!(items.len(), 5);
+        assert!(rules(&pages[0]).is_empty());
+        // first baseline of row 1: margin_top + inset + ascent
+        assert!((items[0].1 - (70.866 + 4.0 + 7.898)).abs() < 1e-3);
+        // col 0 text at margin + inset; col 1 at margin + 100 + inset
+        assert!((items[0].0 - (70.866 + 5.0)).abs() < 1e-6);
+        assert!((items[1].0 - (70.866 + 100.0 + 5.0)).abs() < 1e-6);
+        assert_eq!(items[1].1, items[0].1); // same row, same baseline
+                                            // row 2 starts one row height (lh + 2*inset) lower
+        assert!((items[2].1 - items[0].1 - (14.39 + 8.0)).abs() < 1e-6);
+        assert!((items[3].0 - (70.866 + 100.0 + 5.0)).abs() < 1e-6);
+        // paragraph after the table: table bottom + lh + par_spacing
+        let bottom = 70.866 + 2.0 * 22.39;
+        assert!((items[4].1 - (bottom + 14.39 + 6.05)).abs() < 1e-3);
+    }
+
+    #[test]
+    fn table_auto_and_fr_columns() {
+        // "bbbbbb" = 33pt is the widest word -> auto col = 33 + 2*5 = 43.
+        // The fr column takes the rest: 453.544 - 43 = 410.544.
+        let doc = tdoc(vec![Block::Table {
+            columns: vec![ColSpec::Auto, ColSpec::Fr(1.0)],
+            cells: vec![cell("aaaa bbbbbb"), cell("cc")],
+            stroke: false,
+        }]);
+        let pages = layout(&doc, &Fake);
+        let items = texts(&pages[0]);
+        assert_eq!(items.len(), 3); // cell 0 wraps to "aaaa" / "bbbbbb"
+        let cc = items.iter().find(|i| i.2 == "cc").unwrap();
+        assert!((cc.0 - (70.866 + 43.0 + 5.0)).abs() < 1e-3);
+        let a = items.iter().find(|i| i.2 == "aaaa").unwrap();
+        let b = items.iter().find(|i| i.2 == "bbbbbb").unwrap();
+        assert!((a.0 - (70.866 + 5.0)).abs() < 1e-6);
+        assert!((b.1 - a.1 - 14.39).abs() < 1e-6); // wrapped, same column
+        assert_eq!(cc.1, a.1); // cells share the row's first baseline
+    }
+
+    #[test]
+    fn table_paginates_rows() {
+        // 40 single-line rows of 22.39pt; page fits 31 -> 31 + 9 rows.
+        let doc = tdoc(vec![Block::Table {
+            columns: vec![ColSpec::Fixed(200.0)],
+            cells: (0..40).map(|_| cell("aaaa")).collect(),
+            stroke: false,
+        }]);
+        let pages = layout(&doc, &Fake);
+        assert_eq!(pages.len(), 2);
+        assert_eq!(texts(&pages[0]).len(), 31);
+        let p2 = texts(&pages[1]);
+        assert_eq!(p2.len(), 9);
+        // continued rows start at the top margin again
+        assert!((p2[0].1 - (70.866 + 4.0 + 7.898)).abs() < 1e-3);
+    }
+
+    #[test]
+    fn table_stroke_rules() {
+        let doc = tdoc(vec![Block::Table {
+            columns: vec![ColSpec::Fixed(100.0), ColSpec::Fixed(200.0)],
+            cells: vec![cell("aaaa"), cell("bbbb"), cell("cccc"), cell("dddd")],
+            stroke: true,
+        }]);
+        let pages = layout(&doc, &Fake);
+        let rs = rules(&pages[0]);
+        // per row: 1 horizontal top edge + 3 column edges; +1 bottom edge.
+        assert_eq!(rs.len(), 9);
+        assert!(rs.iter().all(|r| r.4 == 0.0));
+        // table top edge spans the full 300pt
+        assert!(rs.iter().any(|r| (r.0 - 70.866).abs() < 1e-6
+            && (r.1 - 70.866).abs() < 1e-6
+            && (r.2 - 300.0).abs() < 1e-6
+            && (r.3 - 0.5).abs() < 1e-6));
+        // column boundaries at margin + 0 / 100 / 300, spanning row height
+        for x in [70.866, 170.866, 370.866] {
+            assert!(rs.iter().any(|r| (r.0 - x).abs() < 1e-6
+                && (r.1 - 70.866).abs() < 1e-6
+                && (r.2 - 0.5).abs() < 1e-6
+                && (r.3 - 22.39).abs() < 1e-3));
+        }
+        // shared bottom edge drawn once below the last row
+        let bottom = 70.866 + 2.0 * 22.39;
+        assert!(rs
+            .iter()
+            .any(|r| (r.1 - bottom).abs() < 1e-3 && (r.2 - 300.0).abs() < 1e-6));
     }
 }

@@ -1,16 +1,39 @@
 //! Markup parser: source text -> Vec<Node> (see ir.rs / SPEC.md).
-use crate::ir::{Arg, Diag, Expr, Length, Node, Severity, Span, Value};
+use crate::ir::{Arg, ArithOp, Cmp, CmpOp, Diag, Expr, Length, Node, Rhs, Severity, Span, Value};
 
 /// `#name` calls the parser accepts. Anything else (bound `#let` names
 /// aside) is a `not implemented` diagnostic.
 const IMPLEMENTED: &[&str] = &[
-    "lorem", "pagebreak", "v", "h", "linebreak", "strong", "emph", "text", "align",
+    "lorem",
+    "pagebreak",
+    "v",
+    "h",
+    "linebreak",
+    "strong",
+    "emph",
+    "text",
+    "align",
+    "table",
+    "grid",
+];
+
+/// Bare `#word` forms that are recognized but not implemented (rather
+/// than treated as variable references, which unknown `#ident`s become).
+const NOT_IMPL_BARE: &[&str] = &[
+    "show", "context", "state", "counter", "place", "figure", "link", "ref", "while", "else", "in",
+    "not", "and", "or", "return", "break", "continue",
 ];
 
 /// Parse Typst markup. Recovering: returns whatever nodes parsed plus
 /// diagnostics; never panics on bad input.
 pub fn parse(src: &str) -> (Vec<Node>, Vec<Diag>) {
-    let mut p = P { src, pos: 0, diags: Vec::new(), lets: Vec::new(), depth: 0 };
+    let mut p = P {
+        src,
+        pos: 0,
+        diags: Vec::new(),
+        lets: Vec::new(),
+        depth: 0,
+    };
     let nodes = p.body(false, 0);
     (nodes, p.diags)
 }
@@ -52,6 +75,49 @@ fn is_ident_cont(c: u8) -> bool {
     c == b'_' || c == b'-' || c.is_ascii_alphanumeric()
 }
 
+/// The name an `#import "spec"` module binds under: file stem for paths,
+/// package name for `@ns/name:ver`.
+fn spec_stem(spec: &str) -> String {
+    if spec.starts_with('@') {
+        spec.rsplit('/')
+            .next()
+            .and_then(|s| s.split(':').next())
+            .unwrap_or("module")
+            .to_string()
+    } else {
+        spec.rsplit('/')
+            .next()
+            .and_then(|s| s.rsplit_once('.').map(|(s, _)| s).or(Some(s)))
+            .unwrap_or("module")
+            .to_string()
+    }
+}
+
+/// Dotted name of a Var/Field rhs (`a.b.c`).
+fn rhs_name(r: &Rhs) -> Option<String> {
+    match r {
+        Rhs::Var(n) => Some(n.clone()),
+        Rhs::Field { base, name } => Some(format!("{}.{}", rhs_name(base)?, name)),
+        _ => None,
+    }
+}
+
+/// `Rhs` -> markup `Expr` for `#(expr)`: Var/Field collapse to a dotted
+/// `Expr::Var` (eval resolves fields through dicts), Bin/Lit map over.
+fn rhs_expr(r: Rhs) -> Expr {
+    match r {
+        Rhs::Lit(v) => Expr::Lit(v),
+        Rhs::Bin { lhs, op, rhs } => Expr::Bin {
+            lhs: *lhs,
+            op,
+            rhs: *rhs,
+        },
+        other => Expr::Var {
+            name: rhs_name(&other).unwrap_or_default(),
+        },
+    }
+}
+
 impl<'a> P<'a> {
     fn peek(&self) -> Option<u8> {
         self.src.as_bytes().get(self.pos).copied()
@@ -69,7 +135,10 @@ impl<'a> P<'a> {
         self.diags.push(Diag::new(sev, Some(self.span(a)), msg));
     }
     fn adv(&mut self) {
-        self.pos += self.src[self.pos..].chars().next().map_or(1, |c| c.len_utf8());
+        self.pos += self.src[self.pos..]
+            .chars()
+            .next()
+            .map_or(1, |c| c.len_utf8());
     }
     fn skip_hspace(&mut self) {
         while matches!(self.peek(), Some(b' ') | Some(b'\t') | Some(b'\r')) {
@@ -242,13 +311,21 @@ impl<'a> P<'a> {
             Some(b'/') if matches!(self.at(1), Some(b' ') | Some(b'\t')) => {
                 let a = self.pos;
                 self.skip_to_eol();
-                self.diag(Severity::NotImplemented, a, "term lists are not implemented");
+                self.diag(
+                    Severity::NotImplemented,
+                    a,
+                    "term lists are not implemented",
+                );
                 true
             }
             Some(c) if c.is_ascii_digit() && self.starts_block() => {
                 let a = self.pos;
                 self.skip_to_eol();
-                self.diag(Severity::NotImplemented, a, "numbered lists are not implemented");
+                self.diag(
+                    Severity::NotImplemented,
+                    a,
+                    "numbered lists are not implemented",
+                );
                 true
             }
             _ => false,
@@ -300,7 +377,10 @@ impl<'a> P<'a> {
             }
         }
         flush(out, text);
-        out.push(Node::Raw { text: body_txt.into(), block: true });
+        out.push(Node::Raw {
+            text: body_txt.into(),
+            block: true,
+        });
     }
 
     /// `- ` / `+ ` list. Items end at the next column-0 marker, a blank
@@ -391,8 +471,8 @@ impl<'a> P<'a> {
                     }
                 }
                 b'_' => {
-                    let boundary = self.pos == 0
-                        || !self.src.as_bytes()[self.pos - 1].is_ascii_alphanumeric();
+                    let boundary =
+                        self.pos == 0 || !self.src.as_bytes()[self.pos - 1].is_ascii_alphanumeric();
                     if boundary && self.marker(b'_', out, text, in_bracket) {
                     } else {
                         text.push('_');
@@ -469,7 +549,11 @@ impl<'a> P<'a> {
         }
         flush(&mut nodes, &mut t);
         flush(out, text);
-        out.push(if m == b'*' { Node::Strong(nodes) } else { Node::Emph(nodes) });
+        out.push(if m == b'*' {
+            Node::Strong(nodes)
+        } else {
+            Node::Emph(nodes)
+        });
         true
     }
 
@@ -570,7 +654,10 @@ impl<'a> P<'a> {
                     let t = self.src[self.pos + 1..i].to_string();
                     self.pos = i + 1;
                     flush(out, text);
-                    out.push(Node::Raw { text: t, block: false });
+                    out.push(Node::Raw {
+                        text: t,
+                        block: false,
+                    });
                     return;
                 }
                 b'\n' => break,
@@ -646,7 +733,11 @@ impl<'a> P<'a> {
         }
         if i > a + 1 {
             self.pos = i;
-            self.diag(Severity::NotImplemented, a, "references are not implemented");
+            self.diag(
+                Severity::NotImplemented,
+                a,
+                "references are not implemented",
+            );
             true
         } else {
             false
@@ -663,51 +754,11 @@ impl<'a> P<'a> {
                 match name.as_str() {
                     "let" => self.parse_let(a, out, text),
                     "set" => self.parse_set(a, out, text),
-                    _ => {
-                        let implemented = IMPLEMENTED.contains(&name.as_str())
-                            || self.lets.iter().any(|l| l == &name);
-                        if matches!(self.peek(), Some(b'(') | Some(b'[')) {
-                            let args = if self.peek() == Some(b'(') {
-                                self.args()
-                            } else {
-                                Vec::new()
-                            };
-                            let content = if self.peek() == Some(b'[') {
-                                let bs = self.pos;
-                                self.pos += 1;
-                                Some(self.body(true, bs))
-                            } else {
-                                None
-                            };
-                            if implemented {
-                                flush(out, text);
-                                out.push(Node::Expr(Expr::Func { name, args, content }));
-                            } else {
-                                self.diag(
-                                    Severity::NotImplemented,
-                                    a,
-                                    format!("#{name} is not implemented"),
-                                );
-                            }
-                        } else if self.lets.iter().any(|l| l == &name) {
-                            flush(out, text);
-                            out.push(Node::Expr(Expr::Var { name }));
-                        } else if IMPLEMENTED.contains(&name.as_str()) {
-                            flush(out, text);
-                            out.push(Node::Expr(Expr::Func {
-                                name,
-                                args: Vec::new(),
-                                content: None,
-                            }));
-                        } else {
-                            self.diag(
-                                Severity::NotImplemented,
-                                a,
-                                format!("#{name} is not implemented"),
-                            );
-                            self.skip_tail();
-                        }
-                    }
+                    "import" => self.parse_import(a, out, text),
+                    "include" => self.parse_include(a, out, text),
+                    "if" => self.parse_if(a, out, text),
+                    "for" => self.parse_for(a, out, text),
+                    _ => self.hash_call(a, name, out, text),
                 }
             }
             Some(b'"') => {
@@ -726,11 +777,538 @@ impl<'a> P<'a> {
                 }
             }
             Some(b'(') => {
+                // `#(expr)` — a parenthesized expression if it scans as
+                // `rhs )`, otherwise an array/dict/group literal.
+                let save = self.pos;
                 self.pos += 1;
-                self.skip_balanced(b'(', b')');
-                self.diag(Severity::NotImplemented, a, "code expressions are not implemented");
+                let mut handled = false;
+                if let Some(r) = self.rhs() {
+                    self.skip_ws();
+                    if self.peek() == Some(b')') {
+                        self.pos += 1;
+                        flush(out, text);
+                        out.push(Node::Expr(rhs_expr(r)));
+                        handled = true;
+                    }
+                }
+                if !handled {
+                    self.pos = save;
+                    match self.paren_value() {
+                        Some(v) => {
+                            flush(out, text);
+                            out.push(Node::Expr(Expr::Lit(v)));
+                        }
+                        None => self.diag(
+                            Severity::NotImplemented,
+                            a,
+                            "code expressions are not implemented",
+                        ),
+                    }
+                }
             }
             _ => text.push('#'),
+        }
+    }
+
+    /// `#name` — a function call, a variable reference (possibly with
+    /// `.field` access), or a spaced binary expression `#a + b`.
+    fn hash_call(&mut self, a: usize, name: String, out: &mut Vec<Node>, text: &mut String) {
+        let bound = self.lets.iter().any(|l| l == &name);
+        if matches!(self.peek(), Some(b'(') | Some(b'[')) {
+            let implemented = IMPLEMENTED.contains(&name.as_str()) || bound;
+            let args = if self.peek() == Some(b'(') {
+                self.args()
+            } else {
+                Vec::new()
+            };
+            let content = if self.peek() == Some(b'[') {
+                let bs = self.pos;
+                self.pos += 1;
+                Some(self.body(true, bs))
+            } else {
+                None
+            };
+            if implemented {
+                flush(out, text);
+                out.push(Node::Expr(Expr::Func {
+                    name,
+                    args,
+                    content,
+                }));
+            } else {
+                self.diag(
+                    Severity::NotImplemented,
+                    a,
+                    format!("#{name} is not implemented"),
+                );
+            }
+        } else if bound
+            || !(IMPLEMENTED.contains(&name.as_str()) || NOT_IMPL_BARE.contains(&name.as_str()))
+        {
+            // `#var`, `#var.field`, `#a + b`. Unknown names still parse as
+            // `Expr::Var` — eval reports "undefined variable" (this also
+            // covers names bound via `#import "..": *`).
+            let mut dotted = name;
+            let mut lhs = Rhs::Var(dotted.clone());
+            while self.peek() == Some(b'.') && self.at(1).map_or(false, is_ident_start) {
+                self.pos += 1;
+                let f = self.ident().unwrap();
+                dotted.push('.');
+                dotted.push_str(&f);
+                lhs = Rhs::Field {
+                    base: Box::new(lhs),
+                    name: f,
+                };
+            }
+            let save = self.pos;
+            self.skip_hspace();
+            if self.pos > save {
+                if let Some(op) = self.arith_op() {
+                    self.skip_hspace();
+                    if self.rhs_starts() {
+                        if let Some(rhs) = self.rhs() {
+                            flush(out, text);
+                            out.push(Node::Expr(Expr::Bin { lhs, op, rhs }));
+                            return;
+                        }
+                    }
+                }
+            }
+            self.pos = save;
+            flush(out, text);
+            out.push(Node::Expr(Expr::Var { name: dotted }));
+        } else if IMPLEMENTED.contains(&name.as_str()) {
+            flush(out, text);
+            out.push(Node::Expr(Expr::Func {
+                name,
+                args: Vec::new(),
+                content: None,
+            }));
+        } else {
+            self.diag(
+                Severity::NotImplemented,
+                a,
+                format!("#{name} is not implemented"),
+            );
+            self.skip_tail();
+        }
+    }
+
+    /// `#import "path" [: a, b | *]` — or `"@ns/name:ver"` package spec.
+    fn parse_import(&mut self, a: usize, out: &mut Vec<Node>, text: &mut String) {
+        self.skip_hspace();
+        if self.peek() != Some(b'"') {
+            self.diag(Severity::Error, a, "expected a string after `#import`");
+            self.skip_to_eol();
+            return;
+        }
+        let path = self.string(self.pos);
+        self.skip_hspace();
+        let mut items = Vec::new();
+        let mut all = false;
+        if self.peek() == Some(b':') {
+            self.pos += 1;
+            self.skip_hspace();
+            if self.peek() == Some(b'*') {
+                self.pos += 1;
+                all = true;
+            } else {
+                loop {
+                    self.skip_hspace();
+                    match self.ident() {
+                        Some(n) => items.push(n),
+                        None => break,
+                    }
+                    self.skip_hspace();
+                    if self.peek() == Some(b',') {
+                        self.pos += 1;
+                    } else {
+                        break;
+                    }
+                }
+            }
+        }
+        // Register names bound by the import so later `#name` parses as a
+        // variable. With `*` the names are unknown at parse time; the
+        // generic `#ident` -> Var fallback in hash_call covers them.
+        if all {
+        } else if items.is_empty() {
+            self.lets.push(spec_stem(&path));
+        } else {
+            self.lets.extend(items.iter().cloned());
+        }
+        flush(out, text);
+        out.push(Node::Expr(Expr::Import { path, items, all }));
+    }
+
+    /// `#include "path"` — emits `#include("path")` with no parens in source.
+    fn parse_include(&mut self, a: usize, out: &mut Vec<Node>, text: &mut String) {
+        self.skip_hspace();
+        if self.peek() != Some(b'"') {
+            self.diag(Severity::Error, a, "expected a string after `#include`");
+            self.skip_to_eol();
+            return;
+        }
+        let path = self.string(self.pos);
+        flush(out, text);
+        out.push(Node::Expr(Expr::Func {
+            name: "include".into(),
+            args: vec![Arg {
+                name: None,
+                value: Value::Str(path),
+            }],
+            content: None,
+        }));
+    }
+
+    /// `#if cond [..] else if cond [..] else [..]`.
+    fn parse_if(&mut self, a: usize, out: &mut Vec<Node>, text: &mut String) {
+        let mut arms = Vec::new();
+        let mut els = None;
+        loop {
+            let Some(c) = self.cmp() else {
+                self.diag(Severity::Error, a, "expected a condition after `#if`");
+                break;
+            };
+            self.skip_ws();
+            if self.peek() != Some(b'[') {
+                self.diag(Severity::Error, a, "expected `[` after `#if` condition");
+                break;
+            }
+            let bs = self.pos;
+            self.pos += 1;
+            arms.push((c, self.body(true, bs)));
+            let save = self.pos;
+            self.gap();
+            if self.ident().as_deref() != Some("else") {
+                self.pos = save;
+                break;
+            }
+            self.gap();
+            if self.ident().as_deref() == Some("if") {
+                continue;
+            }
+            self.skip_ws();
+            if self.peek() == Some(b'[') {
+                let bs = self.pos;
+                self.pos += 1;
+                els = Some(self.body(true, bs));
+            } else {
+                self.diag(Severity::Error, a, "expected `[` or `if` after `else`");
+            }
+            break;
+        }
+        if !arms.is_empty() || els.is_some() {
+            flush(out, text);
+            out.push(Node::Expr(Expr::If { arms, els }));
+        }
+    }
+
+    /// `#for x in expr [..]` / `#for (k, v) in expr [..]`.
+    fn parse_for(&mut self, a: usize, out: &mut Vec<Node>, text: &mut String) {
+        self.skip_hspace();
+        let mut vars = Vec::new();
+        if self.peek() == Some(b'(') {
+            self.pos += 1;
+            loop {
+                self.skip_ws();
+                if let Some(n) = self.ident() {
+                    vars.push(n);
+                }
+                self.skip_ws();
+                match self.peek() {
+                    Some(b',') => self.pos += 1,
+                    Some(b')') => {
+                        self.pos += 1;
+                        break;
+                    }
+                    _ => break,
+                }
+            }
+        } else if let Some(n) = self.ident() {
+            vars.push(n);
+        }
+        if vars.is_empty() {
+            self.diag(Severity::Error, a, "expected a variable after `#for`");
+            self.skip_to_eol();
+            return;
+        }
+        self.skip_hspace();
+        if self.ident().as_deref() != Some("in") {
+            self.diag(Severity::Error, a, "expected `in` in `#for`");
+            self.skip_to_eol();
+            return;
+        }
+        let Some(iter) = self.rhs() else {
+            self.diag(Severity::Error, a, "expected an expression after `in`");
+            self.skip_to_eol();
+            return;
+        };
+        self.skip_ws();
+        if self.peek() != Some(b'[') {
+            self.diag(Severity::Error, a, "expected `[` after `#for` expression");
+            self.skip_to_eol();
+            return;
+        }
+        let bs = self.pos;
+        self.pos += 1;
+        // Register loop vars before parsing the body so `#var` resolves.
+        self.lets.extend(vars.iter().cloned());
+        let body = self.body(true, bs);
+        flush(out, text);
+        out.push(Node::Expr(Expr::For { vars, iter, body }));
+    }
+
+    /// A condition: `[not] rhs (cmp-op rhs)?`. Bare `#if x` desugars to
+    /// `x != none` (eval treats it as a truthiness test).
+    fn cmp(&mut self) -> Option<Cmp> {
+        self.skip_ws();
+        let save = self.pos;
+        let negated = self.ident().as_deref() == Some("not");
+        if !negated {
+            self.pos = save;
+        }
+        let lhs = self.rhs()?;
+        self.skip_ws();
+        let (op, adv) = match self.peek() {
+            Some(b'=') if self.at(1) == Some(b'=') => (CmpOp::Eq, 2),
+            Some(b'!') if self.at(1) == Some(b'=') => (CmpOp::Ne, 2),
+            Some(b'<') if self.at(1) == Some(b'=') => (CmpOp::Le, 2),
+            Some(b'>') if self.at(1) == Some(b'=') => (CmpOp::Ge, 2),
+            Some(b'<') => (CmpOp::Lt, 1),
+            Some(b'>') => (CmpOp::Gt, 1),
+            _ => (CmpOp::Ne, 0),
+        };
+        self.pos += adv;
+        let rhs = if adv > 0 {
+            self.rhs()?
+        } else {
+            Rhs::Lit(Value::None)
+        };
+        Some(Cmp {
+            lhs,
+            op,
+            rhs,
+            negated,
+        })
+    }
+
+    /// Right-hand side: `mul-level` terms joined by `+`/`-`, folded left.
+    fn rhs(&mut self) -> Option<Rhs> {
+        let mut lhs = self.rhs_mul()?;
+        loop {
+            let save = self.pos;
+            self.skip_ws();
+            let op = match self.peek() {
+                Some(b'+') => ArithOp::Add,
+                Some(b'-') => ArithOp::Sub,
+                _ => {
+                    self.pos = save;
+                    break;
+                }
+            };
+            self.pos += 1;
+            self.skip_ws();
+            match self.rhs_mul() {
+                Some(r) => {
+                    lhs = Rhs::Bin {
+                        lhs: Box::new(lhs),
+                        op,
+                        rhs: Box::new(r),
+                    }
+                }
+                None => {
+                    self.pos = save;
+                    break;
+                }
+            }
+        }
+        Some(lhs)
+    }
+
+    /// `*`/`/` level of an rhs, folded left.
+    fn rhs_mul(&mut self) -> Option<Rhs> {
+        let mut lhs = self.rhs_term()?;
+        loop {
+            let save = self.pos;
+            self.skip_ws();
+            let op = match self.peek() {
+                Some(b'*') => ArithOp::Mul,
+                Some(b'/') if !matches!(self.at(1), Some(b'/') | Some(b'*')) => ArithOp::Div,
+                _ => {
+                    self.pos = save;
+                    break;
+                }
+            };
+            self.pos += 1;
+            self.skip_ws();
+            match self.rhs_term() {
+                Some(r) => {
+                    lhs = Rhs::Bin {
+                        lhs: Box::new(lhs),
+                        op,
+                        rhs: Box::new(r),
+                    }
+                }
+                None => {
+                    self.pos = save;
+                    break;
+                }
+            }
+        }
+        Some(lhs)
+    }
+
+    /// One operand: literal, `var`, `var.field`, `(...)`, or `[content]`.
+    fn rhs_term(&mut self) -> Option<Rhs> {
+        self.skip_ws();
+        match self.peek()? {
+            b'(' => self.paren_value().map(Rhs::Lit),
+            b'"' => Some(Rhs::Lit(Value::Str(self.string(self.pos)))),
+            b'[' => {
+                let bs = self.pos;
+                self.pos += 1;
+                Some(Rhs::Lit(Value::Content(self.body(true, bs))))
+            }
+            c if c.is_ascii_digit()
+                || (matches!(c, b'-' | b'+')
+                    && self.at(1).map_or(false, |d| d.is_ascii_digit()))
+                || (c == b'.' && self.at(1).map_or(false, |d| d.is_ascii_digit())) =>
+            {
+                self.number().map(Rhs::Lit)
+            }
+            c if is_ident_start(c) => {
+                let n = self.ident().unwrap();
+                let mut r = match n.as_str() {
+                    "true" => Rhs::Lit(Value::Bool(true)),
+                    "false" => Rhs::Lit(Value::Bool(false)),
+                    "none" | "auto" => Rhs::Lit(Value::None),
+                    _ => Rhs::Var(n),
+                };
+                while self.peek() == Some(b'.') && self.at(1).map_or(false, is_ident_start) {
+                    self.pos += 1;
+                    let f = self.ident().unwrap();
+                    r = Rhs::Field {
+                        base: Box::new(r),
+                        name: f,
+                    };
+                }
+                Some(r)
+            }
+            _ => None,
+        }
+    }
+
+    /// Does an rhs operand start here?
+    fn rhs_starts(&self) -> bool {
+        match self.peek() {
+            Some(b'"') | Some(b'(') | Some(b'[') => true,
+            Some(c) if c.is_ascii_digit() || is_ident_start(c) => true,
+            Some(b'-') | Some(b'+') => self.at(1).map_or(false, |d| d.is_ascii_digit()),
+            Some(b'.') => self.at(1).map_or(false, |d| d.is_ascii_digit()),
+            _ => false,
+        }
+    }
+
+    /// `+` `-` `*` `/` — but `/` must not start a `//` or `/*` comment.
+    fn arith_op(&mut self) -> Option<ArithOp> {
+        let op = match self.peek()? {
+            b'+' => ArithOp::Add,
+            b'-' => ArithOp::Sub,
+            b'*' => ArithOp::Mul,
+            b'/' if !matches!(self.at(1), Some(b'/') | Some(b'*')) => ArithOp::Div,
+            _ => return None,
+        };
+        self.pos += 1;
+        Some(op)
+    }
+
+    /// `( a, b, ... )` literal: dict if any item is `name: value`, array
+    /// if >1 items or a trailing comma, otherwise a plain group.
+    fn paren_value(&mut self) -> Option<Value> {
+        self.pos += 1;
+        self.depth += 1;
+        let v = self.paren_inner();
+        self.depth -= 1;
+        v
+    }
+
+    fn paren_inner(&mut self) -> Option<Value> {
+        if self.depth > 250 {
+            self.diag(Severity::Error, self.pos, "expression nested too deeply");
+            self.skip_balanced(b'(', b')');
+            return None;
+        }
+        let mut items: Vec<Arg> = Vec::new();
+        let mut trailing = false;
+        loop {
+            self.skip_ws();
+            match self.peek() {
+                None => {
+                    self.diag(Severity::Error, self.pos, "unclosed `(`");
+                    return None;
+                }
+                Some(b')') => {
+                    self.pos += 1;
+                    break;
+                }
+                _ => {}
+            }
+            let mut name = None;
+            let save = self.pos;
+            if let Some(n) = self.ident() {
+                self.skip_hspace();
+                if self.peek() == Some(b':') {
+                    self.pos += 1;
+                    name = Some(n);
+                } else {
+                    self.pos = save;
+                }
+            }
+            match self.value() {
+                Some(v) => items.push(Arg { name, value: v }),
+                None => {
+                    self.diag(Severity::Error, self.pos, "expected a value");
+                    self.recover_arg();
+                }
+            }
+            self.skip_ws();
+            match self.peek() {
+                Some(b',') => {
+                    self.pos += 1;
+                    let s2 = self.pos;
+                    self.skip_ws();
+                    if self.peek() == Some(b')') {
+                        self.pos += 1;
+                        trailing = true;
+                        break;
+                    }
+                    self.pos = s2;
+                }
+                Some(b')') | None => {}
+                _ => {
+                    self.diag(Severity::Error, self.pos, "expected `,` or `)`");
+                    self.recover_arg();
+                }
+            }
+        }
+        if items.iter().any(|a| a.name.is_some()) {
+            let mut ps = Vec::new();
+            for a in items {
+                match a.name {
+                    Some(k) => ps.push((k, a.value)),
+                    None => self.diag(
+                        Severity::Warning,
+                        self.pos,
+                        "positional item ignored in dict literal",
+                    ),
+                }
+            }
+            Some(Value::Dict(ps))
+        } else if items.len() == 1 && !trailing {
+            Some(items.pop().unwrap().value)
+        } else {
+            Some(Value::Array(items.into_iter().map(|a| a.value).collect()))
         }
     }
 
@@ -768,20 +1346,64 @@ impl<'a> P<'a> {
             return;
         };
         self.skip_hspace();
+        if self.peek() == Some(b'(') {
+            // `#let f(..) = ..` — function definitions are out of scope.
+            self.pos += 1;
+            self.skip_balanced(b'(', b')');
+            self.skip_hspace();
+            if self.peek() == Some(b'=') {
+                self.pos += 1;
+                self.skip_hspace();
+            }
+            match self.peek() {
+                Some(b'[') => {
+                    self.pos += 1;
+                    self.skip_balanced(b'[', b']');
+                }
+                Some(b'(') => {
+                    self.pos += 1;
+                    self.skip_balanced(b'(', b')');
+                }
+                Some(b'"') => {
+                    self.string(self.pos);
+                }
+                _ => self.skip_to_eol(),
+            }
+            self.diag(
+                Severity::NotImplemented,
+                a,
+                "#let function definitions are not implemented",
+            );
+            return;
+        }
         if self.peek() != Some(b'=') {
             self.diag(Severity::Error, a, "expected `=` in `#let`");
             self.skip_to_eol();
             return;
         }
         self.pos += 1;
-        match self.value() {
+        match self.rhs() {
             Some(v) => {
                 self.lets.push(name.clone());
                 flush(out, text);
                 out.push(Node::Expr(Expr::Let { name, value: v }));
+                // A trailing `(..)` is a function call — not implemented.
+                let save = self.pos;
+                self.skip_hspace();
+                if self.peek() == Some(b'(') {
+                    self.pos += 1;
+                    self.skip_balanced(b'(', b')');
+                    self.diag(
+                        Severity::NotImplemented,
+                        a,
+                        "function calls in `#let` are not implemented",
+                    );
+                } else {
+                    self.pos = save;
+                }
             }
             None => {
-                self.diag(Severity::Error, a, "expected a literal value in `#let`");
+                self.diag(Severity::Error, a, "expected a value in `#let`");
                 self.skip_to_eol();
             }
         }
@@ -825,9 +1447,8 @@ impl<'a> P<'a> {
         args
     }
 
-    /// Arg list body after `(` is consumed. A parenthesized group value
-    /// `(x: L, ...)` becomes `Value::Content` holding `Expr::Func{key,
-    /// [value]}` nodes (eval's dict encoding).
+    /// Arg list body after `(` is consumed. Nested `(x: v, ...)` groups
+    /// become `Value::Dict`/`Value::Array` via `paren_value`.
     fn arg_list(&mut self) -> Vec<Arg> {
         if self.depth > 250 {
             self.diag(Severity::Error, self.pos, "arguments nested too deeply");
@@ -860,25 +1481,7 @@ impl<'a> P<'a> {
                 }
             }
             self.skip_ws();
-            if self.peek() == Some(b'(') {
-                self.pos += 1;
-                self.depth += 1;
-                let inner = self.arg_list();
-                self.depth -= 1;
-                let mut ns = Vec::new();
-                for a2 in inner {
-                    let node = match a2.name {
-                        Some(k) => Node::Expr(Expr::Func {
-                            name: k,
-                            args: vec![Arg { name: None, value: a2.value }],
-                            content: None,
-                        }),
-                        None => Node::Expr(Expr::Lit(a2.value)),
-                    };
-                    ns.push(node);
-                }
-                args.push(Arg { name, value: Value::Content(ns) });
-            } else if let Some(v) = self.value() {
+            if let Some(v) = self.value() {
                 args.push(Arg { name, value: v });
             } else {
                 self.diag(Severity::Error, self.pos, "expected a value");
@@ -957,18 +1560,21 @@ impl<'a> P<'a> {
     }
 
     /// A literal value: string, number/length, bool/none/auto, `[content]`,
-    /// or a bare identifier (stored as `Value::Str`, e.g. `center`).
+    /// a `(...)` array/dict/group, or a bare identifier (stored as
+    /// `Value::Str`, e.g. `center`).
     fn value(&mut self) -> Option<Value> {
         self.skip_ws();
         match self.peek()? {
             b'"' => Some(Value::Str(self.string(self.pos))),
+            b'(' => self.paren_value(),
             b'[' => {
                 let bs = self.pos;
                 self.pos += 1;
                 Some(Value::Content(self.body(true, bs)))
             }
             c if c.is_ascii_digit()
-                || (matches!(c, b'-' | b'+') && self.at(1).map_or(false, |d| d.is_ascii_digit()))
+                || (matches!(c, b'-' | b'+')
+                    && self.at(1).map_or(false, |d| d.is_ascii_digit()))
                 || (c == b'.' && self.at(1).map_or(false, |d| d.is_ascii_digit())) =>
             {
                 self.number()
@@ -1073,6 +1679,9 @@ impl<'a> P<'a> {
             "mm" => Value::Length(Length::Pt(v * 2.83465)),
             "cm" => Value::Length(Length::Pt(v * 28.3465)),
             "in" => Value::Length(Length::Pt(v * 72.0)),
+            // `1fr` column fractions — no Value variant exists, so they
+            // are encoded as strings and recognized by table/grid eval.
+            "fr" => Value::Str(format!("{v}fr")),
             _ => {
                 self.diag(Severity::Warning, us, format!("unknown unit `{unit}`"));
                 plain()
@@ -1095,8 +1704,20 @@ mod tests {
 
     #[test]
     fn headings() {
-        assert_eq!(nodes("= A"), vec![Node::Heading { level: 1, body: vec![t("A")] }]);
-        assert_eq!(nodes("====== A"), vec![Node::Heading { level: 6, body: vec![t("A")] }]);
+        assert_eq!(
+            nodes("= A"),
+            vec![Node::Heading {
+                level: 1,
+                body: vec![t("A")]
+            }]
+        );
+        assert_eq!(
+            nodes("====== A"),
+            vec![Node::Heading {
+                level: 6,
+                body: vec![t("A")]
+            }]
+        );
         assert_eq!(nodes("======= A"), vec![t("======= A")]);
         assert_eq!(nodes("=x"), vec![t("=x")]);
     }
@@ -1105,11 +1726,19 @@ mod tests {
     fn strong_emph_nesting() {
         assert_eq!(
             nodes("*a _b_ c*"),
-            vec![Node::Strong(vec![t("a "), Node::Emph(vec![t("b")]), t(" c")])]
+            vec![Node::Strong(vec![
+                t("a "),
+                Node::Emph(vec![t("b")]),
+                t(" c")
+            ])]
         );
         assert_eq!(
             nodes("_a *b* c_"),
-            vec![Node::Emph(vec![t("a "), Node::Strong(vec![t("b")]), t(" c")])]
+            vec![Node::Emph(vec![
+                t("a "),
+                Node::Strong(vec![t("b")]),
+                t(" c")
+            ])]
         );
     }
 
@@ -1158,25 +1787,34 @@ mod tests {
     #[test]
     fn escapes_and_breaks() {
         assert_eq!(nodes("\\* \\` \\# \\\\ \\/"), vec![t("* ` # \\ /")]);
-        assert_eq!(
-            nodes("a\\ b"),
-            vec![t("a"), Node::LineBreak, t("b")]
-        );
-        assert_eq!(
-            nodes("a\\\nb"),
-            vec![t("a"), Node::LineBreak, t("b")]
-        );
+        assert_eq!(nodes("a\\ b"), vec![t("a"), Node::LineBreak, t("b")]);
+        assert_eq!(nodes("a\\\nb"), vec![t("a"), Node::LineBreak, t("b")]);
     }
 
     #[test]
     fn raw() {
-        assert_eq!(nodes("`x`"), vec![Node::Raw { text: "x".into(), block: false }]);
+        assert_eq!(
+            nodes("`x`"),
+            vec![Node::Raw {
+                text: "x".into(),
+                block: false
+            }]
+        );
         assert_eq!(
             nodes("```rust\nfn main() {}\n```"),
-            vec![Node::Raw { text: "fn main() {}".into(), block: true }]
+            vec![Node::Raw {
+                text: "fn main() {}".into(),
+                block: true
+            }]
         );
         let (n, d) = parse("```\nabc");
-        assert_eq!(n, vec![Node::Raw { text: "abc".into(), block: true }]);
+        assert_eq!(
+            n,
+            vec![Node::Raw {
+                text: "abc".into(),
+                block: true
+            }]
+        );
         assert_eq!(d.len(), 1);
         assert_eq!(d[0].severity, Severity::Warning);
     }
@@ -1196,7 +1834,10 @@ mod tests {
             vec![Node::Expr(Expr::Set {
                 target: "page".into(),
                 args: vec![
-                    Arg { name: Some("paper".into()), value: Value::Str("a4".into()) },
+                    Arg {
+                        name: Some("paper".into()),
+                        value: Value::Str("a4".into())
+                    },
                     Arg {
                         name: Some("margin".into()),
                         value: Value::Length(Length::Pt(2.0 * 28.3465)),
@@ -1208,7 +1849,10 @@ mod tests {
         assert_eq!(
             nodes("#let x = \"hi\"\n#x"),
             vec![
-                Node::Expr(Expr::Let { name: "x".into(), value: Value::Str("hi".into()) }),
+                Node::Expr(Expr::Let {
+                    name: "x".into(),
+                    value: Rhs::Lit(Value::Str("hi".into())),
+                }),
                 t(" "),
                 Node::Expr(Expr::Var { name: "x".into() }),
             ]
@@ -1218,7 +1862,10 @@ mod tests {
             nodes("#lorem(10)"),
             vec![Node::Expr(Expr::Func {
                 name: "lorem".into(),
-                args: vec![Arg { name: None, value: Value::Int(10) }],
+                args: vec![Arg {
+                    name: None,
+                    value: Value::Int(10)
+                }],
                 content: None,
             })]
         );
@@ -1239,7 +1886,10 @@ mod tests {
             nodes("#align(center)[x]"),
             vec![Node::Expr(Expr::Func {
                 name: "align".into(),
-                args: vec![Arg { name: None, value: Value::Str("center".into()) }],
+                args: vec![Arg {
+                    name: None,
+                    value: Value::Str("center".into())
+                }],
                 content: Some(vec![t("x")]),
             })]
         );
@@ -1258,30 +1908,205 @@ mod tests {
 
     #[test]
     fn set_margin_dict() {
-        // `margin: (x: 1in, top: 2cm)` -> Content of Func-encoded pairs.
+        // `margin: (x: 1in, top: 2cm)` -> Value::Dict of named pairs.
         let (n, d) = parse("#set page(margin: (x: 1in, top: 2cm))");
         assert!(d.is_empty());
-        let Node::Expr(Expr::Set { args, .. }) = &n[0] else { panic!() };
+        let Node::Expr(Expr::Set { args, .. }) = &n[0] else {
+            panic!()
+        };
         assert_eq!(args[0].name.as_deref(), Some("margin"));
-        let Value::Content(ns) = &args[0].value else { panic!() };
         assert_eq!(
-            *ns,
-            vec![
-                Node::Expr(Expr::Func {
-                    name: "x".into(),
-                    args: vec![Arg { name: None, value: Value::Length(Length::Pt(72.0)) }],
-                    content: None,
-                }),
-                Node::Expr(Expr::Func {
-                    name: "top".into(),
-                    args: vec![Arg {
-                        name: None,
-                        value: Value::Length(Length::Pt(2.0 * 28.3465)),
-                    }],
-                    content: None,
-                }),
-            ]
+            args[0].value,
+            Value::Dict(vec![
+                ("x".into(), Value::Length(Length::Pt(72.0))),
+                ("top".into(), Value::Length(Length::Pt(2.0 * 28.3465))),
+            ])
         );
+    }
+
+    #[test]
+    fn import_include() {
+        assert_eq!(
+            nodes("#import \"lib.typ\""),
+            vec![Node::Expr(Expr::Import {
+                path: "lib.typ".into(),
+                items: vec![],
+                all: false,
+            })]
+        );
+        assert_eq!(
+            nodes("#import \"lib.typ\": a, b"),
+            vec![Node::Expr(Expr::Import {
+                path: "lib.typ".into(),
+                items: vec!["a".into(), "b".into()],
+                all: false,
+            })]
+        );
+        assert_eq!(
+            nodes("#import \"lib.typ\": *"),
+            vec![Node::Expr(Expr::Import {
+                path: "lib.typ".into(),
+                items: vec![],
+                all: true,
+            })]
+        );
+        assert_eq!(
+            nodes("#import \"@preview/cetz:0.3.1\": canvas"),
+            vec![Node::Expr(Expr::Import {
+                path: "@preview/cetz:0.3.1".into(),
+                items: vec!["canvas".into()],
+                all: false,
+            })]
+        );
+        assert_eq!(
+            nodes("#include \"ch.typ\""),
+            vec![Node::Expr(Expr::Func {
+                name: "include".into(),
+                args: vec![Arg {
+                    name: None,
+                    value: Value::Str("ch.typ".into())
+                }],
+                content: None,
+            })]
+        );
+    }
+
+    #[test]
+    fn ifs() {
+        // bare `#if x` desugars to `x != none`
+        let (n, d) = parse("#if x [yes]");
+        assert!(d.is_empty());
+        assert_eq!(
+            n,
+            vec![Node::Expr(Expr::If {
+                arms: vec![(
+                    Cmp {
+                        lhs: Rhs::Var("x".into()),
+                        op: CmpOp::Ne,
+                        rhs: Rhs::Lit(Value::None),
+                        negated: false,
+                    },
+                    vec![t("yes")],
+                )],
+                els: None,
+            })]
+        );
+
+        let (n, d) = parse("#if a == 1 [x] else if not b [y] else [z]");
+        assert!(d.is_empty(), "{d:?}");
+        let Node::Expr(Expr::If { arms, els }) = &n[0] else {
+            panic!("{n:?}")
+        };
+        assert_eq!(arms.len(), 2);
+        assert_eq!(arms[0].0.op, CmpOp::Eq);
+        assert_eq!(arms[0].0.rhs, Rhs::Lit(Value::Int(1)));
+        assert!(arms[1].0.negated);
+        assert_eq!(els.as_ref().unwrap()[0], t("z"));
+
+        for (src, op) in [
+            ("#if a != b [x]", CmpOp::Ne),
+            ("#if a < b [x]", CmpOp::Lt),
+            ("#if a <= b [x]", CmpOp::Le),
+            ("#if a > b [x]", CmpOp::Gt),
+            ("#if a >= b [x]", CmpOp::Ge),
+        ] {
+            let (n, d) = parse(src);
+            assert!(d.is_empty(), "{src}: {d:?}");
+            let Node::Expr(Expr::If { arms, .. }) = &n[0] else {
+                panic!("{src}")
+            };
+            assert_eq!(arms[0].0.op, op, "{src}");
+        }
+    }
+
+    #[test]
+    fn fors() {
+        let (n, d) = parse("#for x in xs [#x]");
+        assert!(d.is_empty(), "{d:?}");
+        let Node::Expr(Expr::For { vars, iter, body }) = &n[0] else {
+            panic!("{n:?}")
+        };
+        assert_eq!(vars, &["x"]);
+        assert_eq!(*iter, Rhs::Var("xs".into()));
+        assert_eq!(*body, vec![Node::Expr(Expr::Var { name: "x".into() })]);
+
+        let (n, d) = parse("#for (k, v) in dict [#k = #v]");
+        assert!(d.is_empty(), "{d:?}");
+        let Node::Expr(Expr::For { vars, .. }) = &n[0] else {
+            panic!("{n:?}")
+        };
+        assert_eq!(vars, &["k", "v"]);
+
+        // iterating an array literal
+        let (n, d) = parse("#for x in (1, 2) [#x]");
+        assert!(d.is_empty(), "{d:?}");
+        let Node::Expr(Expr::For { iter, .. }) = &n[0] else {
+            panic!("{n:?}")
+        };
+        assert_eq!(
+            *iter,
+            Rhs::Lit(Value::Array(vec![Value::Int(1), Value::Int(2)]))
+        );
+    }
+
+    #[test]
+    fn let_rhs_literals() {
+        let (n, d) = parse(
+            "#let n = 1 + 2\n#let a = (1, 2pt, \"s\")\n#let d = (k: 1)\n#let g = (5,)\n#let h = (5)\n#let f = m.x",
+        );
+        assert!(d.is_empty(), "{d:?}");
+        // `\n` after each `#let` becomes a separating space Text node.
+        let lets: Vec<&Rhs> = n
+            .iter()
+            .filter_map(|n| {
+                if let Node::Expr(Expr::Let { value, .. }) = n {
+                    Some(value)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(lets.len(), 6);
+        let Rhs::Bin {
+            op: ArithOp::Add, ..
+        } = lets[0]
+        else {
+            panic!("{lets:?}")
+        };
+        let Rhs::Lit(Value::Array(v)) = lets[1] else {
+            panic!("{lets:?}")
+        };
+        assert_eq!(v.len(), 3);
+        let Rhs::Lit(Value::Dict(p)) = lets[2] else {
+            panic!("{lets:?}")
+        };
+        assert_eq!(p, &[("k".into(), Value::Int(1))]);
+        let Rhs::Lit(Value::Array(v)) = lets[3] else {
+            panic!("{lets:?}")
+        };
+        assert_eq!(v, &[Value::Int(5)]);
+        let Rhs::Lit(Value::Int(5)) = lets[4] else {
+            panic!("{lets:?}")
+        };
+        let Rhs::Field { name, .. } = lets[5] else {
+            panic!("{lets:?}")
+        };
+        assert_eq!(name, "x");
+    }
+
+    #[test]
+    fn markup_bin() {
+        let (n, d) = parse("#let a = 1\n#a + 2 end");
+        assert!(d.is_empty(), "{d:?}");
+        assert_eq!(
+            n[2],
+            Node::Expr(Expr::Bin {
+                lhs: Rhs::Var("a".into()),
+                op: ArithOp::Add,
+                rhs: Rhs::Lit(Value::Int(2)),
+            })
+        );
+        assert_eq!(n[3], t(" end"));
     }
 
     #[test]
@@ -1292,13 +2117,14 @@ mod tests {
         assert_eq!(d[0].severity, Severity::NotImplemented);
 
         for (src, what) in [
-            ("#table(1)", "#table"),
             ("#image(\"x.png\")", "#image"),
             ("#figure[..]", "#figure"),
             ("/ term: desc", "term"),
             ("1. item", "numbered"),
             ("<lbl>", "labels"),
             ("@lbl", "references"),
+            ("#let f(x) = x * 2", "function definition"),
+            ("#show: it => it", "#show"),
         ] {
             let (_, d) = parse(src);
             assert!(!d.is_empty(), "{src}");
@@ -1309,11 +2135,46 @@ mod tests {
     #[test]
     fn no_panics_on_malformed() {
         for src in [
-            "", "#", "# ", "##", "#(", "#f(", "#f(x", "#let", "#let 1", "#let x",
-            "#let x =", "#set", "#set x", "\"", "`", "```", "*", "_", "$", "<",
-            "@", "\\", "/", "//", "/*", "[", "]", "-", "+", "=", "=======",
-            "#f[#f[#f[x]", "((((", "*a _b `c", "#12.5.3", "#1xx", "a\\\r\nb",
-            "- a\n- \n- c", "#strong[", "\u{1f600} *é_ \u{4e2d}\u{6587}",
+            "",
+            "#",
+            "# ",
+            "##",
+            "#(",
+            "#f(",
+            "#f(x",
+            "#let",
+            "#let 1",
+            "#let x",
+            "#let x =",
+            "#set",
+            "#set x",
+            "\"",
+            "`",
+            "```",
+            "*",
+            "_",
+            "$",
+            "<",
+            "@",
+            "\\",
+            "/",
+            "//",
+            "/*",
+            "[",
+            "]",
+            "-",
+            "+",
+            "=",
+            "=======",
+            "#f[#f[#f[x]",
+            "((((",
+            "*a _b `c",
+            "#12.5.3",
+            "#1xx",
+            "a\\\r\nb",
+            "- a\n- \n- c",
+            "#strong[",
+            "\u{1f600} *é_ \u{4e2d}\u{6587}",
         ] {
             let _ = parse(src);
         }

@@ -69,7 +69,10 @@ pub enum Node {
     /// `=`, `==`, ... heading with level 1..=6.
     Heading { level: u8, body: Vec<Node> },
     /// Bullet (`-`) or enumeration (`+`) list.
-    List { ordered: bool, items: Vec<Vec<Node>> },
+    List {
+        ordered: bool,
+        items: Vec<Vec<Node>>,
+    },
     /// Raw code: `` `inline` `` (block=false) or a fenced ``` block.
     Raw { text: String, block: bool },
     /// Explicit paragraph boundary (a blank line).
@@ -82,8 +85,9 @@ pub enum Node {
 pub enum Expr {
     /// `#set page(...)`, `#set text(...)`, `#set par(...)`, ...
     Set { target: String, args: Vec<Arg> },
-    /// `#let name = value` (value is a literal in our subset).
-    Let { name: String, value: Value },
+    /// `#let name = value` where value is a literal, a variable
+    /// reference, or a simple binary expression.
+    Let { name: String, value: Rhs },
     /// `#name` — a bound variable reference.
     Var { name: String },
     /// `#func(args)` with optional trailing `[content]`.
@@ -92,8 +96,75 @@ pub enum Expr {
         args: Vec<Arg>,
         content: Option<Vec<Node>>,
     },
+    /// `#import "path"` / `#import "@preview/pkg:1.0.0": a, b` /
+    /// `#import "x.typ": *`. `items` lists named bindings; `all` is the
+    /// `*` wildcard; neither means the module binds under its file stem.
+    Import {
+        path: String,
+        items: Vec<String>,
+        all: bool,
+    },
+    /// `#if cond [..] else if cond [..] else [..]`.
+    If {
+        arms: Vec<(Cmp, Vec<Node>)>,
+        els: Option<Vec<Node>>,
+    },
+    /// `#for x in expr [..]` — `vars` is 1 name, or 2 for `(k, v)` pairs.
+    For {
+        vars: Vec<String>,
+        iter: Rhs,
+        body: Vec<Node>,
+    },
     /// A bare literal in markup: `#"str"`, `#12pt`, ...
     Lit(Value),
+    /// A simple binary expression in markup: `#a + b`, `#x * 2`.
+    Bin { lhs: Rhs, op: ArithOp, rhs: Rhs },
+}
+
+/// Right-hand side of a binding, condition, or iteration.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Rhs {
+    Lit(Value),
+    Var(String),
+    /// Field access on a module/dict: `mod.name`.
+    Field {
+        base: Box<Rhs>,
+        name: String,
+    },
+    /// Binary operation: `a + b`, `n * 2`, ...
+    Bin {
+        lhs: Box<Rhs>,
+        op: ArithOp,
+        rhs: Box<Rhs>,
+    },
+}
+
+/// Comparison in `#if`/`#while` conditions.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Cmp {
+    pub lhs: Rhs,
+    pub op: CmpOp,
+    pub rhs: Rhs,
+    /// Unary `not` applied to the comparison.
+    pub negated: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CmpOp {
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArithOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -114,6 +185,10 @@ pub enum Value {
     Str(String),
     /// `[...]` markup passed as an argument.
     Content(Vec<Node>),
+    /// `(1, 2, 3)` array literal.
+    Array(Vec<Value>),
+    /// `(a: 1, b: 2)` dictionary literal.
+    Dict(Vec<(String, Value)>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -150,6 +225,10 @@ pub struct Styles {
     pub line_height: f64, // pt, baseline to baseline
     pub par_spacing: f64, // pt of vertical space between paragraphs
     pub justify: bool,
+    /// Requested font family from `#set text(font: "..")`. `None` means
+    /// the built-in base-14 serif stack (Times). A `Some` is resolved
+    /// through the font database during eval.
+    pub font_family: Option<String>,
 }
 
 impl Default for Styles {
@@ -157,9 +236,9 @@ impl Default for Styles {
         // A4, 2.5cm margins, 11pt text — matching typst's defaults closely
         // enough for the supported subset.
         Self {
-            page_width: 595.276,   // 210mm
-            page_height: 841.890,  // 297mm
-            margin_top: 70.866,    // 2.5cm
+            page_width: 595.276,  // 210mm
+            page_height: 841.890, // 297mm
+            margin_top: 70.866,   // 2.5cm
             margin_bottom: 70.866,
             margin_left: 70.866,
             margin_right: 70.866,
@@ -167,6 +246,7 @@ impl Default for Styles {
             line_height: 14.39, // measured baseline-to-baseline in typst output
             par_spacing: 6.05,  // measured block gap in typst output
             justify: false,
+            font_family: None,
         }
     }
 }
@@ -182,35 +262,73 @@ pub enum HAlign {
 /// Block-level evaluated content, ready for layout.
 #[derive(Debug, Clone)]
 pub enum Block {
-    Paragraph { content: Vec<Inline>, align: HAlign },
-    Heading { level: u8, content: Vec<Inline> },
-    List { ordered: bool, items: Vec<Vec<Inline>> },
+    Paragraph {
+        content: Vec<Inline>,
+        align: HAlign,
+    },
+    Heading {
+        level: u8,
+        content: Vec<Inline>,
+    },
+    List {
+        ordered: bool,
+        items: Vec<Vec<Inline>>,
+    },
     /// Fenced code block; text is the verbatim content.
-    RawBlock { text: String },
+    RawBlock {
+        text: String,
+    },
     /// Explicit vertical space, in pt (`#v(..)`).
     VSpace(f64),
     /// Forced page break (`#pagebreak()`).
     PageBreak,
+    /// `#table(..)` / `#grid(..)` evaluated to rows of cells.
+    /// Cells are row-major inline content; `columns` describes each
+    /// column's width spec. Row/col spans are out of scope for now.
+    Table {
+        columns: Vec<ColSpec>,
+        cells: Vec<Vec<Inline>>,
+        /// Draw cell borders (`#table` true, `#grid` false).
+        stroke: bool,
+    },
+}
+
+/// Column width spec for `Block::Table`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ColSpec {
+    /// Sized to the widest cell.
+    Auto,
+    /// Fractional share of the remaining width (`1fr`).
+    Fr(f64),
+    /// Fixed width in pt.
+    Fixed(f64),
 }
 
 /// Inline content inside a block.
 #[derive(Debug, Clone)]
 pub enum Inline {
-    Text { text: String, style: TextStyle },
+    Text {
+        text: String,
+        style: TextStyle,
+    },
     LineBreak,
     /// Explicit horizontal space in pt (`#h(..)`).
     HSpace(f64),
 }
 
-/// Base-14 font identities. Exporters map these to PDF base-14 names.
+/// Font identities. The six base variants map to PDF base-14 faces;
+/// `Ext(i)` indexes `Document::fonts` — a face resolved through the
+/// font database and embedded into the PDF.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FontId {
-    Regular,   // Helvetica
-    Bold,      // Helvetica-Bold
-    Italic,    // Helvetica-Oblique
-    BoldItalic,// Helvetica-BoldOblique
-    Mono,      // Courier
-    MonoBold,  // Courier-Bold
+    Regular,    // Times-Roman
+    Bold,       // Times-Bold
+    Italic,     // Times-Italic
+    BoldItalic, // Times-BoldItalic
+    Mono,       // Courier
+    MonoBold,   // Courier-Bold
+    /// Dynamic face index into `Document::fonts`.
+    Ext(u16),
 }
 
 impl FontId {
@@ -230,12 +348,37 @@ pub struct TextStyle {
     pub size: f64, // pt
 }
 
+/// A discovered font face registered during evaluation. `FontId::Ext(i)`
+/// refers to `fonts[i]`; exporters embed the file's TrueType data.
+#[derive(Debug, Clone)]
+pub struct FontUse {
+    /// PostScript name from the font's name table (PDF BaseFont).
+    pub postscript_name: String,
+    /// Family name the document asked for (for SVG font-family).
+    pub family: String,
+    /// Path to the font file on disk.
+    pub path: std::path::PathBuf,
+    /// Face index inside a `.ttc` collection (0 for single fonts).
+    pub ttc_index: u32,
+}
+
+/// Registry handed to the evaluator: resolves a requested family + style
+/// to a `FontId`, recording `FontUse` entries along the way. The fontdb
+/// provides the real implementation; tests may stub it.
+pub trait FaceRegistry {
+    /// Resolve `family` at the given style. Return `None` if unknown —
+    /// the evaluator falls back to the base-14 stack with a diagnostic.
+    fn resolve(&mut self, family: &str, bold: bool, italic: bool, mono: bool) -> Option<FontId>;
+}
+
 /// The evaluated document.
 #[derive(Debug, Clone)]
 pub struct Document {
     pub styles: Styles,
     pub blocks: Vec<Block>,
     pub diags: Vec<Diag>,
+    /// Dynamic fonts referenced by `FontId::Ext`, in registration order.
+    pub fonts: Vec<FontUse>,
 }
 
 // ------------------- Display list (layout output) -------------------
@@ -257,6 +400,15 @@ pub enum DrawItem {
         font: FontId,
         size: f64,
         text: String,
+    },
+    /// A filled rectangle at (x, y) with size (w, h) — used for table
+    /// borders and rules. `gray` is 0.0 black .. 1.0 white.
+    Rule {
+        x: f64,
+        y: f64,
+        w: f64,
+        h: f64,
+        gray: f64,
     },
 }
 

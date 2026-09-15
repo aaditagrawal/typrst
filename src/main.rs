@@ -1,11 +1,15 @@
 mod eval;
 mod font;
+mod fontdb;
 mod ir;
 mod layout;
+mod package;
 mod pdf;
 mod svg;
 mod syntax;
 
+use std::collections::HashSet;
+use std::path::Path;
 use std::process::ExitCode;
 use std::time::Instant;
 
@@ -15,6 +19,7 @@ typrst — a fast, self-contained Typst-subset engine
 USAGE:
     typrst build <input.typ> [-o <out.pdf>] [--svg <out.svg>] [--timing]
     typrst bench <input.typ> [-n <iters>]
+    typrst fonts [--verbose]
     typrst supported
     typrst --help
 ";
@@ -28,6 +33,7 @@ fn main() -> ExitCode {
     match args[0].as_str() {
         "build" | "compile" => cmd_build(&args[1..]),
         "bench" => cmd_bench(&args[1..]),
+        "fonts" => cmd_fonts(&args[1..]),
         "supported" => {
             print!("{}", include_str!("../SPEC.md"));
             ExitCode::SUCCESS
@@ -49,10 +55,13 @@ fn flag_value<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
 
 fn positional(args: &[String]) -> Option<&str> {
     // First bare argument that isn't the value of a preceding flag.
-    args.iter().enumerate().find(|(i, a)| {
-        !a.starts_with('-')
-            && !(*i > 0 && matches!(args[*i - 1].as_str(), "-o" | "--svg" | "-n"))
-    }).map(|(_, a)| a.as_str())
+    args.iter()
+        .enumerate()
+        .find(|(i, a)| {
+            !a.starts_with('-')
+                && !(*i > 0 && matches!(args[*i - 1].as_str(), "-o" | "--svg" | "-n"))
+        })
+        .map(|(_, a)| a.as_str())
 }
 
 fn report_diags(path: &str, src: &str, diags: &[ir::Diag]) -> bool {
@@ -96,16 +105,30 @@ fn cmd_build(args: &[String]) -> ExitCode {
     let t_parse = t.elapsed();
 
     let t = Instant::now();
-    let doc = eval::eval(nodes, &mut diags);
+    let base_dir = Path::new(path).parent().unwrap_or(Path::new("."));
+    let mut fonts: Vec<ir::FontUse> = Vec::new();
+    let mut loaded = HashSet::new();
+    let db_cell = std::cell::OnceCell::new();
+    let mut doc = {
+        let mut reg = fontdb::Registry::lazy(&db_cell, &mut fonts);
+        let mut env = eval::EvalEnv {
+            base_dir,
+            registry: &mut reg,
+            depth: 0,
+            loaded: &mut loaded,
+        };
+        eval::eval(nodes, &mut diags, &mut env)
+    };
+    doc.fonts = fonts;
     let t_eval = t.elapsed();
 
     let t = Instant::now();
-    let metrics = font::Afm::new();
+    let metrics = font::DbMetrics::new(&doc.fonts);
     let pages = layout::layout(&doc, &metrics);
     let t_layout = t.elapsed();
 
     let t = Instant::now();
-    let pdf_bytes = pdf::write_pdf(&pages);
+    let pdf_bytes = pdf::write_pdf(&pages, &doc.fonts);
     let t_pdf = t.elapsed();
 
     let t = Instant::now();
@@ -115,7 +138,7 @@ fn cmd_build(args: &[String]) -> ExitCode {
         io_err = true;
     }
     if let Some(svg_path) = flag_value(args, "--svg") {
-        let svg = svg::render(&pages);
+        let svg = svg::render(&pages, &doc.fonts);
         if let Err(e) = std::fs::write(svg_path, svg) {
             eprintln!("error: cannot write {svg_path}: {e}");
             io_err = true;
@@ -167,19 +190,33 @@ fn cmd_bench(args: &[String]) -> ExitCode {
     let mut eval_ts = Vec::new();
     let mut layout_ts = Vec::new();
     let mut pdf_ts = Vec::new();
-    let metrics = font::Afm::new();
+    let base_dir = Path::new(path).parent().unwrap_or(Path::new("."));
+    let db_cell = std::cell::OnceCell::new();
     for _ in 0..n {
         let t = Instant::now();
         let (nodes, mut diags) = syntax::parse(&src);
         parse_ts.push(t.elapsed());
         let t = Instant::now();
-        let doc = eval::eval(nodes, &mut diags);
+        let mut fonts: Vec<ir::FontUse> = Vec::new();
+        let mut loaded = HashSet::new();
+        let mut doc = {
+            let mut reg = fontdb::Registry::lazy(&db_cell, &mut fonts);
+            let mut env = eval::EvalEnv {
+                base_dir,
+                registry: &mut reg,
+                depth: 0,
+                loaded: &mut loaded,
+            };
+            eval::eval(nodes, &mut diags, &mut env)
+        };
+        doc.fonts = fonts;
         eval_ts.push(t.elapsed());
         let t = Instant::now();
+        let metrics = font::DbMetrics::new(&doc.fonts);
         let pages = layout::layout(&doc, &metrics);
         layout_ts.push(t.elapsed());
         let t = Instant::now();
-        let bytes = pdf::write_pdf(&pages);
+        let bytes = pdf::write_pdf(&pages, &doc.fonts);
         pdf_ts.push(t.elapsed());
         std::hint::black_box(bytes);
     }
@@ -197,6 +234,39 @@ fn cmd_bench(args: &[String]) -> ExitCode {
     println!("eval    {:>9?}   {:>9?}", e_min, e_med);
     println!("layout  {:>9?}   {:>9?}", l_min, l_med);
     println!("pdf     {:>9?}   {:>9?}", w_min, w_med);
-    println!("total   {:>9?}   {:>9?}", p_min + e_min + l_min + w_min, p_med + e_med + l_med + w_med);
+    println!(
+        "total   {:>9?}   {:>9?}",
+        p_min + e_min + l_min + w_min,
+        p_med + e_med + l_med + w_med
+    );
+    ExitCode::SUCCESS
+}
+
+fn cmd_fonts(args: &[String]) -> ExitCode {
+    let t = Instant::now();
+    let db = fontdb::FontDb::discover();
+    let dt = t.elapsed();
+    let verbose = args.iter().any(|a| a == "--verbose" || a == "-v");
+    if verbose {
+        for f in &db.faces {
+            println!(
+                "{:<40} {:<20} w={:<3}{}{} {}",
+                f.family,
+                f.subfamily,
+                f.weight,
+                if f.italic { " italic" } else { "" },
+                if f.monospace { " mono" } else { "" },
+                f.path.display()
+            );
+        }
+    } else {
+        let mut fams: Vec<&str> = db.faces.iter().map(|f| f.family.as_str()).collect();
+        fams.sort_unstable();
+        fams.dedup();
+        for f in fams {
+            println!("{f}");
+        }
+    }
+    eprintln!("{} faces indexed in {:?}", db.len(), dt);
     ExitCode::SUCCESS
 }
