@@ -45,8 +45,8 @@ iteration. Median of 20 runs, best in parentheses; both binaries write PDF.
 
 | Document | `typst compile` wall | `typrst build` wall | speedup |
 |---|---:|---:|---:|
-| `fixtures/small.typ` (372 B, 1 page) | 51.9 ms (50.2) | **2.1 ms (2.0)** | **24.8x** |
-| `fixtures/large.typ` (80 KB, ~30 pages) | 85.5 ms (84.3) | **3.8 ms (3.5)** | **22.7x** |
+| `fixtures/small.typ` (372 B, 1 page) | 55.8 ms (55.0) | **2.5 ms (2.0)** | **22.6x** |
+| `fixtures/large.typ` (80 KB, 25 pages) | 91.0 ms (89.7) | **4.2 ms (3.8)** | **21.4x** |
 
 In-process pipeline (`typrst bench`, median, excludes process startup):
 
@@ -57,12 +57,23 @@ In-process pipeline (`typrst bench`, median, excludes process startup):
 
 `typst`'s wall clock is dominated by fixed startup (fontdb system-font scan,
 general machinery), not per-document work; `typrst` does zero font I/O
-(base-14 AFM metrics are embedded as static tables), so its wall clock is
+(base-14 metrics are embedded as static tables), so its wall clock is
 nearly all exec + I/O overhead — the ~1.5–2 ms macOS process floor.
 
-Both compilers render the same source; page counts differ (typst 25 vs
-typrst 30 on `large.typ`) because typrst uses Helvetica base-14 metrics
-rather than Linux Libertine — same trade-off flash-tex makes vs pdflatex.
+## Visual fidelity
+
+typrst uses the PDF base-14 **Times** faces (metric tables extracted from
+the system fonts, metric-compatible with the Adobe AFMs) to match typst's
+Libertinus Serif default, and its spacing model was fitted against typst's
+real output:
+
+- Same page count on `large.typ` (25 pages, both compilers)
+- Baselines match typst's to within ~0.05 pt at block boundaries
+- Line height 14.39pt @ 11pt body, block gap 6.05pt, heading sizes
+  1.4/1.2/1.05/1.0em with tight leading, list markers hung at the margin
+  with a 0.5em gap — all measured from typst's PDF content streams
+- Remaining differences are intrinsic: Libertinus vs Times glyph shapes and
+  widths shift individual line breaks (±one line, resyncing at each block)
 
 Exact commands: `python3 scripts/bench.py 20` for the wall-clock table;
 `./target/release/typrst bench fixtures/large.typ -n 50` for in-process.

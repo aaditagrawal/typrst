@@ -312,7 +312,7 @@ impl Ev<'_> {
                 Some("size") | None => match val_pt(&a.value, self.st.font_size) {
                     Some(p) => {
                         self.st.font_size = p;
-                        self.st.line_height = 1.3 * p;
+                        self.st.line_height = 1.3082 * p;
                     }
                     None => self.diag(Severity::Warning, "text size expects a length"),
                 },

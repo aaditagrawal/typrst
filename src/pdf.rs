@@ -209,7 +209,7 @@ mod tests {
         assert!(has(&pdf, b"/Type /Catalog"));
         assert!(has(&pdf, b"/Count 1"));
         assert!(has(&pdf, b"/MediaBox [0 0 595.28 841.89]"));
-        assert!(has(&pdf, b"/BaseFont /Helvetica "));
+        assert!(has(&pdf, b"/BaseFont /Times-Roman "));
         assert!(has(&pdf, b"/BaseFont /Courier "));
         // Unused faces get no font object.
         assert!(!has(&pdf, b"Bold"));
@@ -279,7 +279,7 @@ mod tests {
         ];
         let pdf = write_pdf(&pages);
         assert!(has(&pdf, b"/Count 2"));
-        assert!(has(&pdf, b"/BaseFont /Helvetica-BoldOblique "));
+        assert!(has(&pdf, b"/BaseFont /Times-BoldItalic "));
         assert!(has(&pdf, b"BT /F1 12.5 Tf 1 0 0 1 10 180 Tm (x) Tj ET"));
         assert!(!has(&pdf, b"/Courier"));
     }

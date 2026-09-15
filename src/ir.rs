@@ -164,8 +164,8 @@ impl Default for Styles {
             margin_left: 70.866,
             margin_right: 70.866,
             font_size: 11.0,
-            line_height: 14.3, // 1.3 * 11pt
-            par_spacing: 9.0,
+            line_height: 14.39, // measured baseline-to-baseline in typst output
+            par_spacing: 6.05,  // measured block gap in typst output
             justify: false,
         }
     }

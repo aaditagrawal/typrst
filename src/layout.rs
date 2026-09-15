@@ -49,6 +49,7 @@ pub fn layout(doc: &Document, metrics: &dyn FontMetrics) -> Vec<Page> {
         pages: Vec::new(),
         items: Vec::new(),
         y: doc.styles.margin_top,
+        pending_gap: 0.0,
         after: 0.0,
         fresh: true,
         toks: Vec::new(),
@@ -68,9 +69,10 @@ struct Lx<'a> {
     st: &'a Styles,
     pages: Vec<Page>,
     items: Vec<DrawItem>,
-    y: f64,     // top of the next line box
-    after: f64, // trailing spacing of the previous block
-    fresh: bool, // nothing drawn on this page yet (top spacing collapses)
+    y: f64,          // baseline of the previous line (margin_top when fresh)
+    pending_gap: f64, // inter-block spacing applied to the next line's delta
+    after: f64,      // trailing spacing of the previous block
+    fresh: bool,     // nothing drawn on this page yet (top spacing collapses)
     toks: Vec<Tok<'a>>,
     lines: Vec<Line>,
 }
@@ -90,12 +92,14 @@ impl<'a> Lx<'a> {
         self.y = self.st.margin_top;
         self.fresh = true;
         self.after = 0.0;
+        self.pending_gap = 0.0;
     }
 
-    /// Inter-block gap: previous trailing spacing collapses with `before`.
+    /// Inter-block spacing: collapses to max(prev_below, next_above),
+    /// applied to the next baseline delta. Vanishes at page top.
     fn gap(&mut self, before: f64) {
         if !self.fresh {
-            self.y += self.after.max(before);
+            self.pending_gap = self.pending_gap.max(self.after.max(before));
         }
         self.after = 0.0;
     }
@@ -105,7 +109,7 @@ impl<'a> Lx<'a> {
         if self.st.font_size > 0.0 {
             size * self.st.line_height / self.st.font_size
         } else {
-            size * 1.3
+            size * 1.3082
         }
     }
 
@@ -113,20 +117,22 @@ impl<'a> Lx<'a> {
         let ml = self.st.margin_left;
         match b {
             Block::Paragraph { content, align } => {
-                self.gap(self.st.par_spacing);
+                // Paragraphs contribute below-spacing only (6.05pt), matching
+                // typst: heading->para gets no extra gap.
+                self.gap(0.0);
                 let justify = self.st.justify && *align == HAlign::Left;
                 self.flow(content, ml, self.text_w(), *align, justify, None, &ident);
                 self.after = self.st.par_spacing;
             }
             Block::Heading { level, content } => {
                 let f = match level {
-                    1 => 1.6,
-                    2 => 1.3,
-                    3 => 1.15,
+                    1 => 1.4,
+                    2 => 1.2,
+                    3 => 1.05,
                     _ => 1.0,
                 };
                 let size = self.st.font_size * f;
-                self.gap(1.5 * size);
+                self.gap(0.536 * size); // measured: 7.08pt before an h2
                 self.flow(
                     content,
                     ml,
@@ -136,62 +142,67 @@ impl<'a> Lx<'a> {
                     None,
                     &move |s: TextStyle| TextStyle { font: bolden(s.font), size },
                 );
-                self.after = 0.75 * size;
+                self.after = 1.1;
             }
             Block::List { ordered, items } => {
-                self.gap(self.st.par_spacing);
-                const INDENT: f64 = 18.0;
+                // Small before-gap; collapses to the previous block's
+                // trailing gap when larger.
+                self.gap(1.1);
                 for (i, it) in items.iter().enumerate() {
-                    if i > 0 && !self.fresh {
-                        self.y += 4.0;
-                    }
                     let mk = if *ordered {
                         format!("{}.", i + 1)
                     } else {
                         "\u{2022}".to_string()
                     };
                     let mst = TextStyle { font: FontId::Regular, size: self.st.font_size };
+                    // typst hangs the marker at the margin; item text starts
+                    // after the marker + a 0.5em gap, continuations aligned.
+                    let ind = self.m.str_width(mst.font, mst.size, &mk) + 0.5 * mst.size;
                     self.flow(
                         it,
-                        ml + INDENT,
-                        self.text_w() - INDENT,
+                        ml + ind,
+                        self.text_w() - ind,
                         HAlign::Left,
                         false,
                         Some((mk, mst, ml)),
-                        &ident,
+                        &ident
+
                     );
                 }
                 self.after = self.st.par_spacing;
             }
             Block::RawBlock { text } => {
-                self.gap(self.st.par_spacing);
+                self.gap(0.0);
                 let size = self.st.font_size * 0.9;
                 let lh = self.lh(size);
                 let asc = self.m.ascent(FontId::Mono) * size / 1000.0;
                 let desc = self.m.descent(FontId::Mono) * size / 1000.0;
                 let limit = self.st.page_height - self.st.margin_bottom;
                 for line in text.split('\n') {
-                    let baseline = self.y + asc;
+                    let mut baseline = if self.fresh {
+                        self.st.margin_top + asc
+                    } else {
+                        self.y + lh + self.pending_gap
+                    };
+                    self.pending_gap = 0.0;
                     if !self.items.is_empty() && baseline + desc > limit {
                         self.finish_page();
+                        baseline = self.st.margin_top + asc;
                     }
                     self.items.push(DrawItem::Text {
                         x: ml,
-                        y: self.y + asc,
+                        y: baseline,
                         font: FontId::Mono,
                         size,
                         text: line.to_string(),
                     });
-                    self.y += lh;
+                    self.y = baseline;
                     self.fresh = false;
                 }
                 self.after = self.st.par_spacing;
             }
             Block::VSpace(v) => {
-                if !self.fresh {
-                    self.y += self.after;
-                }
-                self.y += v;
+                self.pending_gap += self.after + v;
                 self.after = 0.0;
             }
             Block::PageBreak => self.finish_page(),
@@ -239,9 +250,15 @@ impl<'a> Lx<'a> {
             let last = k + 1 == n;
             let mk = marker.take();
             match mk {
-                Some((mt, mst, mx)) => {
-                    self.place_line(l, x0, width, align, justify, last, Some((mt.as_str(), mst, mx)))
-                }
+                Some((mt, mst, mx)) => self.place_line(
+                    l,
+                    x0,
+                    width,
+                    align,
+                    justify,
+                    last,
+                    Some((mt.as_str(), mst, mx)),
+                ),
                 None => self.place_line(l, x0, width, align, justify, last, None),
             }
         }
@@ -280,12 +297,18 @@ impl<'a> Lx<'a> {
             asc = self.m.ascent(FontId::Regular) * size / 1000.0;
             desc = self.m.descent(FontId::Regular) * size / 1000.0;
         }
+        // Baseline delta = this line's own line height + inter-block gap.
+        let mut baseline = if self.fresh {
+            self.st.margin_top + asc
+        } else {
+            self.y + self.lh(size) + self.pending_gap
+        };
+        self.pending_gap = 0.0;
         let limit = self.st.page_height - self.st.margin_bottom;
-        let baseline = self.y + asc;
         if !self.items.is_empty() && baseline + desc > limit {
             self.finish_page();
+            baseline = self.st.margin_top + asc;
         }
-        let baseline = self.y + asc;
 
         // justification slack over inter-word spaces, capped at 2x stretch
         let mut extra = 0.0;
@@ -366,7 +389,7 @@ impl<'a> Lx<'a> {
                 text: buf,
             });
         }
-        self.y += self.lh(size);
+        self.y = baseline;
         self.fresh = false;
     }
 }
@@ -517,7 +540,7 @@ mod tests {
 
     // Fake metrics: word "aaaa" = 4*500*11/1000 = 22pt; space = 5.5pt.
     // Text width = 595.276 - 2*70.866 = 453.544 -> 16 words/line.
-    // ascent 718 -> first baseline = 70.866 + 7.898 = 78.764; lh = 14.3.
+    // ascent 718 -> first baseline = 70.866 + 7.898 = 78.764; lh = 14.0.
 
     #[test]
     fn layout_wraps_greedily() {
@@ -530,8 +553,8 @@ mod tests {
         let (x, y, ..) = items[0];
         assert!((x - 70.866).abs() < 1e-6);
         assert!((y - 78.764).abs() < 1e-3);
-        assert!((items[1].1 - items[0].1 - 14.3).abs() < 1e-6);
-        assert!((items[2].1 - items[1].1 - 14.3).abs() < 1e-6);
+        assert!((items[1].1 - items[0].1 - 14.39).abs() < 1e-6);
+        assert!((items[2].1 - items[1].1 - 14.39).abs() < 1e-6);
         // first line has 16 words merged
         assert_eq!(items[0].2.matches("aaaa").count(), 16);
     }
@@ -581,21 +604,22 @@ mod tests {
         ]);
         let pages = layout(&doc, &Fake);
         let items = texts(&pages[0]);
-        // heading: bold 17.6pt
+        // heading: bold 15.4pt (1.4em)
         let (_, hy, ht, hf, hs) = items[0];
         assert_eq!(ht, "Title");
         assert_eq!(hf, FontId::Bold);
-        assert!((hs - 17.6).abs() < 1e-6);
-        assert!((hy - (70.866 + 718.0 * 17.6 / 1000.0)).abs() < 1e-3);
-        // marker "1." at margin_left, item text at +18
+        assert!((hs - 15.4).abs() < 1e-6);
+        assert!((hy - (70.866 + 718.0 * 15.4 / 1000.0)).abs() < 1e-3);
+        // marker "1." at margin_left, item text at margin + marker + 0.5em
+        // (fake metrics: "1." = 2 chars * 500 * 11 / 1000 = 11pt + 5.5 = 16.5)
         let m1 = items.iter().find(|i| i.2 == "1.").unwrap();
         assert!((m1.0 - 70.866).abs() < 1e-6);
         let it1 = items.iter().find(|i| i.2 == "first").unwrap();
-        assert!((it1.0 - 88.866).abs() < 1e-6);
+        assert!((it1.0 - 70.866 - 16.5).abs() < 1e-6);
         assert_eq!(m1.1, it1.1); // same baseline
         let m2 = items.iter().find(|i| i.2 == "2.").unwrap();
-        // item 2 baseline = item1 baseline + lh + 4pt item gap
-        assert!((m2.1 - m1.1 - 14.3 - 4.0).abs() < 1e-6);
+        // item 2 baseline = item1 baseline + lh
+        assert!((m2.1 - m1.1 - 14.39).abs() < 1e-6);
     }
 
     #[test]
@@ -635,10 +659,12 @@ mod tests {
         let raw: Vec<_> = items.iter().filter(|i| i.3 == FontId::Mono).collect();
         assert_eq!(raw.len(), 2);
         assert!((raw[0].4 - 9.9).abs() < 1e-6);
-        // paragraph gap 9 collapses with raw spacing 9; then VSpace + para gap.
+        // paragraph gap collapses with raw spacing; then VSpace + para gap.
         let p2 = items.last().unwrap();
-        // y of para2 = para1_top(70.866) + lh(14.3) + gap(9) + 2*raw_lh(12.87) + gap(9) + 20 + gap(9) + asc
-        let expect = 70.866 + 14.3 + 9.0 + 2.0 * (9.9 * 1.3) + 9.0 + 20.0 + 9.0 + 7.898;
+        // y of para2 = para1_top(70.866) + lh(14) + gap(6.7) + 2*raw_lh + gap(6.7) + 20 + gap(6.7) + asc
+        // para1 baseline = 70.866 + 7.898; raw adds lh(9.9*1.3082) per line,
+        // first raw line also takes the 6.05 gap; vspace stacks gap+20; para2 adds its lh.
+        let expect = 70.866 + 7.898 + 2.0 * (9.9 * 1.3082) + 6.05 + 6.05 + 20.0 + 14.39;
         assert!((p2.1 - expect).abs() < 1e-3);
     }
 
@@ -669,6 +695,6 @@ mod tests {
         // bb is 11pt (aa width) + 50pt h-space to the right
         assert!((items[1].0 - items[0].0 - 11.0 - 50.0).abs() < 1e-6);
         // cc on next baseline
-        assert!((items[2].1 - items[0].1 - 14.3).abs() < 1e-6);
+        assert!((items[2].1 - items[0].1 - 14.39).abs() < 1e-6);
     }
 }

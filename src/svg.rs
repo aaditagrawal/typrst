@@ -35,10 +35,10 @@ fn num(v: f64) -> String {
 
 fn family(font: FontId) -> (&'static str, bool, bool) {
     match font {
-        FontId::Regular => ("Helvetica", false, false),
-        FontId::Bold => ("Helvetica", true, false),
-        FontId::Italic => ("Helvetica", false, true),
-        FontId::BoldItalic => ("Helvetica", true, true),
+        FontId::Regular => ("Times New Roman, serif", false, false),
+        FontId::Bold => ("Times New Roman, serif", true, false),
+        FontId::Italic => ("Times New Roman, serif", false, true),
+        FontId::BoldItalic => ("Times New Roman, serif", true, true),
         FontId::Mono => ("Courier New, monospace", false, false),
         FontId::MonoBold => ("Courier New, monospace", true, false),
     }
@@ -162,7 +162,7 @@ mod tests {
         assert!(s.contains("x=\"70.87\" y=\"85\""));
         assert!(s.contains("x=\"10\" y=\"871.89\""));
         // styles
-        assert!(s.contains("font-family=\"Helvetica\""));
+        assert!(s.contains("font-family=\"Times New Roman, serif\""));
         assert!(s.contains("font-weight=\"bold\" font-style=\"italic\""));
         assert!(s.contains("font-family=\"Courier New, monospace\""));
         // escaping
