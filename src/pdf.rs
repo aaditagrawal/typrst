@@ -33,24 +33,62 @@ fn push_int(out: &mut Vec<u8>, v: i64) {
 /// Format a number: <=2 decimals, no trailing zeros. Integer math only —
 /// this is the hottest function in the writer.
 fn push_num(out: &mut Vec<u8>, v: f64) {
+    let mut buf = [0u8; 24];
+    let n = write_num(&mut buf, 0, v).unwrap();
+    out.extend_from_slice(&buf[..n]);
+}
+
+/// Write `v` at `i` with the same digits as [`push_num`]. `None` if it
+/// does not fit.
+fn write_num(buf: &mut [u8], mut i: usize, v: f64) -> Option<usize> {
     let scaled = (v * 100.0).round() as i64;
     if scaled == 0 {
-        out.push(b'0');
-        return;
+        *buf.get_mut(i)? = b'0';
+        return Some(i + 1);
+    }
+    if scaled < 0 {
+        *buf.get_mut(i)? = b'-';
+        i += 1;
     }
     let mag = scaled.unsigned_abs();
-    if scaled < 0 {
-        out.push(b'-');
-    }
     let (int, frac) = (mag / 100, mag % 100);
-    push_uint(out, int);
+    i = write_uint(buf, i, int)?;
     if frac != 0 {
-        out.push(b'.');
-        out.push(b'0' + (frac / 10) as u8);
+        if i + 2 > buf.len() {
+            return None;
+        }
+        buf[i] = b'.';
+        buf[i + 1] = b'0' + (frac / 10) as u8;
+        i += 2;
         if frac % 10 != 0 {
-            out.push(b'0' + (frac % 10) as u8);
+            *buf.get_mut(i)? = b'0' + (frac % 10) as u8;
+            i += 1;
         }
     }
+    Some(i)
+}
+
+fn write_uint(buf: &mut [u8], i: usize, mut n: u64) -> Option<usize> {
+    let mut tmp = [0u8; 20];
+    let mut k = tmp.len();
+    loop {
+        k -= 1;
+        tmp[k] = b'0' + (n % 10) as u8;
+        n /= 10;
+        if n == 0 {
+            break;
+        }
+    }
+    let digits = &tmp[k..];
+    let end = i + digits.len();
+    buf.get_mut(i..end)?.copy_from_slice(digits);
+    Some(end)
+}
+
+fn write_slice(buf: &mut [u8], i: usize, s: &[u8]) -> Option<usize> {
+    let end = i + s.len();
+    buf.get_mut(i..end)?.copy_from_slice(s);
+    Some(end)
 }
 
 #[inline(always)]
@@ -97,6 +135,113 @@ fn push_lit(out: &mut Vec<u8>, s: &str) {
         }
     }
     out.push(b')');
+}
+
+/// One text-showing operator, written in a stack buffer so the page stream
+/// grows by a single copy. Falls back to the streaming writer when the
+/// literal does not fit (a long escaped string).
+fn write_text_op(out: &mut Vec<u8>, font: u64, size: f64, x: f64, y: f64, text: &str) {
+    let mut buf = [0u8; 256];
+    if let Some(n) = fill_text_op(&mut buf, font, size, x, y, text) {
+        out.extend_from_slice(&buf[..n]);
+        return;
+    }
+    out.extend_from_slice(b"BT /F");
+    push_uint(out, font);
+    out.push(b' ');
+    push_num(out, size);
+    out.extend_from_slice(b" Tf 1 0 0 1 ");
+    push_num(out, x);
+    out.push(b' ');
+    push_num(out, y);
+    out.extend_from_slice(b" Tm ");
+    push_lit(out, text);
+    out.extend_from_slice(b" Tj ET\n");
+}
+
+fn fill_text_op(buf: &mut [u8], font: u64, size: f64, x: f64, y: f64, text: &str) -> Option<usize> {
+    let mut i = write_prefix(buf, font, size)?;
+    i = write_num(buf, i, x)?;
+    *buf.get_mut(i)? = b' ';
+    i += 1;
+    i = write_num(buf, i, y)?;
+    i = write_slice(buf, i, b" Tm ")?;
+    i = write_lit(buf, i, text)?;
+    write_slice(buf, i, b" Tj ET\n")
+}
+
+fn write_prefix(buf: &mut [u8], font: u64, size: f64) -> Option<usize> {
+    // 11pt base faces are almost every run in a body-text document.
+    if (size * 100.0).round() as i64 == 1100 {
+        let pref: &[u8] = match font {
+            1 => b"BT /F1 11 Tf 1 0 0 1 ",
+            2 => b"BT /F2 11 Tf 1 0 0 1 ",
+            3 => b"BT /F3 11 Tf 1 0 0 1 ",
+            4 => b"BT /F4 11 Tf 1 0 0 1 ",
+            _ => return write_prefix_slow(buf, font, size),
+        };
+        return write_slice(buf, 0, pref);
+    }
+    write_prefix_slow(buf, font, size)
+}
+
+fn write_prefix_slow(buf: &mut [u8], font: u64, size: f64) -> Option<usize> {
+    let mut i = write_slice(buf, 0, b"BT /F")?;
+    i = write_uint(buf, i, font)?;
+    *buf.get_mut(i)? = b' ';
+    i += 1;
+    i = write_num(buf, i, size)?;
+    write_slice(buf, i, b" Tf 1 0 0 1 ")
+}
+
+fn write_lit(buf: &mut [u8], mut i: usize, s: &str) -> Option<usize> {
+    *buf.get_mut(i)? = b'(';
+    i += 1;
+    let bytes = s.as_bytes();
+    let mut j = 0;
+    while j < bytes.len() {
+        let b = bytes[j];
+        if lit_plain(b) {
+            let start = j;
+            j += 1;
+            while j < bytes.len() && lit_plain(bytes[j]) {
+                j += 1;
+            }
+            i = write_slice(buf, i, &bytes[start..j])?;
+        } else if b < 0x80 {
+            i = write_escaped(buf, i, winansi_code(b as char).unwrap_or(b'?'))?;
+            j += 1;
+        } else {
+            let c = s[j..].chars().next().unwrap();
+            i = write_escaped(buf, i, winansi_code(c).unwrap_or(b'?'))?;
+            j += c.len_utf8();
+        }
+    }
+    *buf.get_mut(i)? = b')';
+    Some(i + 1)
+}
+
+fn write_escaped(buf: &mut [u8], i: usize, b: u8) -> Option<usize> {
+    if matches!(b, b'(' | b')' | b'\\') {
+        if i + 2 > buf.len() {
+            return None;
+        }
+        buf[i] = b'\\';
+        buf[i + 1] = b;
+        Some(i + 2)
+    } else if (0x20..=0x7e).contains(&b) {
+        *buf.get_mut(i)? = b;
+        Some(i + 1)
+    } else {
+        if i + 4 > buf.len() {
+            return None;
+        }
+        buf[i] = b'\\';
+        buf[i + 1] = b'0' + (b >> 6);
+        buf[i + 2] = b'0' + ((b >> 3) & 7);
+        buf[i + 3] = b'0' + (b & 7);
+        Some(i + 4)
+    }
 }
 
 /// PostScript names must be bare PDF names: keep a safe alphabet.
@@ -370,17 +515,14 @@ pub fn write_pdf(pages: &[Page], fonts: &[FontUse]) -> Vec<u8> {
                     size,
                     text,
                 } => {
-                    content.extend_from_slice(b"BT /F");
-                    push_uint(&mut content, fnum(&fmap, *font));
-                    content.push(b' ');
-                    push_num(&mut content, *size);
-                    content.extend_from_slice(b" Tf 1 0 0 1 ");
-                    push_num(&mut content, *x);
-                    content.push(b' ');
-                    push_num(&mut content, page.height - y);
-                    content.extend_from_slice(b" Tm ");
-                    push_lit(&mut content, text);
-                    content.extend_from_slice(b" Tj ET\n");
+                    write_text_op(
+                        &mut content,
+                        fnum(&fmap, *font),
+                        *size,
+                        *x,
+                        page.height - y,
+                        text,
+                    );
                 }
                 DrawItem::Rule { x, y, w, h, gray } => {
                     push_num(&mut content, *gray);
