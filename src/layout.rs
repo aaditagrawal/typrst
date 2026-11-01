@@ -13,14 +13,49 @@ enum Tok<'a> {
     B,
 }
 
+/// One token of the line being filled. A word records its parent string
+/// and byte range so a merged run is one copy, not a copy per word.
+enum Atom<'a> {
+    W(&'a str, u32, u32, TextStyle, f64),
+    S(f64),
+    G(f64),
+}
+
+struct St {
+    w: f64,
+    spaces: u32,
+    has: bool,
+    pend_w: f64,
+    pend_n: u32,
+}
+
+struct Meta {
+    on: bool,
+    w: f64,
+    spaces: u32,
+    hard: bool,
+}
+
+struct Geom {
+    x0: f64,
+    width: f64,
+    align: HAlign,
+    justify: bool,
+}
+
 /// A laid-out line: token range plus precomputed natural width.
 #[derive(Clone, Copy)]
 struct Line {
     start: usize,
     end: usize,
+    // Table cells place token ranges directly; width and break kind stay
+    // on the line so `break_lines` keeps one definition of a break.
+    #[allow(dead_code)]
     w: f64,
+    #[allow(dead_code)]
     spaces: u32,
-    hard: bool, // terminated by an explicit LineBreak
+    #[allow(dead_code)]
+    hard: bool,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -54,8 +89,8 @@ pub fn layout<M: FontMetrics>(doc: &Document, metrics: &M) -> Vec<Page> {
         pending_gap: 0.0,
         after: 0.0,
         fresh: true,
-        toks: Vec::new(),
-        lines: Vec::new(),
+        cur: Vec::new(),
+        held: Vec::new(),
     };
     for b in &doc.blocks {
         lx.block(b);
@@ -75,8 +110,10 @@ struct Lx<'a, M: FontMetrics> {
     pending_gap: f64, // inter-block spacing applied to the next line's delta
     after: f64,       // trailing spacing of the previous block
     fresh: bool,      // nothing drawn on this page yet (top spacing collapses)
-    toks: Vec<Tok<'a>>,
-    lines: Vec<Line>,
+    /// Current line, and the previous line held back so justification
+    /// sees whether a line is the last one. Reused across blocks.
+    cur: Vec<Atom<'a>>,
+    held: Vec<Atom<'a>>,
 }
 
 impl<'a, M: FontMetrics> Lx<'a, M> {
@@ -349,7 +386,8 @@ impl<'a, M: FontMetrics> Lx<'a, M> {
         }
     }
 
-    /// Lay out inline content: tokenize, break into lines, place each.
+    /// Lay out inline content one line at a time. The finished line is held
+    /// back one step so justification can see which line is last.
     fn flow<F: Fn(TextStyle) -> TextStyle>(
         &mut self,
         content: &'a [Inline],
@@ -357,73 +395,262 @@ impl<'a, M: FontMetrics> Lx<'a, M> {
         width: f64,
         align: HAlign,
         justify: bool,
-        marker: Option<(String, TextStyle, f64)>,
+        mut marker: Option<(String, TextStyle, f64)>,
         xf: &F,
     ) {
-        let mut toks = std::mem::take(&mut self.toks);
-        let mut lines = std::mem::take(&mut self.lines);
-        toks.clear();
-        lines.clear();
-        tokenize(&mut toks, content, self.m, xf);
-        break_lines(&toks, width, &mut lines);
-        self.toks = toks;
-        self.lines = lines;
-
-        let n = self.lines.len();
-        let mut marker = marker;
-        if n == 0 {
-            if let Some((mt, mst, mx)) = marker.take() {
-                self.place_line(
-                    Line {
-                        start: 0,
-                        end: 0,
-                        w: 0.0,
-                        spaces: 0,
-                        hard: false,
-                    },
-                    x0,
-                    width,
-                    align,
-                    false,
-                    true,
-                    Some((mt.as_str(), mst, mx)),
-                );
+        let mut cur = std::mem::take(&mut self.cur);
+        let mut held = std::mem::take(&mut self.held);
+        cur.clear();
+        held.clear();
+        let g = Geom {
+            x0,
+            width,
+            align,
+            justify,
+        };
+        let mut st = St {
+            w: 0.0,
+            spaces: 0,
+            has: false,
+            pend_w: 0.0,
+            pend_n: 0,
+        };
+        let mut meta = Meta {
+            on: false,
+            w: 0.0,
+            spaces: 0,
+            hard: false,
+        };
+        for inl in content {
+            match inl {
+                Inline::Text { text, style } => {
+                    self.feed_text(
+                        text,
+                        xf(*style),
+                        &mut cur,
+                        &mut held,
+                        &mut st,
+                        &mut meta,
+                        &g,
+                        &mut marker,
+                    );
+                }
+                Inline::LineBreak => {
+                    self.park(
+                        true,
+                        &mut cur,
+                        &mut held,
+                        &mut st,
+                        &mut meta,
+                        &g,
+                        &mut marker,
+                    );
+                }
+                Inline::HSpace(w) => {
+                    self.push_gap(*w, &mut cur, &mut held, &mut st, &mut meta, &g, &mut marker);
+                }
             }
-            return;
         }
-        for k in 0..n {
-            let l = self.lines[k];
-            let last = k + 1 == n;
-            let mk = marker.take();
-            match mk {
-                Some((mt, mst, mx)) => self.place_line(
-                    l,
-                    x0,
-                    width,
-                    align,
-                    justify,
-                    last,
-                    Some((mt.as_str(), mst, mx)),
-                ),
-                None => self.place_line(l, x0, width, align, justify, last, None),
+        if st.has {
+            self.park(
+                false,
+                &mut cur,
+                &mut held,
+                &mut st,
+                &mut meta,
+                &g,
+                &mut marker,
+            );
+        }
+        if meta.on {
+            self.place_atoms(&held, meta.w, meta.spaces, meta.hard, &g, true, &mut marker);
+        } else if marker.is_some() {
+            self.place_atoms(&[], 0.0, 0, false, &g, true, &mut marker);
+        }
+        self.cur = cur;
+        self.held = held;
+    }
+
+    fn feed_text(
+        &mut self,
+        text: &'a str,
+        style: TextStyle,
+        cur: &mut Vec<Atom<'a>>,
+        held: &mut Vec<Atom<'a>>,
+        st: &mut St,
+        meta: &mut Meta,
+        g: &Geom,
+        marker: &mut Option<(String, TextStyle, f64)>,
+    ) {
+        let bytes = text.as_bytes();
+        let scale = style.size / 1000.0;
+        let lut = self.m.ascii_units(style.font);
+        let space_w = match lut {
+            Some(t) => t[b' ' as usize] as f64 * scale,
+            None => self.m.char_width(style.font, ' ') * scale,
+        };
+        let mut i = 0;
+        while i < bytes.len() {
+            let nws = ws_run(text, i);
+            if nws > 0 {
+                i += nws;
+                // A space before the first committed token stays in the line
+                // (it shifts x) but is not part of the line width. Spaces
+                // after a word stay pending until the next word fits.
+                if !st.has {
+                    if !matches!(cur.last(), Some(Atom::S(_))) {
+                        cur.push(Atom::S(space_w));
+                    }
+                } else if st.pend_n == 0 {
+                    st.pend_w = space_w;
+                    st.pend_n = 1;
+                }
+                continue;
             }
+            let start = i;
+            let mut units = 0u32;
+            let mut simple = lut.is_some();
+            while i < bytes.len() && ws_run(text, i) == 0 {
+                let b = bytes[i];
+                if b < 0x80 {
+                    if let Some(t) = lut {
+                        units += t[b as usize] as u32;
+                    }
+                    i += 1;
+                } else {
+                    let c = text[i..].chars().next().unwrap();
+                    simple = false;
+                    i += c.len_utf8();
+                }
+            }
+            let ww = if simple {
+                units as f64 * scale
+            } else {
+                self.m.str_width(style.font, style.size, &text[start..i])
+            };
+            self.push_word(
+                text,
+                start as u32,
+                i as u32,
+                style,
+                ww,
+                cur,
+                held,
+                st,
+                meta,
+                g,
+                marker,
+            );
         }
     }
 
-    /// Emit one line of tokens at the current vertical cursor.
-    fn place_line(
+    fn push_word(
         &mut self,
-        l: Line,
-        x0: f64,
-        width: f64,
-        align: HAlign,
-        justify: bool,
-        last: bool,
-        marker: Option<(&str, TextStyle, f64)>,
+        src: &'a str,
+        a: u32,
+        b: u32,
+        style: TextStyle,
+        ww: f64,
+        cur: &mut Vec<Atom<'a>>,
+        held: &mut Vec<Atom<'a>>,
+        st: &mut St,
+        meta: &mut Meta,
+        g: &Geom,
+        marker: &mut Option<(String, TextStyle, f64)>,
     ) {
-        // line box extents from the tallest run
-        let (size, asc, desc) = self.extents(&self.toks, l, marker.map(|m| m.1));
-        // Baseline delta = this line's own line height + inter-block gap.
+        if st.has && st.w + st.pend_w + ww > g.width {
+            st.pend_w = 0.0;
+            st.pend_n = 0;
+            self.park(false, cur, held, st, meta, g, marker);
+        }
+        if st.has && st.pend_n > 0 {
+            cur.push(Atom::S(st.pend_w));
+            st.w += st.pend_w;
+            st.spaces += 1;
+        }
+        cur.push(Atom::W(src, a, b, style, ww));
+        st.w += ww;
+        st.has = true;
+        st.pend_w = 0.0;
+        st.pend_n = 0;
+    }
+
+    fn push_gap(
+        &mut self,
+        gw: f64,
+        cur: &mut Vec<Atom<'a>>,
+        held: &mut Vec<Atom<'a>>,
+        st: &mut St,
+        meta: &mut Meta,
+        g: &Geom,
+        marker: &mut Option<(String, TextStyle, f64)>,
+    ) {
+        if st.has && st.w + st.pend_w + gw > g.width {
+            st.pend_w = 0.0;
+            st.pend_n = 0;
+            self.park(false, cur, held, st, meta, g, marker);
+            return;
+        }
+        if st.has && st.pend_n > 0 {
+            cur.push(Atom::S(st.pend_w));
+            st.w += st.pend_w;
+            st.spaces += 1;
+        }
+        cur.push(Atom::G(gw));
+        st.w += gw;
+        st.has = true;
+        st.pend_w = 0.0;
+        st.pend_n = 0;
+    }
+
+    /// Move the current line into the hold slot, placing the previous one.
+    fn park(
+        &mut self,
+        hard: bool,
+        cur: &mut Vec<Atom<'a>>,
+        held: &mut Vec<Atom<'a>>,
+        st: &mut St,
+        meta: &mut Meta,
+        g: &Geom,
+        marker: &mut Option<(String, TextStyle, f64)>,
+    ) {
+        if !hard && !st.has {
+            st.pend_w = 0.0;
+            st.pend_n = 0;
+            return;
+        }
+        // An empty hard line's range does not include a leading space.
+        if !st.has {
+            cur.clear();
+        }
+        if meta.on {
+            self.place_atoms(held, meta.w, meta.spaces, meta.hard, g, false, marker);
+        }
+        std::mem::swap(cur, held);
+        cur.clear();
+        meta.w = st.w;
+        meta.spaces = st.spaces;
+        meta.hard = hard;
+        meta.on = true;
+        st.w = 0.0;
+        st.spaces = 0;
+        st.has = false;
+        st.pend_w = 0.0;
+        st.pend_n = 0;
+    }
+
+    fn place_atoms(
+        &mut self,
+        atoms: &[Atom],
+        line_w: f64,
+        spaces: u32,
+        hard: bool,
+        g: &Geom,
+        last: bool,
+        marker: &mut Option<(String, TextStyle, f64)>,
+    ) {
+        let mk = marker.take();
+        let (size, asc, desc) = self.atom_extents(atoms, mk.as_ref().map(|m| m.1));
         let mut baseline = if self.fresh {
             self.st.margin_top + asc
         } else {
@@ -435,37 +662,57 @@ impl<'a, M: FontMetrics> Lx<'a, M> {
             self.finish_page();
             baseline = self.st.margin_top + asc;
         }
-
-        // justification slack over inter-word spaces, capped at 2x stretch
         let mut extra = 0.0;
-        if justify && !last && !l.hard && l.spaces > 0 && l.w < width {
-            let e = (width - l.w) / l.spaces as f64;
-            let ok = self.toks[l.start..l.end]
-                .iter()
-                .all(|t| !matches!(t, Tok::S(s) if *s < e));
-            if ok {
+        if g.justify && !last && !hard && spaces > 0 && line_w < g.width {
+            let e = (g.width - line_w) / spaces as f64;
+            if atoms.iter().all(|t| !matches!(t, Atom::S(s) if *s < e)) {
                 extra = e;
             }
         }
-        let slack = (width - l.w).max(0.0);
-        let x = x0
-            + match align {
+        let slack = (g.width - line_w).max(0.0);
+        let x = g.x0
+            + match g.align {
                 HAlign::Center => slack / 2.0,
                 HAlign::Right => slack,
                 HAlign::Left => 0.0,
             };
-        if let Some((mt, mst, mx)) = marker {
+        if let Some((mt, mst, mx)) = mk {
             self.items.push(DrawItem::Text {
                 x: mx,
                 y: baseline,
                 font: mst.font,
                 size: mst.size,
-                text: InlineStr::from(mt),
+                text: InlineStr::from(mt.as_str()),
             });
         }
-        emit_line(&mut self.items, &self.toks, l, x, baseline, extra, size);
+        emit_atoms(&mut self.items, atoms, x, baseline, extra);
         self.y = baseline;
         self.fresh = false;
+    }
+
+    fn atom_extents(&self, atoms: &[Atom], marker: Option<TextStyle>) -> (f64, f64, f64) {
+        let mut size = 0.0f64;
+        let mut asc = 0.0f64;
+        let mut desc = 0.0f64;
+        let mut extent = |st: TextStyle| {
+            size = size.max(st.size);
+            asc = asc.max(self.m.ascent(st.font) * st.size / 1000.0);
+            desc = desc.max(self.m.descent(st.font) * st.size / 1000.0);
+        };
+        for a in atoms {
+            if let Atom::W(_, _, _, st, _) = a {
+                extent(*st);
+            }
+        }
+        if let Some(st) = marker {
+            extent(st);
+        }
+        if size == 0.0 {
+            size = self.st.font_size;
+            asc = self.m.ascent(FontId::Regular) * size / 1000.0;
+            desc = self.m.descent(FontId::Regular) * size / 1000.0;
+        }
+        (size, asc, desc)
     }
 
     /// (size, ascent, descent) of a line's tallest run, in pt. Falls back to
@@ -519,6 +766,125 @@ impl<'a, M: FontMetrics> Lx<'a, M> {
             }
         }
         w
+    }
+}
+
+/// Length of a whitespace run at `i`, or 0 when `i` is not whitespace.
+#[inline(always)]
+fn ws_run(text: &str, i: usize) -> usize {
+    let bytes = text.as_bytes();
+    let mut j = i;
+    while j < bytes.len() {
+        let b = bytes[j];
+        if b < 0x80 {
+            if byte_is_ws(b) {
+                j += 1;
+            } else {
+                break;
+            }
+        } else {
+            let c = text[j..].chars().next().unwrap();
+            if c.is_whitespace() {
+                j += c.len_utf8();
+            } else {
+                break;
+            }
+        }
+    }
+    j - i
+}
+
+/// Emit one line of atoms. Same-style words separated by a single source
+/// space become one draw item copied from that parent slice.
+fn emit_atoms(items: &mut Vec<DrawItem>, atoms: &[Atom], mut x: f64, baseline: f64, extra: f64) {
+    let mut sep = Sep::Brk;
+    let mut buf = InlineStr::new();
+    let mut bx = 0.0;
+    let mut bs = TextStyle {
+        font: FontId::Regular,
+        size: 0.0,
+    };
+    let mut has = false;
+    let mut span_src: Option<&str> = None;
+    let mut span_a = 0usize;
+    let mut span_b = 0usize;
+    let mut span_ok = false;
+
+    for t in atoms {
+        match *t {
+            Atom::W(src, a, b, st, wid) => {
+                let a = a as usize;
+                let b = b as usize;
+                if has && bs == st && sep != Sep::Brk {
+                    let extend = span_ok
+                        && std::ptr::eq(span_src.unwrap(), src)
+                        && ((sep == Sep::Sp && a == span_b + 1 && src.as_bytes()[span_b] == b' ')
+                            || (sep == Sep::Cat && a == span_b));
+                    if extend {
+                        span_b = b;
+                    } else {
+                        if span_ok {
+                            buf = InlineStr::from(&span_src.unwrap()[span_a..span_b]);
+                            span_ok = false;
+                        }
+                        if sep == Sep::Sp {
+                            buf.push_str(" ");
+                        }
+                        buf.push_str(&src[a..b]);
+                    }
+                } else {
+                    if has {
+                        items.push(DrawItem::Text {
+                            x: bx,
+                            y: baseline,
+                            font: bs.font,
+                            size: bs.size,
+                            text: take_run(&mut buf, span_ok, span_src, span_a, span_b),
+                        });
+                    }
+                    bx = x;
+                    bs = st;
+                    span_src = Some(src);
+                    span_a = a;
+                    span_b = b;
+                    span_ok = true;
+                    has = true;
+                }
+                x += wid;
+                sep = Sep::Cat;
+            }
+            Atom::S(nat) => {
+                x += if extra > 0.0 { nat + extra } else { nat };
+                sep = if extra > 0.0 { Sep::Brk } else { Sep::Sp };
+            }
+            Atom::G(g) => {
+                x += g;
+                sep = Sep::Brk;
+            }
+        }
+    }
+    if has {
+        items.push(DrawItem::Text {
+            x: bx,
+            y: baseline,
+            font: bs.font,
+            size: bs.size,
+            text: take_run(&mut buf, span_ok, span_src, span_a, span_b),
+        });
+    }
+}
+
+fn take_run(
+    buf: &mut InlineStr,
+    span_ok: bool,
+    span_src: Option<&str>,
+    span_a: usize,
+    span_b: usize,
+) -> InlineStr {
+    if span_ok {
+        InlineStr::from(&span_src.unwrap()[span_a..span_b])
+    } else {
+        std::mem::take(buf)
     }
 }
 
