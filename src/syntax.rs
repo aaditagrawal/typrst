@@ -48,18 +48,21 @@ struct P<'a> {
     depth: u32,
 }
 
-/// Bytes that can end a `*...*` / `_..._` scan. Everything else is skipped
-/// in a tight loop (the same split simdjson uses: classify, then act).
-#[inline(always)]
-fn find_interesting(c: u8, m: u8) -> bool {
-    c == b'\n' || c == b'\\' || c == b'`' || c == b'/' || c == b']' || c == m
-}
+/// Bytes that can end a `*...*` / `_..._` scan, not counting the marker
+/// itself. The marker is tested beside the table.
+const INTERESTING: [u8; 256] = {
+    let mut t = [0u8; 256];
+    t[b'\n' as usize] = 1;
+    t[b'\\' as usize] = 1;
+    t[b'`' as usize] = 1;
+    t[b'/' as usize] = 1;
+    t[b']' as usize] = 1;
+    t
+};
 
-/// Bytes that `inline` can copy in one slice: printable ASCII and space,
-/// excluding markup sigils. `]` is excluded so a content block still stops
-/// on the closer instead of swallowing it.
-#[inline(always)]
-fn is_plain_markup(c: u8) -> bool {
+/// Printable ASCII and space, excluding markup sigils. `]` is excluded so
+/// a content block still stops on the closer instead of swallowing it.
+const fn plain_byte(c: u8) -> bool {
     c == b' '
         || (c > b' '
             && c < 0x7f
@@ -68,6 +71,18 @@ fn is_plain_markup(c: u8) -> bool {
                 b'*' | b'_' | b'`' | b'\\' | b'#' | b'$' | b'<' | b'@' | b'/' | b']'
             ))
 }
+
+const PLAIN: [u8; 256] = {
+    let mut t = [0u8; 256];
+    let mut c = 0;
+    while c < 256 {
+        if plain_byte(c as u8) {
+            t[c] = 1;
+        }
+        c += 1;
+    }
+    t
+};
 
 fn flush(out: &mut Vec<Node>, text: &mut String) {
     if !text.is_empty() {
@@ -496,10 +511,25 @@ impl<'a> P<'a> {
                 return;
             }
             // simdjson-style stage split: copy a plain run, then handle one sigil.
-            if is_plain_markup(c) {
+            if PLAIN[c as usize] != 0 {
                 let mut i = pos + 1;
                 let n = bytes.len();
-                while i < n && is_plain_markup(bytes[i]) {
+                // Eight loads, then a scalar tail. The class of a byte is
+                // one table load instead of the sigil match.
+                while i + 8 <= n
+                    && PLAIN[bytes[i] as usize]
+                        & PLAIN[bytes[i + 1] as usize]
+                        & PLAIN[bytes[i + 2] as usize]
+                        & PLAIN[bytes[i + 3] as usize]
+                        & PLAIN[bytes[i + 4] as usize]
+                        & PLAIN[bytes[i + 5] as usize]
+                        & PLAIN[bytes[i + 6] as usize]
+                        & PLAIN[bytes[i + 7] as usize]
+                        != 0
+                {
+                    i += 8;
+                }
+                while i < n && PLAIN[bytes[i] as usize] != 0 {
                     i += 1;
                 }
                 text.push_str(&self.src[pos..i]);
@@ -607,9 +637,9 @@ impl<'a> P<'a> {
         let limit = (self.pos + (1 << 16)).min(s.len());
         while i < limit {
             let c = s[i];
-            if !find_interesting(c, m) {
+            if INTERESTING[c as usize] == 0 && c != m {
                 i += 1;
-                while i < limit && !find_interesting(s[i], m) {
+                while i < limit && INTERESTING[s[i] as usize] == 0 && s[i] != m {
                     i += 1;
                 }
                 continue;
