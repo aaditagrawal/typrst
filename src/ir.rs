@@ -383,6 +383,123 @@ pub struct Document {
 
 // ------------------- Display list (layout output) -------------------
 
+/// Short runs (a styled word, a list marker) stay inside the draw item.
+/// Longer lines spill to one heap string. Avoids a malloc per word, which
+/// is where line placement was spending its time.
+const INLINE_CAP: usize = 23;
+
+#[derive(Clone)]
+enum InlineStore {
+    Inl([u8; INLINE_CAP], u8),
+    Heap(String),
+}
+
+#[derive(Clone)]
+pub struct InlineStr {
+    store: InlineStore,
+}
+
+impl InlineStr {
+    pub fn new() -> Self {
+        Self {
+            store: InlineStore::Inl([0; INLINE_CAP], 0),
+        }
+    }
+
+    pub fn as_str(&self) -> &str {
+        match &self.store {
+            InlineStore::Inl(buf, n) => std::str::from_utf8(&buf[..*n as usize]).unwrap(),
+            InlineStore::Heap(s) => s.as_str(),
+        }
+    }
+
+    pub fn push_str(&mut self, s: &str) {
+        if s.is_empty() {
+            return;
+        }
+        if let InlineStore::Heap(h) = &mut self.store {
+            h.push_str(s);
+            return;
+        }
+        let len = match &self.store {
+            InlineStore::Inl(_, n) => *n as usize,
+            InlineStore::Heap(_) => return,
+        };
+        if len + s.len() <= INLINE_CAP {
+            if let InlineStore::Inl(buf, n) = &mut self.store {
+                buf[len..len + s.len()].copy_from_slice(s.as_bytes());
+                *n = (len + s.len()) as u8;
+            }
+        } else {
+            let mut h = String::with_capacity(len + s.len() + 16);
+            h.push_str(self.as_str());
+            h.push_str(s);
+            self.store = InlineStore::Heap(h);
+        }
+    }
+}
+
+impl Default for InlineStr {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl From<&str> for InlineStr {
+    fn from(s: &str) -> Self {
+        if s.len() <= INLINE_CAP {
+            let mut buf = [0u8; INLINE_CAP];
+            buf[..s.len()].copy_from_slice(s.as_bytes());
+            Self {
+                store: InlineStore::Inl(buf, s.len() as u8),
+            }
+        } else {
+            Self {
+                store: InlineStore::Heap(s.to_string()),
+            }
+        }
+    }
+}
+
+impl From<String> for InlineStr {
+    fn from(s: String) -> Self {
+        if s.len() <= INLINE_CAP {
+            Self::from(s.as_str())
+        } else {
+            Self {
+                store: InlineStore::Heap(s),
+            }
+        }
+    }
+}
+
+impl std::ops::Deref for InlineStr {
+    type Target = str;
+    fn deref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl PartialEq for InlineStr {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_str() == other.as_str()
+    }
+}
+
+impl PartialEq<str> for InlineStr {
+    fn eq(&self, other: &str) -> bool {
+        self.as_str() == other
+    }
+}
+
+impl Eq for InlineStr {}
+
+impl std::fmt::Debug for InlineStr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(self.as_str(), f)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Page {
     pub width: f64,
@@ -399,7 +516,7 @@ pub enum DrawItem {
         y: f64,
         font: FontId,
         size: f64,
-        text: String,
+        text: InlineStr,
     },
     /// A filled rectangle at (x, y) with size (w, h) — used for table
     /// borders and rules. `gray` is 0.0 black .. 1.0 white.
@@ -420,6 +537,14 @@ pub enum DrawItem {
 pub trait FontMetrics {
     /// Width of a Unicode scalar in 1/1000 em for `font`.
     fn char_width(&self, font: FontId, c: char) -> f64;
+
+    /// Byte LUT of AFM units for `0..128`, if this face has one.
+    /// The line breaker uses it to turn a word's width into a few adds
+    /// with the font match hoisted out of the byte loop. `None` falls
+    /// back to [`char_width`](Self::char_width).
+    fn ascii_units(&self, _font: FontId) -> Option<&'static [u16; 128]> {
+        None
+    }
 
     /// Width of a string rendered at `size` pt, in points.
     fn str_width(&self, font: FontId, size: f64, s: &str) -> f64 {

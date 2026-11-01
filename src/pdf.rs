@@ -53,17 +53,47 @@ fn push_num(out: &mut Vec<u8>, v: f64) {
     }
 }
 
+#[inline(always)]
+fn lit_plain(b: u8) -> bool {
+    b >= 0x20 && b < 0x7f && b != b'(' && b != b')' && b != b'\\'
+}
+
+fn push_escaped(out: &mut Vec<u8>, b: u8) {
+    if matches!(b, b'(' | b')' | b'\\') {
+        out.push(b'\\');
+        out.push(b);
+    } else if (0x20..=0x7e).contains(&b) {
+        out.push(b);
+    } else {
+        // Three octal digits, matching `\{b:03o}`.
+        out.push(b'\\');
+        out.push(b'0' + (b >> 6));
+        out.push(b'0' + ((b >> 3) & 7));
+        out.push(b'0' + (b & 7));
+    }
+}
+
 /// WinAnsi-encode `s` as an escaped PDF literal string, `(…)` included.
 fn push_lit(out: &mut Vec<u8>, s: &str) {
     out.push(b'(');
-    for c in s.chars() {
-        let b = winansi_code(c).unwrap_or(b'?');
-        if matches!(b, b'(' | b')' | b'\\') {
-            out.extend_from_slice(&[b'\\', b]);
-        } else if (0x20..=0x7e).contains(&b) {
-            out.push(b);
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if lit_plain(b) {
+            let start = i;
+            i += 1;
+            while i < bytes.len() && lit_plain(bytes[i]) {
+                i += 1;
+            }
+            out.extend_from_slice(&bytes[start..i]);
+        } else if b < 0x80 {
+            push_escaped(out, winansi_code(b as char).unwrap_or(b'?'));
+            i += 1;
         } else {
-            write!(out, "\\{b:03o}").unwrap();
+            let c = s[i..].chars().next().unwrap();
+            push_escaped(out, winansi_code(c).unwrap_or(b'?'));
+            i += c.len_utf8();
         }
     }
     out.push(b')');
@@ -246,15 +276,45 @@ fn used_fonts(pages: &[Page]) -> Vec<FontId> {
         .collect()
 }
 
-fn fnum(used: &[FontId], f: FontId) -> u64 {
-    used.iter()
-        .position(|x| *x == f)
-        .map(|i| i as u64 + 1)
-        .unwrap_or(1)
+struct FMap {
+    /// PDF font numbers for the six base-14 faces, in `FontId` order.
+    base: [u64; 6],
+    ext: Vec<(u16, u64)>,
+}
+
+fn font_map(used: &[FontId]) -> FMap {
+    let mut base = [1u64; 6];
+    let mut ext = Vec::new();
+    for (i, f) in used.iter().enumerate() {
+        let n = i as u64 + 1;
+        match *f {
+            FontId::Regular => base[0] = n,
+            FontId::Bold => base[1] = n,
+            FontId::Italic => base[2] = n,
+            FontId::BoldItalic => base[3] = n,
+            FontId::Mono => base[4] = n,
+            FontId::MonoBold => base[5] = n,
+            FontId::Ext(e) => ext.push((e, n)),
+        }
+    }
+    FMap { base, ext }
+}
+
+fn fnum(map: &FMap, f: FontId) -> u64 {
+    match f {
+        FontId::Regular => map.base[0],
+        FontId::Bold => map.base[1],
+        FontId::Italic => map.base[2],
+        FontId::BoldItalic => map.base[3],
+        FontId::Mono => map.base[4],
+        FontId::MonoBold => map.base[5],
+        FontId::Ext(e) => map.ext.iter().find(|p| p.0 == e).map(|p| p.1).unwrap_or(1),
+    }
 }
 
 pub fn write_pdf(pages: &[Page], fonts: &[FontUse]) -> Vec<u8> {
     let used = used_fonts(pages);
+    let fmap = font_map(&used);
     let plans: Vec<Plan> = used.iter().map(|f| plan_for(*f, fonts)).collect();
 
     // Object ids: base faces take 1 object; embedded faces take 3
@@ -311,7 +371,7 @@ pub fn write_pdf(pages: &[Page], fonts: &[FontUse]) -> Vec<u8> {
                     text,
                 } => {
                     content.extend_from_slice(b"BT /F");
-                    push_uint(&mut content, fnum(&used, *font));
+                    push_uint(&mut content, fnum(&fmap, *font));
                     content.push(b' ');
                     push_num(&mut content, *size);
                     content.extend_from_slice(b" Tf 1 0 0 1 ");

@@ -44,7 +44,7 @@ fn ident(s: TextStyle) -> TextStyle {
     s
 }
 
-pub fn layout(doc: &Document, metrics: &dyn FontMetrics) -> Vec<Page> {
+pub fn layout<M: FontMetrics>(doc: &Document, metrics: &M) -> Vec<Page> {
     let mut lx = Lx {
         m: metrics,
         st: &doc.styles,
@@ -66,8 +66,8 @@ pub fn layout(doc: &Document, metrics: &dyn FontMetrics) -> Vec<Page> {
     lx.pages
 }
 
-struct Lx<'a> {
-    m: &'a dyn FontMetrics,
+struct Lx<'a, M: FontMetrics> {
+    m: &'a M,
     st: &'a Styles,
     pages: Vec<Page>,
     items: Vec<DrawItem>,
@@ -79,7 +79,7 @@ struct Lx<'a> {
     lines: Vec<Line>,
 }
 
-impl<'a> Lx<'a> {
+impl<'a, M: FontMetrics> Lx<'a, M> {
     fn text_w(&self) -> f64 {
         self.st.page_width - self.st.margin_left - self.st.margin_right
     }
@@ -201,7 +201,7 @@ impl<'a> Lx<'a> {
                         y: baseline,
                         font: FontId::Mono,
                         size,
-                        text: line.to_string(),
+                        text: InlineStr::from(line),
                     });
                     self.y = baseline;
                     self.fresh = false;
@@ -350,7 +350,7 @@ impl<'a> Lx<'a> {
     }
 
     /// Lay out inline content: tokenize, break into lines, place each.
-    fn flow(
+    fn flow<F: Fn(TextStyle) -> TextStyle>(
         &mut self,
         content: &'a [Inline],
         x0: f64,
@@ -358,7 +358,7 @@ impl<'a> Lx<'a> {
         align: HAlign,
         justify: bool,
         marker: Option<(String, TextStyle, f64)>,
-        xf: &dyn Fn(TextStyle) -> TextStyle,
+        xf: &F,
     ) {
         let mut toks = std::mem::take(&mut self.toks);
         let mut lines = std::mem::take(&mut self.lines);
@@ -460,7 +460,7 @@ impl<'a> Lx<'a> {
                 y: baseline,
                 font: mst.font,
                 size: mst.size,
-                text: mt.to_string(),
+                text: InlineStr::from(mt),
             });
         }
         emit_line(&mut self.items, &self.toks, l, x, baseline, extra, size);
@@ -535,7 +535,7 @@ fn emit_line(
     size: f64,
 ) {
     let mut sep = Sep::Brk;
-    let mut buf = String::new();
+    let mut buf = InlineStr::new();
     let mut bx = 0.0;
     let mut bs = TextStyle {
         font: FontId::Regular,
@@ -547,7 +547,7 @@ fn emit_line(
             Tok::W(w, st, wid) => {
                 if has && bs == st && sep != Sep::Brk {
                     if sep == Sep::Sp {
-                        buf.push(' ');
+                        buf.push_str(" ");
                     }
                     buf.push_str(w);
                 } else {
@@ -590,35 +590,137 @@ fn emit_line(
     }
 }
 
+/// ASCII bytes that `char::is_whitespace` treats as whitespace.
+#[inline(always)]
+fn byte_is_ws(b: u8) -> bool {
+    matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0x0c)
+}
+
+fn push_space<'a>(toks: &mut Vec<Tok<'a>>, space_w: f64) {
+    if !matches!(toks.last(), Some(Tok::S(_))) {
+        toks.push(Tok::S(space_w));
+    }
+}
+
+/// Word widths from a byte LUT. The font match happened once, outside.
+fn push_text_lut<'a, M: FontMetrics>(
+    toks: &mut Vec<Tok<'a>>,
+    text: &'a str,
+    st: TextStyle,
+    lut: &[u16; 128],
+    m: &M,
+) {
+    let scale = st.size / 1000.0;
+    let space_w = lut[b' ' as usize] as f64 * scale;
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b < 0x80 && byte_is_ws(b) {
+            push_space(toks, space_w);
+            i += 1;
+            continue;
+        }
+        if b >= 0x80 {
+            let c = text[i..].chars().next().unwrap();
+            if c.is_whitespace() {
+                push_space(toks, space_w);
+                i += c.len_utf8();
+                continue;
+            }
+        }
+        let start = i;
+        let mut units = 0u32;
+        let mut simple = true;
+        while i < bytes.len() {
+            let b = bytes[i];
+            if b < 0x80 {
+                if byte_is_ws(b) {
+                    break;
+                }
+                units += lut[b as usize] as u32;
+                i += 1;
+            } else {
+                let c = text[i..].chars().next().unwrap();
+                if c.is_whitespace() {
+                    break;
+                }
+                simple = false;
+                i += c.len_utf8();
+            }
+        }
+        let w = &text[start..i];
+        let width = if simple {
+            units as f64 * scale
+        } else {
+            m.str_width(st.font, st.size, w)
+        };
+        toks.push(Tok::W(w, st, width));
+    }
+}
+
+fn push_text_slow<'a, M: FontMetrics>(
+    toks: &mut Vec<Tok<'a>>,
+    text: &'a str,
+    st: TextStyle,
+    m: &M,
+) {
+    let scale = st.size / 1000.0;
+    let space_w = m.char_width(st.font, ' ') * scale;
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b < 0x80 && byte_is_ws(b) {
+            push_space(toks, space_w);
+            i += 1;
+            continue;
+        }
+        if b >= 0x80 {
+            let c = text[i..].chars().next().unwrap();
+            if c.is_whitespace() {
+                push_space(toks, space_w);
+                i += c.len_utf8();
+                continue;
+            }
+        }
+        let start = i;
+        while i < bytes.len() {
+            let b = bytes[i];
+            if b < 0x80 {
+                if byte_is_ws(b) {
+                    break;
+                }
+                i += 1;
+            } else {
+                let c = text[i..].chars().next().unwrap();
+                if c.is_whitespace() {
+                    break;
+                }
+                i += c.len_utf8();
+            }
+        }
+        let w = &text[start..i];
+        toks.push(Tok::W(w, st, m.str_width(st.font, st.size, w)));
+    }
+}
+
 /// Split inline content into word/space tokens; words get `xf`-mapped styles.
-fn tokenize<'a>(
+/// One forward scan per run (first-fit, Θ(n)); width is one table load per byte.
+fn tokenize<'a, M: FontMetrics, F: Fn(TextStyle) -> TextStyle>(
     toks: &mut Vec<Tok<'a>>,
     content: &'a [Inline],
-    m: &dyn FontMetrics,
-    xf: &dyn Fn(TextStyle) -> TextStyle,
+    m: &M,
+    xf: &F,
 ) {
     for i in content {
         match i {
             Inline::Text { text, style } => {
                 let st = xf(*style);
-                let space_w = m.str_width(st.font, st.size, " ");
-                let mut w0 = None;
-                for (k, c) in text.char_indices() {
-                    if c.is_whitespace() {
-                        if let Some(s) = w0.take() {
-                            let w = &text[s..k];
-                            toks.push(Tok::W(w, st, m.str_width(st.font, st.size, w)));
-                        }
-                        if !matches!(toks.last(), Some(Tok::S(_))) {
-                            toks.push(Tok::S(space_w));
-                        }
-                    } else if w0.is_none() {
-                        w0 = Some(k);
-                    }
-                }
-                if let Some(s) = w0 {
-                    let w = &text[s..];
-                    toks.push(Tok::W(w, st, m.str_width(st.font, st.size, w)));
+                if let Some(lut) = m.ascii_units(st.font) {
+                    push_text_lut(toks, text, st, lut, m);
+                } else {
+                    push_text_slow(toks, text, st, m);
                 }
             }
             Inline::LineBreak => toks.push(Tok::B),

@@ -27,60 +27,73 @@ pub fn base14_name(font: FontId) -> &'static str {
     }
 }
 
+/// Map a Unicode scalar to its WinAnsiEncoding byte, if representable.
+/// Const so the inverse table is built at compile time (Adobe AFM: width
+/// and encoding are a 256-slot array, not a search).
+pub(crate) const fn winansi_u32(c: u32) -> Option<u8> {
+    match c {
+        0x20..=0x7e | 0xa0..=0xff => Some(c as u8),
+        0x20ac => Some(0x80),
+        0x201a => Some(0x82),
+        0x192 => Some(0x83),
+        0x201e => Some(0x84),
+        0x2026 => Some(0x85),
+        0x2020 => Some(0x86),
+        0x2021 => Some(0x87),
+        0x2c6 => Some(0x88),
+        0x2030 => Some(0x89),
+        0x160 => Some(0x8a),
+        0x2039 => Some(0x8b),
+        0x152 => Some(0x8c),
+        0x17d => Some(0x8e),
+        0x2018 => Some(0x91),
+        0x2019 => Some(0x92),
+        0x201c => Some(0x93),
+        0x201d => Some(0x94),
+        0x2022 => Some(0x95),
+        0x2013 => Some(0x96),
+        0x2014 => Some(0x97),
+        0x2dc => Some(0x98),
+        0x2122 => Some(0x99),
+        0x161 => Some(0x9a),
+        0x203a => Some(0x9b),
+        0x153 => Some(0x9c),
+        0x17e => Some(0x9e),
+        0x178 => Some(0x9f),
+        _ => None,
+    }
+}
+
 /// Map a Unicode char to its WinAnsiEncoding byte, if representable.
 pub(crate) fn winansi_code(c: char) -> Option<u8> {
-    Some(match c {
-        ' '..='~' | '\u{a0}'..='\u{ff}' => c as u8,
-        '\u{20ac}' => 0x80,
-        '\u{201a}' => 0x82,
-        '\u{192}' => 0x83,
-        '\u{201e}' => 0x84,
-        '\u{2026}' => 0x85,
-        '\u{2020}' => 0x86,
-        '\u{2021}' => 0x87,
-        '\u{2c6}' => 0x88,
-        '\u{2030}' => 0x89,
-        '\u{160}' => 0x8a,
-        '\u{2039}' => 0x8b,
-        '\u{152}' => 0x8c,
-        '\u{17d}' => 0x8e,
-        '\u{2018}' => 0x91,
-        '\u{2019}' => 0x92,
-        '\u{201c}' => 0x93,
-        '\u{201d}' => 0x94,
-        '\u{2022}' => 0x95,
-        '\u{2013}' => 0x96,
-        '\u{2014}' => 0x97,
-        '\u{2dc}' => 0x98,
-        '\u{2122}' => 0x99,
-        '\u{161}' => 0x9a,
-        '\u{203a}' => 0x9b,
-        '\u{153}' => 0x9c,
-        '\u{17e}' => 0x9e,
-        '\u{178}' => 0x9f,
-        _ => return None,
-    })
+    winansi_u32(c as u32)
+}
+
+const fn winansi_inverse_const() -> [u32; 256] {
+    let mut t = [0u32; 256];
+    let mut u = 1u32;
+    while u < 0x2200 {
+        if let Some(b) = winansi_u32(u) {
+            t[b as usize] = u;
+        }
+        u += 1;
+    }
+    t
 }
 
 /// Inverse of `winansi_code`: WinAnsi byte -> Unicode scalar (0 = unmapped).
-/// Used to build `/Widths` arrays for embedded fonts.
+pub(crate) const WINANSI_INV: [u32; 256] = winansi_inverse_const();
+
+/// Inverse of `winansi_code`. Compile-time table; the copy is ~1 KB.
 pub(crate) fn winansi_inverse() -> [u32; 256] {
-    let mut t = [0u32; 256];
-    for u in 1..0x2200u32 {
-        if let Some(c) = char::from_u32(u) {
-            if let Some(b) = winansi_code(c) {
-                t[b as usize] = u;
-            }
-        }
-    }
-    t
+    WINANSI_INV
 }
 
 // Times widths in 1/1000 em (extracted from the system Times faces, which
 // are metric-compatible with the Adobe base-14 AFMs), indexed by WinAnsi
 // code minus 32. Undefined slots carry the '?' width; they are unreachable
 // because winansi_code() never produces them.
-static TIMES: [u16; 224] = [
+const TIMES: [u16; 224] = [
     250, 333, 408, 500, 500, 833, 778, 180, 333, 333, 500, 564, 250, 333, 250, 278, 500, 500, 500,
     500, 500, 500, 500, 500, 500, 500, 278, 278, 564, 564, 564, 444, 921, 722, 667, 667, 722, 611,
     556, 722, 722, 333, 389, 722, 611, 889, 722, 722, 556, 722, 667, 556, 611, 722, 722, 944, 722,
@@ -95,7 +108,7 @@ static TIMES: [u16; 224] = [
     500, 500, 500, 500, 500, 500, 500, 549, 500, 500, 500, 500, 500, 500, 500, 500,
 ];
 
-static TIMES_BOLD: [u16; 224] = [
+const TIMES_BOLD: [u16; 224] = [
     250, 333, 555, 500, 500, 1000, 833, 278, 333, 333, 500, 570, 250, 333, 250, 278, 500, 500, 500,
     500, 500, 500, 500, 500, 500, 500, 333, 333, 570, 570, 570, 500, 930, 722, 667, 722, 722, 667,
     611, 778, 778, 389, 500, 778, 667, 944, 722, 778, 611, 778, 722, 556, 667, 722, 722, 1000, 722,
@@ -110,7 +123,7 @@ static TIMES_BOLD: [u16; 224] = [
     278, 500, 556, 500, 500, 500, 500, 500, 549, 500, 556, 556, 556, 556, 500, 556, 500,
 ];
 
-static TIMES_ITALIC: [u16; 224] = [
+const TIMES_ITALIC: [u16; 224] = [
     250, 333, 420, 500, 500, 833, 778, 214, 333, 333, 500, 675, 250, 333, 250, 278, 500, 500, 500,
     500, 500, 500, 500, 500, 500, 500, 333, 333, 675, 675, 675, 500, 920, 611, 611, 667, 722, 611,
     611, 722, 722, 333, 444, 667, 556, 833, 667, 722, 611, 722, 611, 500, 556, 722, 611, 833, 611,
@@ -125,7 +138,7 @@ static TIMES_ITALIC: [u16; 224] = [
     500, 500, 500, 500, 500, 500, 549, 500, 500, 500, 500, 500, 444, 500, 444,
 ];
 
-static TIMES_BOLD_ITALIC: [u16; 224] = [
+const TIMES_BOLD_ITALIC: [u16; 224] = [
     250, 389, 555, 500, 500, 833, 778, 278, 333, 333, 500, 570, 250, 333, 250, 278, 500, 500, 500,
     500, 500, 500, 500, 500, 500, 500, 333, 333, 570, 570, 570, 500, 832, 667, 667, 667, 722, 667,
     667, 722, 778, 389, 500, 667, 611, 889, 722, 722, 611, 722, 667, 556, 611, 722, 667, 889, 667,
@@ -140,24 +153,111 @@ static TIMES_BOLD_ITALIC: [u16; 224] = [
     395, 500, 556, 500, 500, 500, 500, 500, 549, 500, 556, 556, 556, 556, 444, 500, 444,
 ];
 
+/// Byte-indexed widths for `0..128`. Controls and DEL use the '?' width.
+/// A direct load is the AFM model (`cwi[256]`) and stays in L1.
+const fn ascii_lut(table: &[u16; 224]) -> [u16; 128] {
+    let mut a = [0u16; 128];
+    let q = table[b'?' as usize - 32];
+    let mut i = 0;
+    while i < 128 {
+        a[i] = if i >= 32 && i < 127 {
+            table[i - 32]
+        } else {
+            q
+        };
+        i += 1;
+    }
+    a
+}
+
+const TIMES_ASCII: [u16; 128] = ascii_lut(&TIMES);
+const TIMES_BOLD_ASCII: [u16; 128] = ascii_lut(&TIMES_BOLD);
+const TIMES_ITALIC_ASCII: [u16; 128] = ascii_lut(&TIMES_ITALIC);
+const TIMES_BI_ASCII: [u16; 128] = ascii_lut(&TIMES_BOLD_ITALIC);
+
 fn is_mono(font: FontId) -> bool {
     matches!(font, FontId::Mono | FontId::MonoBold)
 }
 
+fn serif_table(font: FontId) -> &'static [u16; 224] {
+    match font {
+        FontId::Bold => &TIMES_BOLD,
+        FontId::Italic => &TIMES_ITALIC,
+        FontId::BoldItalic => &TIMES_BOLD_ITALIC,
+        _ => &TIMES,
+    }
+}
+
+fn serif_ascii(font: FontId) -> &'static [u16; 128] {
+    match font {
+        FontId::Bold => &TIMES_BOLD_ASCII,
+        FontId::Italic => &TIMES_ITALIC_ASCII,
+        FontId::BoldItalic => &TIMES_BI_ASCII,
+        _ => &TIMES_ASCII,
+    }
+}
+
+/// Sum of AFM units (1/1000 em) for `s` in a serif face.
+/// One predictable `b < 128` branch per byte; the Latin text in a document
+/// never takes it. `str::is_ascii` is not used: its prologue loses on the
+/// short words this loop sees thousands of times.
+#[inline(always)]
+fn serif_units(font: FontId, s: &str) -> u32 {
+    let lut = serif_ascii(font);
+    let bytes = s.as_bytes();
+    let mut sum = 0u32;
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b < 128 {
+            sum += lut[b as usize] as u32;
+            i += 1;
+        } else {
+            let table = serif_table(font);
+            let ch = s[i..].chars().next().unwrap();
+            let code = winansi_code(ch).unwrap_or(b'?');
+            sum += table[code as usize - 32] as u32;
+            i += ch.len_utf8();
+        }
+    }
+    sum
+}
+
 impl FontMetrics for Afm {
+    #[inline(always)]
     fn char_width(&self, font: FontId, c: char) -> f64 {
         if is_mono(font) {
             return 600.0;
         }
+        let u = c as u32;
+        if u < 128 {
+            return serif_ascii(font)[u as usize] as f64;
+        }
         let code = winansi_code(c).unwrap_or(b'?') as usize;
-        let table = match font {
-            FontId::Regular => &TIMES,
-            FontId::Bold => &TIMES_BOLD,
-            FontId::Italic => &TIMES_ITALIC,
-            FontId::BoldItalic => &TIMES_BOLD_ITALIC,
-            _ => &TIMES,
-        };
-        table[code - 32] as f64
+        serif_table(font)[code - 32] as f64
+    }
+
+    #[inline(always)]
+    fn ascii_units(&self, font: FontId) -> Option<&'static [u16; 128]> {
+        if is_mono(font) {
+            None
+        } else {
+            Some(serif_ascii(font))
+        }
+    }
+
+    #[inline(always)]
+    fn str_width(&self, font: FontId, size: f64, s: &str) -> f64 {
+        let scale = size / 1000.0;
+        if is_mono(font) {
+            let n = if s.is_ascii() {
+                s.len()
+            } else {
+                s.chars().count()
+            };
+            return n as f64 * 600.0 * scale;
+        }
+        serif_units(font, s) as f64 * scale
     }
 
     fn ascent(&self, font: FontId) -> f64 {
@@ -207,6 +307,25 @@ impl FontMetrics for DbMetrics {
                 _ => self.base.char_width(FontId::Regular, c),
             },
             _ => self.base.char_width(font, c),
+        }
+    }
+
+    fn ascii_units(&self, font: FontId) -> Option<&'static [u16; 128]> {
+        match font {
+            FontId::Ext(_) => None,
+            _ => self.base.ascii_units(font),
+        }
+    }
+
+    fn str_width(&self, font: FontId, size: f64, s: &str) -> f64 {
+        match font {
+            FontId::Ext(i) => match self.ext.get(i as usize) {
+                Some(Some(m)) => {
+                    s.chars().map(|c| m.char_width(c)).sum::<f64>() * size / 1000.0
+                }
+                _ => self.base.str_width(FontId::Regular, size, s),
+            },
+            _ => self.base.str_width(font, size, s),
         }
     }
 

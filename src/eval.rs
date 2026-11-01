@@ -93,8 +93,11 @@ pub struct EvalEnv<'a> {
 pub fn eval(nodes: Vec<Node>, diags: &mut Vec<Diag>, env: &mut EvalEnv) -> Document {
     let mut ev = Ev::new(diags, env);
     let mut pending = Vec::new();
-    for n in &nodes {
-        ev.node(n, &mut pending);
+    // Own the tree so paragraph strings move into the document instead of
+    // being cloned. Imports and `#for` bodies stay on the borrowing path
+    // (`node`) because those trees are shared or evaluated more than once.
+    for n in nodes {
+        ev.eat(n, &mut pending);
     }
     ev.flush(&mut pending);
     Document {
@@ -254,6 +257,100 @@ impl<'e, 'a> Ev<'e, 'a> {
     }
 
     // --------------------------- nodes ---------------------------
+
+    /// Consuming walk used for the root tree. Moves `Node::Text` buffers.
+    fn eat(&mut self, n: Node, out: &mut Vec<Inline>) {
+        match n {
+            Node::Text(s) => {
+                let st = self.cur();
+                out.push(Inline::Text { text: s, style: st });
+            }
+            Node::LineBreak => out.push(Inline::LineBreak),
+            Node::Strong(ch) => {
+                let st = self.cur();
+                let f = self.vary(st.font, Some(true), None, None);
+                self.eat_styled(ch, with_font(st, f), out);
+            }
+            Node::Emph(ch) => {
+                let st = self.cur();
+                let f = self.vary(st.font, None, Some(true), None);
+                self.eat_styled(ch, with_font(st, f), out);
+            }
+            Node::Raw { text, block: false } => out.push(Inline::Text {
+                text,
+                style: TextStyle {
+                    font: FontId::Mono,
+                    size: self.st.font_size,
+                },
+            }),
+            Node::Parbreak => self.flush(out),
+            Node::Heading { level, body } => {
+                self.flush(out);
+                let mut c = Vec::new();
+                let st = self.cur();
+                self.eat_styled(body, st, &mut c);
+                self.blocks.push(Block::Heading {
+                    level,
+                    content: c,
+                });
+            }
+            Node::List { ordered, items } => {
+                self.flush(out);
+                let st = self.cur();
+                let mut out_items = Vec::with_capacity(items.len());
+                for it in items {
+                    let mut c = Vec::new();
+                    self.eat_styled(it, st, &mut c);
+                    out_items.push(c);
+                }
+                self.blocks.push(Block::List {
+                    ordered,
+                    items: out_items,
+                });
+            }
+            Node::Raw { text, block: true } => {
+                self.flush(out);
+                self.blocks.push(Block::RawBlock { text });
+            }
+            Node::Expr(e) => self.expr(&e, out),
+        }
+    }
+
+    /// Owned inline walk. Same rules as `inlines`, but text buffers move.
+    fn eat_styled(&mut self, nodes: Vec<Node>, st: TextStyle, out: &mut Vec<Inline>) {
+        for n in nodes {
+            match n {
+                Node::Text(s) => out.push(Inline::Text { text: s, style: st }),
+                Node::LineBreak => out.push(Inline::LineBreak),
+                Node::Strong(ch) => {
+                    let f = self.vary(st.font, Some(true), None, None);
+                    self.eat_styled(ch, with_font(st, f), out);
+                }
+                Node::Emph(ch) => {
+                    let f = self.vary(st.font, None, Some(true), None);
+                    self.eat_styled(ch, with_font(st, f), out);
+                }
+                Node::Raw { text, block } => {
+                    if block {
+                        self.diag(Severity::NotImplemented, "raw block inside inline content");
+                    }
+                out.push(Inline::Text {
+                    text,
+                    style: TextStyle {
+                        font: FontId::Mono,
+                        size: st.size,
+                    },
+                });
+                }
+                Node::Parbreak => out.push(Inline::LineBreak),
+                Node::Heading { .. } | Node::List { .. } => self.diag(
+                    Severity::NotImplemented,
+                    "block-level construct inside inline content",
+                ),
+                Node::Expr(e) => inline_expr(&e, st, out, self),
+            }
+        }
+    }
 
     fn node(&mut self, n: &Node, out: &mut Vec<Inline>) {
         match n {

@@ -123,8 +123,7 @@ fn cmd_build(args: &[String]) -> ExitCode {
     let t_eval = t.elapsed();
 
     let t = Instant::now();
-    let metrics = font::DbMetrics::new(&doc.fonts);
-    let pages = layout::layout(&doc, &metrics);
+    let pages = layout_doc(&doc);
     let t_layout = t.elapsed();
 
     let t = Instant::now();
@@ -171,6 +170,17 @@ fn cmd_build(args: &[String]) -> ExitCode {
     }
 }
 
+/// Base-14 documents skip `DbMetrics` so the line breaker monomorphizes
+/// straight onto the AFM tables. Embedded faces still go through the db.
+fn layout_doc(doc: &ir::Document) -> Vec<ir::Page> {
+    if doc.fonts.is_empty() {
+        layout::layout(doc, &font::Afm)
+    } else {
+        let metrics = font::DbMetrics::new(&doc.fonts);
+        layout::layout(doc, &metrics)
+    }
+}
+
 fn cmd_bench(args: &[String]) -> ExitCode {
     let Some(path) = positional(args) else {
         eprintln!("error: bench needs an input file");
@@ -212,8 +222,7 @@ fn cmd_bench(args: &[String]) -> ExitCode {
         doc.fonts = fonts;
         eval_ts.push(t.elapsed());
         let t = Instant::now();
-        let metrics = font::DbMetrics::new(&doc.fonts);
-        let pages = layout::layout(&doc, &metrics);
+        let pages = layout_doc(&doc);
         layout_ts.push(t.elapsed());
         let t = Instant::now();
         let bytes = pdf::write_pdf(&pages, &doc.fonts);

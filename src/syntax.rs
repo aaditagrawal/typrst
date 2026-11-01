@@ -29,6 +29,7 @@ const NOT_IMPL_BARE: &[&str] = &[
 pub fn parse(src: &str) -> (Vec<Node>, Vec<Diag>) {
     let mut p = P {
         src,
+        bytes: src.as_bytes(),
         pos: 0,
         diags: Vec::new(),
         lets: Vec::new(),
@@ -40,10 +41,32 @@ pub fn parse(src: &str) -> (Vec<Node>, Vec<Diag>) {
 
 struct P<'a> {
     src: &'a str,
+    bytes: &'a [u8],
     pos: usize,
     diags: Vec<Diag>,
     lets: Vec<String>,
     depth: u32,
+}
+
+/// Bytes that can end a `*...*` / `_..._` scan. Everything else is skipped
+/// in a tight loop (the same split simdjson uses: classify, then act).
+#[inline(always)]
+fn find_interesting(c: u8, m: u8) -> bool {
+    c == b'\n' || c == b'\\' || c == b'`' || c == b'/' || c == b']' || c == m
+}
+
+/// Bytes that `inline` can copy in one slice: printable ASCII and space,
+/// excluding markup sigils. `]` is excluded so a content block still stops
+/// on the closer instead of swallowing it.
+#[inline(always)]
+fn is_plain_markup(c: u8) -> bool {
+    c == b' '
+        || (c > b' '
+            && c < 0x7f
+            && !matches!(
+                c,
+                b'*' | b'_' | b'`' | b'\\' | b'#' | b'$' | b'<' | b'@' | b'/' | b']'
+            ))
 }
 
 fn flush(out: &mut Vec<Node>, text: &mut String) {
@@ -120,10 +143,10 @@ fn rhs_expr(r: Rhs) -> Expr {
 
 impl<'a> P<'a> {
     fn peek(&self) -> Option<u8> {
-        self.src.as_bytes().get(self.pos).copied()
+        self.bytes.get(self.pos).copied()
     }
     fn at(&self, k: usize) -> Option<u8> {
-        self.src.as_bytes().get(self.pos + k).copied()
+        self.bytes.get(self.pos + k).copied()
     }
     fn eof(&self) -> bool {
         self.pos >= self.src.len()
@@ -206,7 +229,7 @@ impl<'a> P<'a> {
 
     /// Does a block construct start at byte offset `i` (line start)?
     fn block_at(&self, i: usize) -> bool {
-        let s = self.src.as_bytes();
+        let s = self.bytes;
         let at = |k: usize| s.get(i + k).copied();
         match s.get(i).copied() {
             Some(b'=') => {
@@ -244,7 +267,7 @@ impl<'a> P<'a> {
             return Vec::new();
         }
         let mut out: Vec<Node> = Vec::new();
-        let mut text = String::new();
+        let mut text = String::with_capacity(128);
         let mut in_para = false;
         let mut first = true;
         loop {
@@ -271,7 +294,8 @@ impl<'a> P<'a> {
                 pad(&mut text, &out);
             }
             in_para = false;
-            if line_start && self.block(&mut out, &mut text, in_bracket) {
+            // `cont` already proved this line is not a block start.
+            if line_start && !cont && self.block(&mut out, &mut text, in_bracket) {
                 continue;
             }
             self.inline(&mut out, &mut text, in_bracket, None);
@@ -455,14 +479,33 @@ impl<'a> P<'a> {
         in_bracket: bool,
         stop: Option<u8>,
     ) {
+        let bytes = self.bytes;
         loop {
-            let c = match self.peek() {
-                None => return,
-                Some(b'\n') => return,
-                Some(b']') if in_bracket => return,
-                Some(c) if stop == Some(c) && self.at_marker(c) => return,
-                Some(c) => c,
-            };
+            let pos = self.pos;
+            if pos >= bytes.len() {
+                return;
+            }
+            let c = bytes[pos];
+            if c == b'\n' || (in_bracket && c == b']') {
+                return;
+            }
+            if stop == Some(c) && self.at_marker(c) {
+                return;
+            }
+            if c == b'/' && matches!(bytes.get(pos + 1), Some(&b'/') | Some(&b'*')) {
+                return;
+            }
+            // simdjson-style stage split: copy a plain run, then handle one sigil.
+            if is_plain_markup(c) {
+                let mut i = pos + 1;
+                let n = bytes.len();
+                while i < n && is_plain_markup(bytes[i]) {
+                    i += 1;
+                }
+                text.push_str(&self.src[pos..i]);
+                self.pos = i;
+                continue;
+            }
             match c {
                 b'*' => {
                     if !self.marker(b'*', out, text, in_bracket) {
@@ -559,11 +602,19 @@ impl<'a> P<'a> {
 
     /// Look for a closing `*`/`_` before the paragraph ends. Bounded scan.
     fn find_close(&self, m: u8, in_bracket: bool) -> Option<usize> {
-        let s = self.src.as_bytes();
+        let s = self.bytes;
         let mut i = self.pos + 1;
         let limit = (self.pos + (1 << 16)).min(s.len());
         while i < limit {
-            match s[i] {
+            let c = s[i];
+            if !find_interesting(c, m) {
+                i += 1;
+                while i < limit && !find_interesting(s[i], m) {
+                    i += 1;
+                }
+                continue;
+            }
+            match c {
                 b'\n' => {
                     // paragraph ends at a blank line or a block-start line
                     let mut j = i + 1;
