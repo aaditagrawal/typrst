@@ -190,6 +190,11 @@ thread_local! {
     static MODULES: RefCell<HashMap<PathBuf, Rc<Vec<Node>>>> = RefCell::new(HashMap::new());
 }
 
+/// Drop cached modules so a later compile in this process re-reads them.
+pub fn clear_module_cache() {
+    MODULES.with(|m| m.borrow_mut().clear());
+}
+
 /// Read and parse a `.typ` file. Results are cached by path, so a hit
 /// returns an empty diag list (its diagnostics were reported on first
 /// load). `path` should be canonicalized by the caller.

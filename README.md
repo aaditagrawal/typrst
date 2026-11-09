@@ -14,6 +14,8 @@ typrst fonts                          # list the indexed font families
 typrst supported                      # print the supported subset inventory
 ```
 
+`typrst watch` rebuilds when the input or a directly imported file changes.
+
 `typrst build` lexes, lays out and paints a document in microseconds, writes
 the PDF with its own bundled writer (base-14 fonts *and* embedded TrueType
 for any system family), resolves `@preview` packages, and emits

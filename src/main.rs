@@ -9,15 +9,16 @@ mod svg;
 mod syntax;
 
 use std::collections::HashSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 const USAGE: &str = "\
 typrst — a fast, self-contained Typst-subset engine
 
 USAGE:
     typrst build <input.typ> [-o <out.pdf>] [--svg <out.svg>] [--timing]
+    typrst watch <input.typ> [-o <out.pdf>] [--svg <out.svg>]
     typrst bench <input.typ> [-n <iters>]
     typrst fonts [--verbose]
     typrst supported
@@ -32,6 +33,7 @@ fn main() -> ExitCode {
     }
     match args[0].as_str() {
         "build" | "compile" => cmd_build(&args[1..]),
+        "watch" => cmd_watch(&args[1..]),
         "bench" => cmd_bench(&args[1..]),
         "fonts" => cmd_fonts(&args[1..]),
         "supported" => {
@@ -84,21 +86,57 @@ fn report_diags(path: &str, src: &str, diags: &[ir::Diag]) -> bool {
     has_error
 }
 
+fn unknown_flag<'a>(args: &'a [String], known: &[&str]) -> Option<&'a str> {
+    args.iter()
+        .find(|a| a.starts_with('-') && !known.contains(&a.as_str()))
+        .map(|s| s.as_str())
+}
+
 fn cmd_build(args: &[String]) -> ExitCode {
     let Some(path) = positional(args) else {
         eprintln!("error: build needs an input file");
         return ExitCode::FAILURE;
     };
+    if let Some(flag) = unknown_flag(args, &["-o", "--svg", "--timing"]) {
+        eprintln!("error: unknown flag '{flag}'");
+        return ExitCode::FAILURE;
+    }
     let timing = args.iter().any(|a| a == "--timing");
     let out = flag_value(args, "-o")
         .map(String::from)
         .unwrap_or_else(|| path.replace(".typ", ".pdf"));
+    build(path, &out, flag_value(args, "--svg"), timing, false, None).code
+}
+
+struct BuildResult {
+    code: ExitCode,
+    written: Option<Vec<u8>>,
+}
+
+/// `true` when `next` differs from the PDF bytes last written.
+fn should_write_pdf(previous: Option<&[u8]>, next: &[u8]) -> bool {
+    previous != Some(next)
+}
+
+/// Parse, eval, layout, PDF, write. Shared by `build` and `watch`.
+/// `success_only` prints the rendered line only on success (`watch`).
+fn build(
+    path: &str,
+    out: &str,
+    svg_out: Option<&str>,
+    timing: bool,
+    success_only: bool,
+    previous: Option<&[u8]>,
+) -> BuildResult {
+    // One-shot `build` starts empty; `watch` must not reuse the last compile's imports.
+    package::clear_module_cache();
+    let fail = || BuildResult { code: ExitCode::FAILURE, written: None };
     let t0 = Instant::now();
     let src = match std::fs::read_to_string(path) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("error: cannot read {path}: {e}");
-            return ExitCode::FAILURE;
+            return fail();
         }
     };
     let t_read = t0.elapsed();
@@ -135,11 +173,16 @@ fn cmd_build(args: &[String]) -> ExitCode {
 
     let t = Instant::now();
     let mut io_err = false;
-    if let Err(e) = std::fs::write(&out, &pdf_bytes) {
-        eprintln!("error: cannot write {out}: {e}");
-        io_err = true;
+    let mut written = None;
+    if should_write_pdf(previous, &pdf_bytes) {
+        if let Err(e) = std::fs::write(out, &pdf_bytes) {
+            eprintln!("error: cannot write {out}: {e}");
+            io_err = true;
+        } else {
+            written = Some(pdf_bytes);
+        }
     }
-    if let Some(svg_path) = flag_value(args, "--svg") {
+    if let Some(svg_path) = svg_out {
         let svg = svg::render(&pages, &doc.fonts);
         if let Err(e) = std::fs::write(svg_path, svg) {
             eprintln!("error: cannot write {svg_path}: {e}");
@@ -150,6 +193,7 @@ fn cmd_build(args: &[String]) -> ExitCode {
 
     diags.extend(doc.diags.iter().cloned());
     let has_error = report_diags(path, &src, &diags);
+    let ok = !io_err && !has_error;
 
     if timing {
         eprintln!(
@@ -163,13 +207,12 @@ fn cmd_build(args: &[String]) -> ExitCode {
             t0.elapsed(),
             pages.len()
         );
-    } else {
+    } else if ok || !success_only {
         eprintln!("rendered in {:?} -> {out}", t0.elapsed());
     }
-    if io_err || has_error {
-        ExitCode::FAILURE
-    } else {
-        ExitCode::SUCCESS
+    BuildResult {
+        code: if ok { ExitCode::SUCCESS } else { ExitCode::FAILURE },
+        written,
     }
 }
 
@@ -182,6 +225,92 @@ fn layout_doc(doc: &ir::Document) -> Vec<ir::Page> {
         let metrics = font::DbMetrics::new(&doc.fonts);
         layout::layout(doc, &metrics)
     }
+}
+
+fn cmd_watch(args: &[String]) -> ExitCode {
+    let Some(path) = positional(args) else {
+        eprintln!("error: watch needs an input file");
+        return ExitCode::FAILURE;
+    };
+    if let Some(flag) = unknown_flag(args, &["-o", "--svg"]) {
+        eprintln!("error: unknown flag '{flag}'");
+        return ExitCode::FAILURE;
+    }
+    let out = flag_value(args, "-o")
+        .map(String::from)
+        .unwrap_or_else(|| path.replace(".typ", ".pdf"));
+    let svg = flag_value(args, "--svg").map(String::from);
+    let input = Path::new(path);
+    let mut last_pdf = None;
+    let mut deps = watch_deps(input);
+    let mut seen = watch_seen(input, &deps);
+    loop {
+        let result = build(path, &out, svg.as_deref(), false, true, last_pdf.as_deref());
+        if let Some(pdf) = result.written {
+            last_pdf = Some(pdf);
+        }
+        // A blocking 200ms sleep: Ctrl-C kills the process, which is acceptable.
+        loop {
+            std::thread::sleep(Duration::from_millis(200));
+            if watch_seen(input, &deps) != seen {
+                break;
+            }
+        }
+        deps = watch_deps(input);
+        seen = watch_seen(input, &deps);
+    }
+}
+
+fn stamp(path: &Path) -> (u64, Option<std::time::SystemTime>) {
+    match std::fs::metadata(path) {
+        Ok(m) => (m.len(), m.modified().ok()),
+        Err(_) => (0, None),
+    }
+}
+
+fn watch_seen(input: &Path, deps: &[PathBuf]) -> Vec<(u64, Option<std::time::SystemTime>)> {
+    std::iter::once(stamp(input)).chain(deps.iter().map(|p| stamp(p))).collect()
+}
+
+/// `#import` / `#include` quoted paths, relative to the file that names them.
+/// One level past the input is enough.
+fn watch_deps(input: &Path) -> Vec<PathBuf> {
+    fn paths_in(src: &str) -> Vec<&str> {
+        let mut out = Vec::new();
+        for (i, _) in src.match_indices('#') {
+            let s = &src[i..];
+            let n = if s.starts_with("#import") { 7 } else if s.starts_with("#include") { 8 } else { continue };
+            if s.as_bytes().get(n).is_some_and(|c| c.is_ascii_alphanumeric() || *c == b'_') {
+                continue;
+            }
+            let Some(path) = s[n..].split('"').nth(1) else { continue };
+            if !path.is_empty() && !path.starts_with('@') && !path.contains('\n') {
+                out.push(path);
+            }
+        }
+        out
+    }
+    let mut out = Vec::new();
+    let mut layer = vec![input.to_path_buf()];
+    for depth in 0..2 {
+        let mut next = Vec::new();
+        for file in &layer {
+            let Ok(src) = std::fs::read_to_string(file) else { continue };
+            let base = file.parent().unwrap_or(Path::new("."));
+            for rel in paths_in(&src) {
+                let path = base.join(rel);
+                if out.contains(&path) {
+                    continue;
+                }
+                out.push(path.clone());
+                if depth == 0 {
+                    next.push(path);
+                }
+            }
+        }
+        layer = next;
+    }
+    out
 }
 
 fn cmd_bench(args: &[String]) -> ExitCode {
@@ -311,5 +440,13 @@ mod tests {
             "function '#foo' is not implemented",
         )];
         assert!(report_diags("t.typ", "#foo()", &unspanned));
+    }
+
+    #[test]
+    fn identical_pdf_bytes_skip_write() {
+        let last = [1u8, 2, 3, 4];
+        assert!(!super::should_write_pdf(Some(&last), &last));
+        assert!(super::should_write_pdf(Some(&last), &[1, 2, 3]));
+        assert!(super::should_write_pdf(None, &last));
     }
 }
