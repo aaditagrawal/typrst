@@ -3259,11 +3259,6 @@ mod tests {
         run_env(nodes, Path::new("."))
     }
 
-    /// Parse + eval a source string rooted at `base`.
-    fn eval_str(src: &str, base: &Path) -> (Document, Vec<Diag>) {
-        run_src(src, base)
-    }
-
     fn run_src(src: &str, base: &Path) -> (Document, Vec<Diag>) {
         let (nodes, mut d) = crate::syntax::parse(src);
         let (doc, ed) = run_env(nodes, base);
