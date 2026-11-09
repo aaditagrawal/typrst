@@ -131,3 +131,9 @@ fractions `1fr` (table context only).
 Output text is encoded WinAnsi (PDF base-14 and embedded simple TrueType
 alike). Unmappable characters → `?` plus a warning diagnostic (one per
 document, not per char).
+
+## Speed
+
+Compatibility work must keep a 10x wall-clock speedup versus typst 0.15.1
+on `fixtures/small.typ` and `fixtures/large.typ` (fresh process, median).
+`scripts/speed_gate.py` enforces it: both ratios must be at least 10x.
