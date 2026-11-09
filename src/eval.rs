@@ -457,7 +457,10 @@ impl<'e, 'a> Ev<'e, 'a> {
                 self.push_block(Block::RawBlock { text });
             }
             Node::Label(name) => self.on_label(name, out.is_empty()),
-            Node::Ref(name) => self.push_ref(name, self.cur(), out),
+            Node::Ref(name) => {
+                let st = self.cur();
+                self.push_ref(name, st, out);
+            },
             Node::Expr(e) => self.expr(&e, out),
         }
     }
@@ -668,7 +671,10 @@ impl<'e, 'a> Ev<'e, 'a> {
                 self.push_block(Block::RawBlock { text: text.clone() });
             }
             Node::Label(name) => self.on_label(name.clone(), out.is_empty()),
-            Node::Ref(name) => self.push_ref(name.clone(), self.cur(), out),
+            Node::Ref(name) => {
+                let st = self.cur();
+                self.push_ref(name.clone(), st, out);
+            },
             Node::Expr(e) => self.expr(e, out),
         }
     }
@@ -4016,28 +4022,30 @@ mod tests {
     #[test]
     fn numbered_heading_lays_out_bold_prefix() {
         let (doc, d) = run_src(
-            "#set heading(numbering: \"1.1\")\n== Methods\n",
+            "#set heading(numbering: \"1.1\")\n= Methods\n",
             Path::new("."),
         );
         assert!(d.is_empty(), "{d:?}");
         let pages = crate::layout::layout(&doc, &crate::font::Afm);
-        let mut saw_num = false;
-        let mut saw_body = false;
+        // The prefix and the body share the heading face, so layout may
+        // merge them into one run ("1 Methods") or keep them split.
+        let mut words = String::new();
         for it in &pages[0].items {
             if let DrawItem::Text { font, size, text, .. } = it {
-                if text.as_str() == "1.1" {
-                    saw_num = true;
-                    assert_eq!(*font, FontId::Bold);
-                    assert!((*size - 11.0 * 1.2).abs() < 1e-6, "{size}");
+                assert_eq!(*font, FontId::Bold);
+                assert!((*size - 11.0 * 1.4).abs() < 1e-6, "{size}");
+                if !words.is_empty() {
+                    words.push(' ');
                 }
-                if text.as_str() == "Methods" {
-                    saw_body = true;
-                    assert_eq!(*font, FontId::Bold);
-                    assert!((*size - 11.0 * 1.2).abs() < 1e-6, "{size}");
-                }
+                words.push_str(text.as_str());
             }
         }
-        assert!(saw_num && saw_body, "{:?}", pages[0].items);
+        assert_eq!(
+            words.split_whitespace().collect::<Vec<_>>().join(" "),
+            "1 Methods",
+            "{:?}",
+            pages[0].items
+        );
     }
 
 

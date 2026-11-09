@@ -32,8 +32,16 @@ parser recovers to the next paragraph boundary. Diagnostics from
   warning and the line stays literal text. An indented `/` is literal
   (nested term lists are not supported).
 - `$..$` math, `#figure`, `#footnote`, `#show`, `#context`,
-  numbering patterns, labels `<x>`, references `@x`, `#break`,
-  `#continue` → `not implemented` diagnostics.
+  `#break`, `#continue` → `not implemented` diagnostics.
+- `<ident>` labels (letters, digits, `_`, `-`, `.`). A label on the same
+  line as a heading, or the next non-empty construct before another block,
+  attaches to that heading. A label elsewhere attaches to the previous
+  block. With no previous block it is an error. Labels do not cross
+  `#import`.
+- `@ident` in inline text resolves to a label in the same document. It
+  renders as the heading number plus the heading's plain text when
+  numbering is on (`1.2 Introduction`), otherwise just the plain text.
+  An unknown label is a warning and renders the literal `@ident`.
 
 ## Expressions (`#expr`)
 
@@ -50,6 +58,13 @@ fractions `1fr` (table context only).
   TrueType face (`FontId::Ext`). Unknown families warn and fall back.
 - `#set par(justify: bool, leading: L, spacing: L)` — `leading` sets
   baseline-to-baseline = `size + leading` if < size else `leading`
+- `#set heading(numbering: "1" | "1." | "1.1" | "1.1.1" | none)` — per-level
+  counters. Default is `none` (headings are unchanged). The pattern is one
+  or more `1` tokens separated by `.`, with an optional trailing `.`. A
+  level-n heading shows n numbers (`1`, `1.2`, `1.2.3`); a shorter pattern
+  still shows the full chain, and a longer pattern trims to the heading's
+  level. A trailing `.` is kept (`1.` / `1.1.`). The number is part of the
+  heading text, then a space, then the body. `none` clears the pattern.
 - `#let name = <expr>` — literal, variable, `mod.field`, method call,
   or binary arithmetic (`+ - * /` on numbers/lengths; `+` also
   concatenates strings and arrays). Later `#name` substitutes the
@@ -180,6 +195,7 @@ fractions `1fr` (table context only).
   `max(prev below, next above)` — fitted against typst's PDF output.
 - Headings: bold, sizes rel. to base — L1 1.4em, L2 1.2em, L3 1.05em,
   L4+ 1.0em; space before = 0.536em of heading size, after ≈ 0.
+  A numbering prefix is part of that text (same bold face and size), then a space, then the heading body.
 - Lists: bullet `•` / `n.` marker at the margin, 0.5em gap, hanging
   indent — continuation lines align at text start. A nested list shifts
   its marker by one hanging indent (marker width + 0.5em) per level and

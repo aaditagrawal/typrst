@@ -1858,4 +1858,56 @@ mod tests {
             .iter()
             .any(|r| (r.1 - bottom).abs() < 1e-3 && (r.2 - 300.0).abs() < 1e-6));
     }
+
+    #[test]
+    fn layout_image_advances_past_the_box() {
+        let doc = tdoc(vec![
+            para(1),
+            Block::Image {
+                index: 0,
+                w: 120.0,
+                h: 40.0,
+            },
+            para(1),
+        ]);
+        let pages = layout(&doc, &Fake);
+        assert_eq!(pages.len(), 1);
+        let img = pages[0]
+            .items
+            .iter()
+            .find_map(|i| match i {
+                DrawItem::Image { x, y, w, h, index } => Some((*x, *y, *w, *h, *index)),
+                _ => None,
+            })
+            .unwrap();
+        assert!((img.0 - 70.866).abs() < 1e-6);
+        assert_eq!((img.2, img.3, img.4), (120.0, 40.0, 0));
+        let texts: Vec<f64> = pages[0]
+            .items
+            .iter()
+            .filter_map(|i| match i {
+                DrawItem::Text { y, .. } => Some(*y),
+                _ => None,
+            })
+            .collect();
+        assert!(texts[0] < img.1);
+        assert!(texts[1] >= img.1 + img.3);
+        let doc = tdoc(vec![
+            para(1),
+            Block::Image {
+                index: 0,
+                w: 10.0,
+                h: 800.0,
+            },
+        ]);
+        let pages = layout(&doc, &Fake);
+        assert_eq!(pages.len(), 2);
+        match &pages[1].items[0] {
+            DrawItem::Image { y, h, .. } => {
+                assert!((*y - 70.866).abs() < 1e-6);
+                assert_eq!(*h, 800.0);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
 }
