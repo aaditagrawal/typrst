@@ -67,7 +67,10 @@ fn positional(args: &[String]) -> Option<&str> {
 fn report_diags(path: &str, src: &str, diags: &[ir::Diag]) -> bool {
     let mut has_error = false;
     for d in diags {
-        if d.severity == ir::Severity::Error {
+        if matches!(
+            d.severity,
+            ir::Severity::Error | ir::Severity::NotImplemented
+        ) {
             has_error = true;
         }
         match d.span {
@@ -278,4 +281,35 @@ fn cmd_fonts(args: &[String]) -> ExitCode {
     }
     eprintln!("{} faces indexed in {:?}", db.len(), dt);
     ExitCode::SUCCESS
+}
+
+#[cfg(test)]
+mod tests {
+    use super::report_diags;
+    use crate::ir::{Diag, Severity, Span};
+
+    #[test]
+    fn not_implemented_fails_the_build() {
+        let src = "#show heading: it => it\nHello";
+        let failed = [Diag::new(
+            Severity::NotImplemented,
+            Some(Span::new(0, 5)),
+            "#show is not implemented",
+        )];
+        assert!(report_diags("t.typ", src, &failed));
+
+        // Eval warnings carry no span; that stays a successful build.
+        let warned = [Diag::new(Severity::Warning, None, "undefined variable")];
+        assert!(!report_diags("t.typ", "hello", &warned));
+
+        let errored = [Diag::new(Severity::Error, Some(Span::new(0, 1)), "bad")];
+        assert!(report_diags("t.typ", "x", &errored));
+
+        let unspanned = [Diag::new(
+            Severity::NotImplemented,
+            None,
+            "function '#foo' is not implemented",
+        )];
+        assert!(report_diags("t.typ", "#foo()", &unspanned));
+    }
 }

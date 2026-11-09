@@ -1905,9 +1905,15 @@ impl<'a> P<'a> {
         }
     }
 
-    /// Remainder of an unrecognized `#foo` construct: trailing string /
-    /// `(...)` / `[...]` operands, or a `#show: ...`-style rest of line.
+    /// Remainder of an unrecognized `#foo` construct: an optional ident,
+    /// trailing string / `(...)` / `[...]` operands, or a `#show heading:
+    /// ...` rest of line. Bracket groups may span lines. The following
+    /// paragraph is left for the markup parser.
     fn skip_tail(&mut self) {
+        self.skip_hspace();
+        if self.peek().map_or(false, is_ident_start) {
+            let _ = self.ident();
+        }
         loop {
             self.skip_hspace();
             match self.peek() {
@@ -1923,10 +1929,32 @@ impl<'a> P<'a> {
                     self.skip_balanced(b'[', b']');
                 }
                 Some(b':') => {
-                    self.skip_to_eol();
+                    self.skip_colon_tail();
                     return;
                 }
                 _ => return,
+            }
+        }
+    }
+
+    /// After `:`, consume the rest of this line. A `[...]` or `(...)`
+    /// group is consumed whole, even when it crosses lines.
+    fn skip_colon_tail(&mut self) {
+        while let Some(c) = self.peek() {
+            match c {
+                b'\n' => return,
+                b'[' => {
+                    self.pos += 1;
+                    self.skip_balanced(b'[', b']');
+                }
+                b'(' => {
+                    self.pos += 1;
+                    self.skip_balanced(b'(', b')');
+                }
+                b'"' => {
+                    self.string(self.pos);
+                }
+                _ => self.pos += 1,
             }
         }
     }
@@ -3461,6 +3489,57 @@ mod tests {
             assert!(!d.is_empty(), "{src}");
             assert_eq!(d[0].severity, Severity::NotImplemented, "{src} ({what})");
         }
+    }
+
+    fn contains_text(nodes: &[Node], needle: &str) -> bool {
+        nodes.iter().any(|n| match n {
+            Node::Text(s) => s.contains(needle),
+            Node::Strong(body) | Node::Emph(body) => contains_text(body, needle),
+            Node::Heading { body, .. } => contains_text(body, needle),
+            Node::List { items, .. } => items.iter().any(|item| contains_text(item, needle)),
+            Node::Terms { items } => items.iter().any(|item| {
+                contains_text(&item.term, needle) || contains_text(&item.desc, needle)
+            }),
+            _ => false,
+        })
+    }
+
+    #[test]
+    fn not_implemented_is_not_printed() {
+        let src = "#show heading: it => it";
+        let (n, d) = parse(src);
+        assert!(
+            d.iter().any(|x| {
+                x.severity == Severity::NotImplemented
+                    && x.span.map(|sp| crate::ir::line_col(src, sp.start)) == Some((1, 1))
+            }),
+            "{d:?}"
+        );
+        assert!(!contains_text(&n, "heading"), "{n:?}");
+        assert!(!contains_text(&n, "it"), "{n:?}");
+
+        let src = "#show heading: it => it\nHello";
+        let (n, d) = parse(src);
+        assert!(d.iter().any(|x| {
+            x.severity == Severity::NotImplemented && x.span.is_some()
+        }));
+        assert!(!contains_text(&n, "heading"), "{n:?}");
+        assert!(contains_text(&n, "Hello"), "{n:?}");
+
+        let src = "#show heading: it => [\nsecret\n]\nNext";
+        let (n, d) = parse(src);
+        assert!(d.iter().any(|x| x.severity == Severity::NotImplemented && x.span.is_some()));
+        assert!(!contains_text(&n, "secret"), "{n:?}");
+        assert!(!contains_text(&n, "heading"), "{n:?}");
+        assert!(contains_text(&n, "Next"), "{n:?}");
+
+        let (n, d) = parse("$x$");
+        assert!(d.iter().any(|x| x.severity == Severity::NotImplemented && x.span.is_some()));
+        assert!(!contains_text(&n, "x"), "{n:?}");
+
+        let (n, d) = parse("hello");
+        assert!(d.iter().all(|x| x.severity != Severity::NotImplemented));
+        assert!(contains_text(&n, "hello"));
     }
 
     #[test]

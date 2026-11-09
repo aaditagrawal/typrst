@@ -2,7 +2,8 @@
 
 typrst implements a growing subset of Typst, flash-tex style:
 recognized-but-unimplemented constructs produce a `not implemented`
-diagnostic with a recovery note — they are never silently dropped.
+diagnostic with a recovery note, fail the build, and are not printed —
+they are never silently dropped.
 Unrecognized constructs produce `error`/`warning` diagnostics and the
 parser recovers to the next paragraph boundary. Diagnostics from
 `#import`/`#include` files are prefixed with the imported file's path.
