@@ -14,6 +14,8 @@ typrst fonts                          # list the indexed font families
 typrst supported                      # print the supported subset inventory
 ```
 
+`typrst watch` rebuilds when the input or a directly imported file changes.
+
 `typrst build` lexes, lays out and paints a document in microseconds, writes
 the PDF with its own bundled writer (base-14 fonts *and* embedded TrueType
 for any system family), resolves `@preview` packages, and emits
@@ -22,12 +24,17 @@ recognized-but-unimplemented constructs are reported with a recovery note,
 never silently dropped.
 
 What it is **not** (yet): a full Typst engine. typrst implements a growing
-subset of Typst (headings, paragraphs, `*strong*`/`_emph_`, lists, raw code,
-tables, `#if`/`#for`, `#import`/`#include`, `#set page`/`#set text`/`#set
-par`, `#let`, `#lorem`, `#align`, `#v`/`#h`, `#pagebreak`, …); constructs it
-does not implement — math, show rules, `#let` functions — are reported as
+subset of Typst (headings with numbering, paragraphs, `*strong*`/`_emph_`,
+nested and term lists, raw code, tables, figures, JPEG images, links,
+`#outline`, `#if`/`#while`/`#for`, user functions, `#import`/`#include`,
+`#set page`/`#set text`/`#set par`/`#set heading`, `#let`, labels and
+`@references`, `#lorem`, `#align`, `#box`/`#block`/`#stack`, `#v`/`#h`,
+`#pagebreak`, …). Math, show rules, and `context` are reported as
 diagnostics. `typrst supported` prints the exact inventory; see
-[SPEC.md](SPEC.md).
+[SPEC.md](SPEC.md). The subset stays on the direct eval-to-display-list
+path, and `scripts/speed_gate.py` fails the build when wall-clock on
+`fixtures/small.typ` or `fixtures/large.typ` drops below 10× versus
+typst 0.15.1.
 
 ## Features
 
@@ -51,9 +58,10 @@ diagnostics. `typrst supported` prints the exact inventory; see
   shared typst package dirs first (already-fetched packages work), then
   downloads from `packages.typst.org` into `~/.cache/typrst/packages`.
   `typst.toml` entrypoints, named/wildcard/stem imports, cycle detection.
-- **A real evaluator** — `#let` bindings with arithmetic, dicts and
-  arrays, `mod.field` access, `#if`/`else if`/`else`, `#for x in …`
-  loops, `#include`, and a scope-carrying module system.
+- **A real evaluator** — `#let` bindings and user functions, arithmetic,
+  dicts and arrays, method calls, `mod.field` access, `#if`/`else if`/`else`,
+  `#while`, `#for x in …` loops, nested content scopes, `#include`, and a
+  scope-carrying module system.
 - **Recovering parser** — single-pass byte-cursor markup parser producing
   spans on every diagnostic; malformed input never panics.
 - **Its own layout engine** — greedy line breaking with optional
@@ -151,7 +159,8 @@ typrst build main.typ
 ## Development
 
 ```sh
-cargo test            # 73 unit tests across all stages
+cargo test            # unit tests across all stages
+python3 scripts/speed_gate.py   # require >= 10x vs typst 0.15.1
 cargo build --release
 ```
 

@@ -53,6 +53,13 @@ impl Diag {
 
 // ------------------------- AST (parser output) -------------------------
 
+/// One `/ term: description` entry. `term` stops at the colon.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TermEntry {
+    pub term: Vec<Node>,
+    pub desc: Vec<Node>,
+}
+
 /// A parsed markup node. Block- and inline-level nodes share one type;
 /// the evaluator resolves the distinction.
 #[derive(Debug, Clone, PartialEq)]
@@ -68,15 +75,23 @@ pub enum Node {
     Emph(Vec<Node>),
     /// `=`, `==`, ... heading with level 1..=6.
     Heading { level: u8, body: Vec<Node> },
-    /// Bullet (`-`) or enumeration (`+`) list.
+    /// Bullet (`-`) or enumeration (`+`) list. A nested list is a
+    /// `Node::List` inside an item; the item's other nodes are inline.
     List {
         ordered: bool,
         items: Vec<Vec<Node>>,
     },
+    /// `/ term: description`. Consecutive items are one node.
+    Terms { items: Vec<TermEntry> },
     /// Raw code: `` `inline` `` (block=false) or a fenced ``` block.
     Raw { text: String, block: bool },
     /// Explicit paragraph boundary (a blank line).
     Parbreak,
+    /// `<name>` label. Letters, digits, `_`, `-`, `.`. Eval attaches it
+    /// to the heading or block it follows; it is not rendered.
+    Label(String),
+    /// `@name` reference. Resolved against labels in this document.
+    Ref(String),
     /// A `#`-expression.
     Expr(Expr),
 }
@@ -96,6 +111,19 @@ pub enum Expr {
         args: Vec<Arg>,
         content: Option<Vec<Node>>,
     },
+    /// `#let name(params) = body`. A `[content]` body is stored as
+    /// `Rhs::Lit(Value::Content(..))`; anything else is an expression.
+    LetFn {
+        name: String,
+        params: Vec<Param>,
+        body: Rhs,
+    },
+    /// Call of a `#let` function. Builtin calls stay [`Expr::Func`].
+    Call {
+        name: String,
+        args: Vec<RhsArg>,
+        content: Option<Vec<Node>>,
+    },
     /// `#import "path"` / `#import "@preview/pkg:1.0.0": a, b` /
     /// `#import "x.typ": *`. `items` lists named bindings; `all` is the
     /// `*` wildcard; neither means the module binds under its file stem.
@@ -106,9 +134,11 @@ pub enum Expr {
     },
     /// `#if cond [..] else if cond [..] else [..]`.
     If {
-        arms: Vec<(Cmp, Vec<Node>)>,
+        arms: Vec<(Cond, Vec<Node>)>,
         els: Option<Vec<Node>>,
     },
+    /// `#while cond [..]` — body runs until `cond` is false.
+    While { cond: Cond, body: Vec<Node> },
     /// `#for x in expr [..]` — `vars` is 1 name, or 2 for `(k, v)` pairs.
     For {
         vars: Vec<String>,
@@ -119,6 +149,16 @@ pub enum Expr {
     Lit(Value),
     /// A simple binary expression in markup: `#a + b`, `#x * 2`.
     Bin { lhs: Rhs, op: ArithOp, rhs: Rhs },
+    /// An rhs rendered in markup that is not a name or binary
+    /// (`#xs.len()`, `#(xs.at(i))`). Field chains stay `Var`.
+    Rhs(Rhs),
+    /// `#show heading|strong|emph|link|figure: param => body`.
+    /// Other `#show` forms are diagnostics, not this node.
+    Show {
+        target: String,
+        param: String,
+        body: Rhs,
+    },
 }
 
 /// Right-hand side of a binding, condition, or iteration.
@@ -137,6 +177,23 @@ pub enum Rhs {
         op: ArithOp,
         rhs: Box<Rhs>,
     },
+    /// `value.method(args)`. Field access stays `Field` (no paren).
+    Call {
+        recv: Box<Rhs>,
+        method: String,
+        args: Vec<Rhs>,
+    },
+}
+
+/// Boolean condition for `#if` / `#while` only.
+/// `not` binds tightest, then `and`, then `or`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Cond {
+    /// A comparison, or a bare value desugared to `x != none`.
+    Cmp(Cmp),
+    Not(Box<Cond>),
+    And(Box<Cond>, Box<Cond>),
+    Or(Box<Cond>, Box<Cond>),
 }
 
 /// Comparison in `#if`/`#while` conditions.
@@ -145,8 +202,6 @@ pub struct Cmp {
     pub lhs: Rhs,
     pub op: CmpOp,
     pub rhs: Rhs,
-    /// Unary `not` applied to the comparison.
-    pub negated: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -174,6 +229,28 @@ pub struct Arg {
     pub value: Value,
 }
 
+/// Parameter of `#let name(params)`. `default` is set for `name: literal`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Param {
+    pub name: String,
+    pub default: Option<Value>,
+}
+
+/// Argument of a user-function call. The value is an expression.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RhsArg {
+    pub name: Option<String>,
+    pub value: Rhs,
+}
+
+/// `#let` function. Boxed inside [`Value::Func`] so it can live in a scope
+/// (and survive `#import`) without growing `Value`: [`Rhs`] contains `Value`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Func {
+    pub params: Vec<Param>,
+    pub body: Rhs,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
     None,
@@ -189,6 +266,8 @@ pub enum Value {
     Array(Vec<Value>),
     /// `(a: 1, b: 2)` dictionary literal.
     Dict(Vec<(String, Value)>),
+    /// `#let` function. Boxed so `Value` does not grow (`Rhs` contains `Value`).
+    Func(Box<Func>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -270,10 +349,14 @@ pub enum Block {
         level: u8,
         content: Vec<Inline>,
     },
+    /// Bullet or enumeration. `items[i].rest` is an empty vec (no heap
+    /// allocation) when the item contains no nested list.
     List {
         ordered: bool,
-        items: Vec<Vec<Inline>>,
+        items: Vec<ListItem>,
     },
+    /// `/ term: description`. Term inlines are already bold.
+    Terms { items: Vec<TermItem> },
     /// Fenced code block; text is the verbatim content.
     RawBlock {
         text: String,
@@ -291,6 +374,82 @@ pub enum Block {
         /// Draw cell borders (`#table` true, `#grid` false).
         stroke: bool,
     },
+    /// `#image`. `index` selects `Document::images`. `w` and `h` are the
+    /// laid-out size in pt; aspect ratio is already resolved.
+    Image { index: usize, w: f64, h: f64 },
+    /// `#box` / `#block`. The payload is boxed so a document that never
+    /// frames anything keeps the same `Block` size.
+    Framed(Box<Frame>),
+    /// `#stack`. `horizontal` is `dir: ltr`; otherwise children run down
+    /// the page (`dir: ttb`).
+    Stack {
+        horizontal: bool,
+        spacing: f64,
+        children: Vec<Block>,
+    },
+    /// `#figure`. Boxed so a document that never calls `#figure` keeps
+    /// the same `Block` size. `caption` includes the `Figure N: ` prefix
+    /// when a caption was supplied.
+    Figure(Box<Fig>),
+    /// `#outline()` placeholder. Replaced with one paragraph per heading
+    /// before layout, and only when the document contains an outline.
+    Outline { style: TextStyle },
+}
+
+/// Body, caption, and counter for `Block::Figure`.
+#[derive(Debug, Clone)]
+pub struct Fig {
+    pub body: Vec<Block>,
+    pub caption: Vec<Inline>,
+    /// Document counter, starting at 1. A label on the figure stores
+    /// `Figure {number}` and nothing else.
+    pub number: u32,
+}
+
+/// Framed region shared by `Block::Framed` and inline `Inline::Frame`.
+/// `fill` is gray, 0 black .. 1 white. `stroke` is the border thickness
+/// in pt (`None` draws no border).
+#[derive(Debug, Clone)]
+pub struct Frame {
+    /// Outer width in pt. `None` shrinks to the content.
+    pub width: Option<f64>,
+    /// Stretch to the available measure. Set for `#block` without `width`.
+    pub expand: bool,
+    pub inset: f64,
+    pub fill: Option<f64>,
+    pub stroke: Option<f64>,
+    pub content: Vec<Inline>,
+}
+
+/// One bullet or enum item. `rest` stays empty on the flat-list path.
+#[derive(Debug, Clone)]
+pub struct ListItem {
+    pub content: Vec<Inline>,
+    /// Nested lists and inline runs that follow them, in source order.
+    pub rest: Vec<ListRest>,
+}
+
+/// What follows the leading inline run of a list item.
+#[derive(Debug, Clone)]
+pub enum ListRest {
+    /// Nested `-` / `+` list.
+    List(Box<ListBody>),
+    /// Inline continuation after a nested list.
+    Inlines(Vec<Inline>),
+}
+
+/// Nested list body. Layout walks this directly; no second pass.
+#[derive(Debug, Clone)]
+pub struct ListBody {
+    pub ordered: bool,
+    pub items: Vec<ListItem>,
+}
+
+/// One evaluated term-list entry.
+#[derive(Debug, Clone)]
+pub struct TermItem {
+    pub term: Vec<Inline>,
+    pub desc: Vec<Inline>,
 }
 
 /// Column width spec for `Block::Table`.
@@ -314,6 +473,20 @@ pub enum Inline {
     LineBreak,
     /// Explicit horizontal space in pt (`#h(..)`).
     HSpace(f64),
+    /// Unresolved `@name`. Eval replaces these before layout when the
+    /// document contains a reference; `name` has no `@`.
+    Ref { name: String, style: TextStyle },
+    /// Inline `#box` (no paragraph break in the content). `expand` is ignored.
+    Frame(Box<Frame>),
+    /// `#link`. Boxed so a document with no links keeps `Inline`'s size.
+    Link(Box<LinkRun>),
+}
+
+/// Visible text of a `#link`. `content` is inline only.
+#[derive(Debug, Clone)]
+pub struct LinkRun {
+    pub url: String,
+    pub content: Vec<Inline>,
 }
 
 /// Font identities. The six base variants map to PDF base-14 faces;
@@ -379,6 +552,24 @@ pub struct Document {
     pub diags: Vec<Diag>,
     /// Dynamic fonts referenced by `FontId::Ext`, in registration order.
     pub fonts: Vec<FontUse>,
+    /// JPEGs referenced by `Block::Image` / `DrawItem::Image`.
+    /// Empty when the source contains no successfully loaded `#image`.
+    pub images: Vec<Image>,
+}
+
+/// JPEG file copied into the PDF as a `/DCTDecode` XObject. Pixel size
+/// comes from the SOF marker; the bytes are not decoded.
+#[derive(Debug, Clone)]
+pub struct Image {
+    pub bytes: Vec<u8>,
+    /// Intrinsic width in pixels.
+    pub width: u32,
+    /// Intrinsic height in pixels.
+    pub height: u32,
+    /// SOF sample precision (`/BitsPerComponent`).
+    pub bits: u8,
+    /// SOF component count: 1 gray, 3 RGB, 4 CMYK.
+    pub components: u8,
 }
 
 // ------------------- Display list (layout output) -------------------
@@ -526,6 +717,26 @@ pub enum DrawItem {
         w: f64,
         h: f64,
         gray: f64,
+    },
+    /// A JPEG XObject. `y` is the top edge in the same top-down space as
+    /// `Rule` (the PDF writer flips it). `index` selects `Document::images`.
+    Image {
+        x: f64,
+        y: f64,
+        w: f64,
+        h: f64,
+        index: usize,
+    },
+    /// URI annotation. `y` is the top edge in the same top-down space as
+    /// `Rule`. The text and its underline are separate items; this one is
+    /// not painted. SVG ignores it. `url` reuses the short-string store so
+    /// the variant does not grow `DrawItem`.
+    Link {
+        x: f64,
+        y: f64,
+        w: f64,
+        h: f64,
+        url: InlineStr,
     },
 }
 

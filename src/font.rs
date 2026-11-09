@@ -3,6 +3,8 @@
 //! Serif faces map to Times to visually match typst's Libertinus default.
 use crate::fontdb::{self, FaceMetrics};
 use crate::ir::{FontId, FontMetrics, FontUse};
+use std::cell::RefCell;
+use std::collections::HashMap;
 
 pub struct Afm;
 
@@ -279,12 +281,25 @@ impl FontMetrics for Afm {
     }
 }
 
+/// Word widths for one `FontId::Ext` face, after hmtx and kern.
+/// Keyed by (ext index, size in 1/100 pt, word). Never used for AFM.
+struct WordCache {
+    map: HashMap<(u16, i32, String), f64>,
+    /// Test-only counters. Layout never reads them.
+    #[allow(dead_code)]
+    hits: u64,
+    #[allow(dead_code)]
+    misses: u64,
+}
+
 /// Base-14 tables plus one `FaceMetrics` per `Document::fonts` entry.
 /// Faces that fail to load keep a `None` slot and fall back to Times
-/// metrics so an `Ext` id can never panic.
+/// metrics so an `Ext` id can never panic. Repeated Ext words are
+/// cached here; the base-14 path is not.
 pub struct DbMetrics {
     base: Afm,
     ext: Vec<Option<FaceMetrics>>,
+    words: RefCell<WordCache>,
 }
 
 impl DbMetrics {
@@ -295,7 +310,28 @@ impl DbMetrics {
                 .iter()
                 .map(|f| fontdb::load_metrics(&f.path, f.ttc_index))
                 .collect(),
+            words: RefCell::new(WordCache {
+                map: HashMap::new(),
+                hits: 0,
+                misses: 0,
+            }),
         }
+    }
+
+    /// Ext word width, measured once per (face, size, word). `size` is
+    /// quantized to 1/100 pt. The stored width already includes kerning.
+    fn cached_ext(&self, id: u16, face: &FaceMetrics, size: f64, s: &str) -> f64 {
+        let cents = (size * 100.0).round() as i32;
+        let mut cache = self.words.borrow_mut();
+        let key = (id, cents, s.to_string());
+        if let Some(&w) = cache.map.get(&key) {
+            cache.hits += 1;
+            return w;
+        }
+        let w = face.str_width(size, s);
+        cache.misses += 1;
+        cache.map.insert(key, w);
+        w
     }
 }
 
@@ -320,9 +356,7 @@ impl FontMetrics for DbMetrics {
     fn str_width(&self, font: FontId, size: f64, s: &str) -> f64 {
         match font {
             FontId::Ext(i) => match self.ext.get(i as usize) {
-                Some(Some(m)) => {
-                    s.chars().map(|c| m.char_width(c)).sum::<f64>() * size / 1000.0
-                }
+                Some(Some(m)) => self.cached_ext(i, m, size, s),
                 _ => self.base.str_width(FontId::Regular, size, s),
             },
             _ => self.base.str_width(font, size, s),
@@ -414,5 +448,67 @@ mod tests {
         assert_eq!(m.ascent(FontId::MonoBold), 629.0);
         assert_eq!(m.descent(FontId::Mono), 157.0);
         assert_eq!(m.str_width(FontId::Mono, 10.0, "abc"), 18.0);
+    }
+
+    #[test]
+    fn regular_str_width_matches_afm_units() {
+        let m = Afm::new();
+        let word = "Typography";
+        // AFM units are integers. `str_width` sums them, then scales once.
+        let units: u32 = word
+            .chars()
+            .map(|c| m.char_width(FontId::Regular, c) as u32)
+            .sum();
+        assert_eq!(
+            m.str_width(FontId::Regular, 11.0, word),
+            units as f64 * (11.0 / 1000.0)
+        );
+    }
+
+    #[test]
+    fn ext_word_width_hits_cache() {
+        let dir = std::env::temp_dir().join(format!("typrst-extw-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("k.ttf");
+        let mut tables =
+            fontdb::synth_tables("Cache Face", "Regular", "CacheFace", 400, false, false);
+        tables.push((b"kern", fontdb::synth_kern(&[(1, 1, -100)])));
+        std::fs::write(&p, fontdb::synth_ttf(&tables)).unwrap();
+        let m = DbMetrics::new(&[FontUse {
+            postscript_name: "CacheFace".into(),
+            family: "Cache Face".into(),
+            path: p,
+            ttc_index: 0,
+        }]);
+        // 600+600-100 font units, upm 1000, 10 pt -> 11.
+        let w1 = m.str_width(FontId::Ext(0), 10.0, "AA");
+        assert_eq!(w1, 11.0);
+        assert_eq!(m.words.borrow().misses, 1);
+        assert_eq!(m.words.borrow().hits, 0);
+        assert_eq!(m.words.borrow().map.len(), 1);
+        let w2 = m.str_width(FontId::Ext(0), 10.0, "AA");
+        assert_eq!(w1, w2);
+        assert_eq!(m.words.borrow().hits, 1);
+        assert_eq!(m.words.borrow().misses, 1);
+        assert_eq!(m.words.borrow().map.len(), 1);
+
+        let word = "Typography";
+        let afm = Afm::new();
+        let units: u32 = word
+            .chars()
+            .map(|c| afm.char_width(FontId::Regular, c) as u32)
+            .sum();
+        assert_eq!(
+            m.str_width(FontId::Regular, 11.0, word),
+            afm.str_width(FontId::Regular, 11.0, word)
+        );
+        assert_eq!(
+            afm.str_width(FontId::Regular, 11.0, word),
+            units as f64 * (11.0 / 1000.0)
+        );
+        // The AFM face does not enter the Ext cache.
+        assert_eq!(m.words.borrow().map.len(), 1);
+        assert_eq!(m.words.borrow().hits, 1);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

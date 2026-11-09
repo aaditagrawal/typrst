@@ -1,5 +1,8 @@
 //! Markup parser: source text -> Vec<Node> (see ir.rs / SPEC.md).
-use crate::ir::{Arg, ArithOp, Cmp, CmpOp, Diag, Expr, Length, Node, Rhs, Severity, Span, Value};
+use crate::ir::{
+    Arg, ArithOp, Cmp, CmpOp, Cond, Diag, Expr, Length, Node, Param, Rhs, RhsArg, Severity, Span,
+    TermEntry, Value,
+};
 
 /// `#name` calls the parser accepts. Anything else (bound `#let` names
 /// aside) is a `not implemented` diagnostic.
@@ -15,13 +18,20 @@ const IMPLEMENTED: &[&str] = &[
     "align",
     "table",
     "grid",
+    "image",
+    "box",
+    "block",
+    "stack",
+    "figure",
+    "outline",
+    "link",
 ];
 
 /// Bare `#word` forms that are recognized but not implemented (rather
 /// than treated as variable references, which unknown `#ident`s become).
 const NOT_IMPL_BARE: &[&str] = &[
-    "show", "context", "state", "counter", "place", "figure", "link", "ref", "while", "else", "in",
-    "not", "and", "or", "return", "break", "continue",
+    "show", "context", "state", "counter", "place", "ref", "else", "in", "not",
+    "and", "or", "return", "break", "continue",
 ];
 
 /// Parse Typst markup. Recovering: returns whatever nodes parsed plus
@@ -33,6 +43,7 @@ pub fn parse(src: &str) -> (Vec<Node>, Vec<Diag>) {
         pos: 0,
         diags: Vec::new(),
         lets: Vec::new(),
+        star: false,
         depth: 0,
     };
     let nodes = p.body(false, 0);
@@ -45,6 +56,9 @@ struct P<'a> {
     pos: usize,
     diags: Vec<Diag>,
     lets: Vec<String>,
+    /// `#import "...": *` was seen. Later `#name(...)` may be a user
+    /// function; the imported names are not known at parse time.
+    star: bool,
     depth: u32,
 }
 
@@ -102,7 +116,7 @@ fn pad(t: &mut String, nodes: &[Node]) {
 }
 
 fn is_label(c: u8) -> bool {
-    c.is_ascii_alphanumeric() || matches!(c, b'_' | b'-' | b'.' | b':')
+    c.is_ascii_alphanumeric() || matches!(c, b'_' | b'-' | b'.')
 }
 
 fn is_ident_start(c: u8) -> bool {
@@ -142,6 +156,7 @@ fn rhs_name(r: &Rhs) -> Option<String> {
 
 /// `Rhs` -> markup `Expr` for `#(expr)`: Var/Field collapse to a dotted
 /// `Expr::Var` (eval resolves fields through dicts), Bin/Lit map over.
+/// A method call (or a field hanging off one) stays an `Expr::Rhs`.
 fn rhs_expr(r: Rhs) -> Expr {
     match r {
         Rhs::Lit(v) => Expr::Lit(v),
@@ -150,8 +165,10 @@ fn rhs_expr(r: Rhs) -> Expr {
             op,
             rhs: *rhs,
         },
-        other => Expr::Var {
-            name: rhs_name(&other).unwrap_or_default(),
+        Rhs::Var(name) => Expr::Var { name },
+        other => match rhs_name(&other) {
+            Some(name) => Expr::Var { name },
+            None => Expr::Rhs(other),
         },
     }
 }
@@ -275,7 +292,7 @@ impl<'a> P<'a> {
     /// matching `]` (consumed); `bstart` is its `[` offset for diagnostics.
     fn body(&mut self, in_bracket: bool, bstart: usize) -> Vec<Node> {
         self.depth += 1;
-        if self.depth > 250 {
+        if self.depth > 32 {
             self.depth -= 1;
             self.diag(Severity::Error, bstart, "content nested too deeply");
             self.skip_balanced(b'[', b']');
@@ -344,18 +361,11 @@ impl<'a> P<'a> {
                 true
             }
             Some(m @ (b'-' | b'+')) if matches!(self.at(1), Some(b' ') | Some(b'\t')) => {
-                self.list(out, text, m == b'+', in_bracket);
+                self.list(out, text, m == b'+', in_bracket, 0, 1);
                 true
             }
             Some(b'/') if matches!(self.at(1), Some(b' ') | Some(b'\t')) => {
-                let a = self.pos;
-                self.skip_to_eol();
-                self.diag(
-                    Severity::NotImplemented,
-                    a,
-                    "term lists are not implemented",
-                );
-                true
+                self.terms(out, text, in_bracket)
             }
             Some(c) if c.is_ascii_digit() && self.starts_block() => {
                 let a = self.pos;
@@ -422,67 +432,323 @@ impl<'a> P<'a> {
         });
     }
 
-    /// `- ` / `+ ` list. Items end at the next column-0 marker, a blank
-    /// line, a heading, or a fence; indented markers are literal text.
-    fn list(&mut self, out: &mut Vec<Node>, text: &mut String, ordered: bool, in_bracket: bool) {
+    /// `- ` / `+ ` list whose marker sits at `indent` (leading spaces/tabs).
+    /// `depth` is 1 at the outermost list and at most 6. A column-0
+    /// sibling is recognized before any indent is counted.
+    fn list(
+        &mut self,
+        out: &mut Vec<Node>,
+        text: &mut String,
+        ordered: bool,
+        in_bracket: bool,
+        indent: usize,
+        depth: u8,
+    ) {
         let marker = if ordered { b'+' } else { b'-' };
         let mut items = Vec::new();
         loop {
             self.pos += 1;
             self.skip_hspace();
-            let mut nodes: Vec<Node> = Vec::new();
-            let mut t = String::new();
-            loop {
-                self.inline(&mut nodes, &mut t, in_bracket, None);
-                let gs = self.pos;
-                let mut nls = 0;
-                let mut stop = false;
-                loop {
-                    match self.peek() {
-                        Some(b'\n') => {
-                            self.pos += 1;
-                            nls += 1;
-                            if self.peek() == Some(marker)
-                                && matches!(self.at(1), Some(b' ') | Some(b'\t'))
-                            {
-                                stop = true; // next item, keep pos at marker
-                                break;
-                            }
-                            if self.block_at(self.pos) {
-                                stop = true;
-                                break;
-                            }
-                        }
-                        Some(b' ') | Some(b'\t') | Some(b'\r') => self.pos += 1,
-                        Some(b'/') if self.at(1) == Some(b'/') => self.line_comment(),
-                        Some(b'/') if self.at(1) == Some(b'*') => self.block_comment(),
-                        _ => break,
-                    }
-                }
-                if stop {
-                    if !(self.peek() == Some(marker)
-                        && matches!(self.at(1), Some(b' ') | Some(b'\t')))
-                    {
-                        self.pos = gs; // let body() recount the boundary
-                    }
-                    break;
-                }
-                if self.eof() || nls >= 2 || (in_bracket && self.peek() == Some(b']')) {
-                    self.pos = gs;
-                    break;
-                }
-                if nls > 0 {
-                    pad(&mut t, &nodes);
-                }
-            }
-            flush(&mut nodes, &mut t);
-            items.push(nodes);
-            if !(self.peek() == Some(marker) && matches!(self.at(1), Some(b' ') | Some(b'\t'))) {
+            items.push(self.list_item(marker, indent, depth, in_bracket));
+            if self.peek() != Some(marker) || !matches!(self.at(1), Some(b' ') | Some(b'\t')) {
                 break;
             }
         }
         flush(out, text);
         out.push(Node::List { ordered, items });
+    }
+
+    /// One item. Ends at a same-indent sibling marker, a blank line, a
+    /// heading, or a fence. A deeper `-`/`+` marker becomes a nested list.
+    fn list_item(
+        &mut self,
+        marker: u8,
+        parent_indent: usize,
+        depth: u8,
+        in_bracket: bool,
+    ) -> Vec<Node> {
+        let mut nodes = Vec::new();
+        let mut t = String::new();
+        loop {
+            self.inline(&mut nodes, &mut t, in_bracket, None);
+            let gs = self.pos;
+            // `row` counts consecutive newlines with only whitespace
+            // between them. A comment breaks the streak so `- a\n// c\n- b`
+            // stays one list, while a real blank line ends it.
+            let mut row = 0usize;
+            let mut line_indent = 0usize;
+            let mut counting = false;
+            let mut blank = false;
+            let mut sibling = false;
+            let mut hard_stop = false;
+            loop {
+                match self.peek() {
+                    Some(b'\n') => {
+                        self.pos += 1;
+                        row += 1;
+                        if row >= 2 {
+                            blank = true;
+                            break;
+                        }
+                        line_indent = 0;
+                        counting = true;
+                        // Flat lists: the next byte is the marker or a
+                        // block start. Don't measure indent on that path.
+                        if parent_indent == 0 {
+                            if self.peek() == Some(marker)
+                                && matches!(self.at(1), Some(b' ') | Some(b'\t'))
+                            {
+                                sibling = true;
+                                break;
+                            }
+                            if self.block_at(self.pos) {
+                                hard_stop = true;
+                                break;
+                            }
+                        }
+                    }
+                    Some(b' ') | Some(b'\t') if counting => {
+                        self.pos += 1;
+                        line_indent += 1;
+                    }
+                    Some(b'\r') => self.pos += 1,
+                    Some(b'/') if self.at(1) == Some(b'/') => {
+                        self.line_comment();
+                        counting = false;
+                        row = 0;
+                    }
+                    Some(b'/') if self.at(1) == Some(b'*') => {
+                        self.block_comment();
+                        counting = false;
+                        row = 0;
+                    }
+                    _ => break,
+                }
+            }
+            if blank || self.eof() || (in_bracket && self.peek() == Some(b']')) {
+                self.pos = gs;
+                break;
+            }
+            if sibling {
+                break;
+            }
+            if hard_stop {
+                self.pos = gs;
+                break;
+            }
+            if row == 0 {
+                if self.pos == gs {
+                    break;
+                }
+                continue;
+            }
+            let marker_here = matches!(self.peek(), Some(b'-') | Some(b'+'))
+                && matches!(self.at(1), Some(b' ') | Some(b'\t'));
+            if marker_here && line_indent > parent_indent {
+                if depth >= 6 {
+                    self.diag(Severity::Warning, self.pos, "lists nested too deeply");
+                    pad(&mut t, &nodes);
+                    continue;
+                }
+                flush(&mut nodes, &mut t);
+                let ordered = self.peek() == Some(b'+');
+                self.list(
+                    &mut nodes,
+                    &mut t,
+                    ordered,
+                    in_bracket,
+                    line_indent,
+                    depth + 1,
+                );
+                continue;
+            }
+            if marker_here && line_indent == parent_indent && self.peek() == Some(marker) {
+                break;
+            }
+            if line_indent < parent_indent
+                || (marker_here && line_indent == parent_indent)
+                || (!marker_here && line_indent <= parent_indent && self.block_at(self.pos))
+            {
+                self.pos = gs;
+                break;
+            }
+            // Continuation. A run that follows a nested list is its own
+            // text node; don't glue a leading space onto it.
+            if !(matches!(nodes.last(), Some(Node::List { .. })) && t.is_empty()) {
+                pad(&mut t, &nodes);
+            }
+        }
+        flush(&mut nodes, &mut t);
+        nodes
+    }
+
+    /// `/ term: description` list. Returns false (and rewinds) when the
+    /// first marker has no colon, so the line is ordinary text.
+    fn terms(&mut self, out: &mut Vec<Node>, text: &mut String, in_bracket: bool) -> bool {
+        let mut items: Vec<TermEntry> = Vec::new();
+        loop {
+            if self.peek() != Some(b'/') || !matches!(self.at(1), Some(b' ') | Some(b'\t')) {
+                break;
+            }
+            let mark = self.pos;
+            self.pos += 1;
+            self.skip_hspace();
+            let Some(col) = self.find_term_colon() else {
+                self.diag(Severity::Warning, mark, "term list item missing ':'");
+                self.pos = mark;
+                break;
+            };
+            let term = self.parse_restricted(col, in_bracket);
+            self.pos = col + 1;
+            self.skip_hspace();
+            let desc = self.term_desc(in_bracket);
+            items.push(TermEntry { term, desc });
+            if self.peek() != Some(b'/') || !matches!(self.at(1), Some(b' ') | Some(b'\t')) {
+                break;
+            }
+        }
+        if items.is_empty() {
+            return false;
+        }
+        flush(out, text);
+        out.push(Node::Terms { items });
+        true
+    }
+
+    /// First colon that ends a term: not escaped, not inside `` `raw` ``
+    /// or a `#"..."`. Stops at end of line.
+    fn find_term_colon(&self) -> Option<usize> {
+        let s = self.bytes;
+        let mut i = self.pos;
+        while i < s.len() {
+            match s[i] {
+                b'\n' => return None,
+                b'\\' => {
+                    i += 1;
+                    if i < s.len() && s[i] != b'\n' {
+                        i += 1;
+                    }
+                }
+                b'`' => {
+                    i += 1;
+                    while i < s.len() && s[i] != b'`' && s[i] != b'\n' {
+                        i += 1;
+                    }
+                    if i < s.len() && s[i] == b'`' {
+                        i += 1;
+                    }
+                }
+                b'#' if s.get(i + 1) == Some(&b'"') => {
+                    i += 2;
+                    while i < s.len() && s[i] != b'"' && s[i] != b'\n' {
+                        if s[i] == b'\\' && i + 1 < s.len() {
+                            i += 2;
+                        } else {
+                            i += 1;
+                        }
+                    }
+                    if i < s.len() && s[i] == b'"' {
+                        i += 1;
+                    }
+                }
+                b':' => return Some(i),
+                _ => i += 1,
+            }
+        }
+        None
+    }
+
+    /// Parse inline markup in `self.src[..end]`, then restore the full
+    /// source. Positions stay absolute, so no extra scan of other text.
+    fn parse_restricted(&mut self, end: usize, in_bracket: bool) -> Vec<Node> {
+        let src = self.src;
+        let bytes = self.bytes;
+        self.src = &src[..end];
+        self.bytes = &bytes[..end];
+        let mut nodes = Vec::new();
+        let mut t = String::new();
+        self.inline(&mut nodes, &mut t, in_bracket, None);
+        flush(&mut nodes, &mut t);
+        self.src = src;
+        self.bytes = bytes;
+        nodes
+    }
+
+    /// Description: the rest of this line, plus lines indented further
+    /// than the `/`. An indented `/` stays literal.
+    fn term_desc(&mut self, in_bracket: bool) -> Vec<Node> {
+        let mut nodes = Vec::new();
+        let mut t = String::new();
+        loop {
+            self.inline(&mut nodes, &mut t, in_bracket, None);
+            let gs = self.pos;
+            let mut row = 0usize;
+            let mut line_indent = 0usize;
+            let mut counting = false;
+            let mut stop_rewind = false;
+            let mut stop_sibling = false;
+            loop {
+                match self.peek() {
+                    Some(b'\n') => {
+                        self.pos += 1;
+                        row += 1;
+                        if row >= 2 {
+                            stop_rewind = true;
+                            break;
+                        }
+                        line_indent = 0;
+                        counting = true;
+                        if self.peek() == Some(b'/')
+                            && matches!(self.at(1), Some(b' ') | Some(b'\t'))
+                        {
+                            stop_sibling = true;
+                            break;
+                        }
+                        if self.block_at(self.pos) {
+                            stop_rewind = true;
+                            break;
+                        }
+                    }
+                    Some(b' ') | Some(b'\t') if counting => {
+                        self.pos += 1;
+                        line_indent += 1;
+                    }
+                    Some(b'\r') => self.pos += 1,
+                    Some(b'/') if self.at(1) == Some(b'/') => {
+                        self.line_comment();
+                        counting = false;
+                        row = 0;
+                    }
+                    Some(b'/') if self.at(1) == Some(b'*') => {
+                        self.block_comment();
+                        counting = false;
+                        row = 0;
+                    }
+                    _ => break,
+                }
+            }
+            if stop_rewind || self.eof() || (in_bracket && self.peek() == Some(b']')) {
+                self.pos = gs;
+                break;
+            }
+            if stop_sibling {
+                break;
+            }
+            if row == 0 {
+                if self.pos == gs {
+                    break;
+                }
+                continue;
+            }
+            if line_indent > 0 {
+                pad(&mut t, &nodes);
+                continue;
+            }
+            self.pos = gs;
+            break;
+        }
+        flush(&mut nodes, &mut t);
+        nodes
     }
 
     /// One line of inline content; stops at `\n`, `]` (in bracket), the
@@ -557,13 +823,13 @@ impl<'a> P<'a> {
                 b'#' => self.hash(out, text),
                 b'$' => self.math(),
                 b'<' => {
-                    if !self.label() {
+                    if !self.label(out, text) {
                         text.push('<');
                         self.pos += 1;
                     }
                 }
                 b'@' => {
-                    if !self.at_ref() {
+                    if !self.at_ref(out, text) {
                         text.push('@');
                         self.pos += 1;
                     }
@@ -787,38 +1053,57 @@ impl<'a> P<'a> {
         self.diag(Severity::NotImplemented, a, "math is not implemented");
     }
 
-    /// `<name>` label.
-    fn label(&mut self) -> bool {
+    /// `<name>` label. Letters, digits, `_`, `-`, `.`.
+    fn label(&mut self, out: &mut Vec<Node>, text: &mut String) -> bool {
         let a = self.pos;
-        let s = self.src.as_bytes();
-        let mut i = self.pos + 1;
-        while i < s.len() && is_label(s[i]) {
-            i += 1;
-        }
-        if i > a + 1 && s.get(i) == Some(&b'>') {
-            self.pos = i + 1;
-            self.diag(Severity::NotImplemented, a, "labels are not implemented");
+        let (name, end) = {
+            let s = self.src.as_bytes();
+            let mut i = a + 1;
+            while i < s.len() && is_label(s[i]) {
+                i += 1;
+            }
+            if i > a + 1 && s.get(i) == Some(&b'>') {
+                (Some(self.src[a + 1..i].to_string()), i + 1)
+            } else {
+                (None, a)
+            }
+        };
+        if let Some(name) = name {
+            self.pos = end;
+            flush(out, text);
+            out.push(Node::Label(name));
             true
         } else {
             false
         }
     }
 
-    /// `@name` reference.
-    fn at_ref(&mut self) -> bool {
+    /// `@name` reference. A `.` stays in the name only when another label
+    /// character follows it (`@fig.1`, `@a.b`, `@a..b`). Dots before
+    /// space, punctuation, or end of input stay in the text (`@intro.`).
+    fn at_ref(&mut self, out: &mut Vec<Node>, text: &mut String) -> bool {
         let a = self.pos;
-        let s = self.src.as_bytes();
-        let mut i = self.pos + 1;
-        while i < s.len() && is_label(s[i]) {
-            i += 1;
-        }
-        if i > a + 1 {
-            self.pos = i;
-            self.diag(
-                Severity::NotImplemented,
-                a,
-                "references are not implemented",
-            );
+        let (name, end) = {
+            let s = self.src.as_bytes();
+            let mut i = a + 1;
+            while i < s.len() && is_label(s[i]) {
+                i += 1;
+            }
+            // Typst uneats trailing `.` after the label scan, so `@intro..`
+            // is `intro` and both dots remain text.
+            while i > a + 1 && s[i - 1] == b'.' {
+                i -= 1;
+            }
+            if i > a + 1 {
+                (Some(self.src[a + 1..i].to_string()), i)
+            } else {
+                (None, a)
+            }
+        };
+        if let Some(name) = name {
+            self.pos = end;
+            flush(out, text);
+            out.push(Node::Ref(name));
             true
         } else {
             false
@@ -839,6 +1124,8 @@ impl<'a> P<'a> {
                     "include" => self.parse_include(a, out, text),
                     "if" => self.parse_if(a, out, text),
                     "for" => self.parse_for(a, out, text),
+                    "while" => self.parse_while(a, out, text),
+                    "show" => self.parse_show(a, out, text),
                     _ => self.hash_call(a, name, out, text),
                 }
             }
@@ -895,20 +1182,61 @@ impl<'a> P<'a> {
     /// `.field` access), or a spaced binary expression `#a + b`.
     fn hash_call(&mut self, a: usize, name: String, out: &mut Vec<Node>, text: &mut String) {
         let bound = self.lets.iter().any(|l| l == &name);
+        // `import *` does not list names. Those calls resolve in eval.
+        if (bound || self.star)
+            && !IMPLEMENTED.contains(&name.as_str())
+            && matches!(self.peek(), Some(b'(') | Some(b'['))
+        {
+            let args = if self.peek() == Some(b'(') {
+                self.rhs_args()
+            } else {
+                Vec::new()
+            };
+            let content = self.trailing_content();
+            flush(out, text);
+            out.push(Node::Expr(Expr::Call { name, args, content }));
+            return;
+        }
         if matches!(self.peek(), Some(b'(') | Some(b'[')) {
             let implemented = IMPLEMENTED.contains(&name.as_str()) || bound;
-            let args = if self.peek() == Some(b'(') {
+            let mut args = if self.peek() == Some(b'(') {
                 self.args()
             } else {
                 Vec::new()
             };
-            let content = if self.peek() == Some(b'[') {
+            let mut content = if self.peek() == Some(b'[') {
                 let bs = self.pos;
                 self.pos += 1;
                 Some(self.body(true, bs))
             } else {
                 None
             };
+            // `#stack[a][b][c]` — every consecutive content block is a
+            // positional content arg. Other calls keep a single trailing
+            // block, so `#emph[x]`, `#if`, and `#for` are unchanged.
+            if name == "stack" {
+                if let Some(first) = content.take() {
+                    args.push(Arg {
+                        name: None,
+                        value: Value::Content(first),
+                    });
+                }
+                loop {
+                    let save = self.pos;
+                    self.skip_ws();
+                    if self.peek() == Some(b'[') {
+                        let bs = self.pos;
+                        self.pos += 1;
+                        args.push(Arg {
+                            name: None,
+                            value: Value::Content(self.body(true, bs)),
+                        });
+                    } else {
+                        self.pos = save;
+                        break;
+                    }
+                }
+            }
             if implemented {
                 flush(out, text);
                 out.push(Node::Expr(Expr::Func {
@@ -926,21 +1254,11 @@ impl<'a> P<'a> {
         } else if bound
             || !(IMPLEMENTED.contains(&name.as_str()) || NOT_IMPL_BARE.contains(&name.as_str()))
         {
-            // `#var`, `#var.field`, `#a + b`. Unknown names still parse as
-            // `Expr::Var` — eval reports "undefined variable" (this also
-            // covers names bound via `#import "..": *`).
-            let mut dotted = name;
-            let mut lhs = Rhs::Var(dotted.clone());
-            while self.peek() == Some(b'.') && self.at(1).map_or(false, is_ident_start) {
-                self.pos += 1;
-                let f = self.ident().unwrap();
-                dotted.push('.');
-                dotted.push_str(&f);
-                lhs = Rhs::Field {
-                    base: Box::new(lhs),
-                    name: f,
-                };
-            }
+            // `#var`, `#var.field`, `#xs.len()`, `#a + b`. Unknown names
+            // still parse as `Expr::Var` — eval reports "undefined
+            // variable" (this also covers names bound via `#import "..": *`).
+            // A pure field chain stays a dotted `Var`; a method call does not.
+            let lhs = self.with_suffix(Rhs::Var(name));
             let save = self.pos;
             self.skip_hspace();
             if self.pos > save {
@@ -957,7 +1275,7 @@ impl<'a> P<'a> {
             }
             self.pos = save;
             flush(out, text);
-            out.push(Node::Expr(Expr::Var { name: dotted }));
+            out.push(Node::Expr(rhs_expr(lhs)));
         } else if IMPLEMENTED.contains(&name.as_str()) {
             flush(out, text);
             out.push(Node::Expr(Expr::Func {
@@ -1013,6 +1331,7 @@ impl<'a> P<'a> {
         // variable. With `*` the names are unknown at parse time; the
         // generic `#ident` -> Var fallback in hash_call covers them.
         if all {
+            self.star = true;
         } else if items.is_empty() {
             self.lets.push(spec_stem(&path));
         } else {
@@ -1047,7 +1366,7 @@ impl<'a> P<'a> {
         let mut arms = Vec::new();
         let mut els = None;
         loop {
-            let Some(c) = self.cmp() else {
+            let Some(c) = self.cond() else {
                 self.diag(Severity::Error, a, "expected a condition after `#if`");
                 break;
             };
@@ -1140,15 +1459,121 @@ impl<'a> P<'a> {
         out.push(Node::Expr(Expr::For { vars, iter, body }));
     }
 
-    /// A condition: `[not] rhs (cmp-op rhs)?`. Bare `#if x` desugars to
-    /// `x != none` (eval treats it as a truthiness test).
-    fn cmp(&mut self) -> Option<Cmp> {
+    /// `#while cond [body]`. Same condition language as `#if`.
+    fn parse_while(&mut self, a: usize, out: &mut Vec<Node>, text: &mut String) {
+        let Some(cond) = self.cond() else {
+            self.diag(Severity::Error, a, "expected a condition after `#while`");
+            self.skip_to_eol();
+            return;
+        };
         self.skip_ws();
-        let save = self.pos;
-        let negated = self.ident().as_deref() == Some("not");
-        if !negated {
+        if self.peek() != Some(b'[') {
+            self.diag(Severity::Error, a, "expected `[` after `#while` condition");
+            self.skip_to_eol();
+            return;
+        }
+        let bs = self.pos;
+        self.pos += 1;
+        let body = self.body(true, bs);
+        flush(out, text);
+        out.push(Node::Expr(Expr::While { cond, body }));
+    }
+
+    /// `#if` / `#while` condition. `and` binds tighter than `or`; prefix
+    /// `not` binds tighter than both. A bare value desugars to `x != none`
+    /// (eval treats that as truthiness). Parentheses group a condition,
+    /// but a parenthesized bare value stays an rhs so `(1) == 2` is still
+    /// a comparison.
+    fn cond(&mut self) -> Option<Cond> {
+        self.cond_or().map(|(c, _)| c)
+    }
+
+    fn cond_or(&mut self) -> Option<(Cond, bool)> {
+        let (mut lhs, mut bare) = self.cond_and()?;
+        loop {
+            let save = self.pos;
+            self.skip_ws();
+            if self.word("or") {
+                match self.cond_and() {
+                    Some((r, _)) => {
+                        lhs = Cond::Or(Box::new(lhs), Box::new(r));
+                        bare = false;
+                    }
+                    None => {
+                        self.diag(Severity::Error, self.pos, "expected an expression after `or`");
+                        return None;
+                    }
+                }
+            } else {
+                self.pos = save;
+                break;
+            }
+        }
+        Some((lhs, bare))
+    }
+
+    fn cond_and(&mut self) -> Option<(Cond, bool)> {
+        let (mut lhs, mut bare) = self.cond_unary()?;
+        loop {
+            let save = self.pos;
+            self.skip_ws();
+            if self.word("and") {
+                match self.cond_unary() {
+                    Some((r, _)) => {
+                        lhs = Cond::And(Box::new(lhs), Box::new(r));
+                        bare = false;
+                    }
+                    None => {
+                        self.diag(Severity::Error, self.pos, "expected an expression after `and`");
+                        return None;
+                    }
+                }
+            } else {
+                self.pos = save;
+                break;
+            }
+        }
+        Some((lhs, bare))
+    }
+
+    fn cond_unary(&mut self) -> Option<(Cond, bool)> {
+        self.skip_ws();
+        if self.word("not") {
+            let (c, _) = self.cond_unary()?;
+            return Some((Cond::Not(Box::new(c)), false));
+        }
+        self.cond_primary()
+    }
+
+    fn cond_primary(&mut self) -> Option<(Cond, bool)> {
+        self.skip_ws();
+        if self.peek() == Some(b'(') {
+            let save = self.pos;
+            self.pos += 1;
+            self.depth += 1;
+            let grouped = if self.depth > 64 {
+                self.diag(Severity::Error, save, "expression nested too deeply");
+                None
+            } else {
+                self.cond_or()
+            };
+            if let Some((c, bare)) = grouped {
+                self.skip_ws();
+                if self.peek() == Some(b')') && !bare {
+                    self.pos += 1;
+                    self.depth -= 1;
+                    return Some((c, false));
+                }
+            }
+            self.depth -= 1;
             self.pos = save;
         }
+        self.comparison()
+    }
+
+    /// `rhs (cmp-op rhs)?`. Without an operator the value is bare
+    /// (`bare == true`) and desugars to `lhs != none`.
+    fn comparison(&mut self) -> Option<(Cond, bool)> {
         let lhs = self.rhs()?;
         self.skip_ws();
         let (op, adv) = match self.peek() {
@@ -1160,37 +1585,94 @@ impl<'a> P<'a> {
             Some(b'>') => (CmpOp::Gt, 1),
             _ => (CmpOp::Ne, 0),
         };
+        if adv == 0 {
+            return Some((
+                Cond::Cmp(Cmp {
+                    lhs,
+                    op: CmpOp::Ne,
+                    rhs: Rhs::Lit(Value::None),
+                }),
+                true,
+            ));
+        }
         self.pos += adv;
-        let rhs = if adv > 0 {
-            self.rhs()?
+        let rhs = self.rhs()?;
+        Some((Cond::Cmp(Cmp { lhs, op, rhs }), false))
+    }
+
+    /// Exact identifier `kw`. Does not match a longer name (`or` / `order`).
+    fn word(&mut self, kw: &str) -> bool {
+        let s = self.pos;
+        if !self.peek().map_or(false, is_ident_start) {
+            return false;
+        }
+        let mut i = self.pos;
+        while self.bytes.get(i).copied().map_or(false, is_ident_cont) {
+            i += 1;
+        }
+        if &self.src[s..i] == kw {
+            self.pos = i;
+            true
         } else {
-            Rhs::Lit(Value::None)
-        };
-        Some(Cmp {
-            lhs,
-            op,
-            rhs,
-            negated,
-        })
+            false
+        }
+    }
+
+    /// `word`, but does not consume. A longer ident (`set` vs `setting`) misses.
+    fn at_word(&self, kw: &str) -> bool {
+        let b = kw.as_bytes();
+        let s = self.pos;
+        if s + b.len() > self.bytes.len() || &self.bytes[s..s + b.len()] != b {
+            return false;
+        }
+        !self.bytes.get(s + b.len()).copied().map_or(false, is_ident_cont)
+    }
+
+    /// Show-rule body. A line break ends it, so the next line's markup stays.
+    fn show_rhs(&mut self) -> Option<Rhs> {
+        self.fold_rhs(true, false)
     }
 
     /// Right-hand side: `mul-level` terms joined by `+`/`-`, folded left.
     fn rhs(&mut self) -> Option<Rhs> {
-        let mut lhs = self.rhs_mul()?;
+        self.fold_rhs(false, false)
+    }
+
+    fn fold_rhs(&mut self, line: bool, mul: bool) -> Option<Rhs> {
+        let mut lhs = if mul {
+            self.rhs_term()?
+        } else {
+            self.fold_rhs(line, true)?
+        };
         loop {
             let save = self.pos;
-            self.skip_ws();
+            if line {
+                self.skip_hspace();
+            } else {
+                self.skip_ws();
+            }
             let op = match self.peek() {
-                Some(b'+') => ArithOp::Add,
-                Some(b'-') => ArithOp::Sub,
+                Some(b'+') if !mul => ArithOp::Add,
+                Some(b'-') if !mul => ArithOp::Sub,
+                Some(b'*') if mul => ArithOp::Mul,
+                Some(b'/') if mul && !matches!(self.at(1), Some(b'/') | Some(b'*')) => ArithOp::Div,
                 _ => {
                     self.pos = save;
                     break;
                 }
             };
             self.pos += 1;
-            self.skip_ws();
-            match self.rhs_mul() {
+            if line {
+                self.skip_hspace();
+            } else {
+                self.skip_ws();
+            }
+            let next = if mul {
+                self.rhs_term()
+            } else {
+                self.fold_rhs(line, true)
+            };
+            match next {
                 Some(r) => {
                     lhs = Rhs::Bin {
                         lhs: Box::new(lhs),
@@ -1207,77 +1689,119 @@ impl<'a> P<'a> {
         Some(lhs)
     }
 
-    /// `*`/`/` level of an rhs, folded left.
-    fn rhs_mul(&mut self) -> Option<Rhs> {
-        let mut lhs = self.rhs_term()?;
-        loop {
-            let save = self.pos;
-            self.skip_ws();
-            let op = match self.peek() {
-                Some(b'*') => ArithOp::Mul,
-                Some(b'/') if !matches!(self.at(1), Some(b'/') | Some(b'*')) => ArithOp::Div,
-                _ => {
-                    self.pos = save;
-                    break;
-                }
-            };
-            self.pos += 1;
-            self.skip_ws();
-            match self.rhs_term() {
-                Some(r) => {
-                    lhs = Rhs::Bin {
-                        lhs: Box::new(lhs),
-                        op,
-                        rhs: Box::new(r),
-                    }
-                }
-                None => {
-                    self.pos = save;
-                    break;
-                }
-            }
-        }
-        Some(lhs)
-    }
-
-    /// One operand: literal, `var`, `var.field`, `(...)`, or `[content]`.
+    /// One operand: literal, `var`, `var.field`, `value.method(args)`,
+    /// `(...)`, or `[content]`.
     fn rhs_term(&mut self) -> Option<Rhs> {
         self.skip_ws();
-        match self.peek()? {
-            b'(' => self.paren_value().map(Rhs::Lit),
-            b'"' => Some(Rhs::Lit(Value::Str(self.string(self.pos)))),
+        let base = match self.peek()? {
+            b'(' => self.paren_value().map(Rhs::Lit)?,
+            b'"' => Rhs::Lit(Value::Str(self.string(self.pos))),
             b'[' => {
                 let bs = self.pos;
                 self.pos += 1;
-                Some(Rhs::Lit(Value::Content(self.body(true, bs))))
+                Rhs::Lit(Value::Content(self.body(true, bs)))
             }
             c if c.is_ascii_digit()
                 || (matches!(c, b'-' | b'+')
                     && self.at(1).map_or(false, |d| d.is_ascii_digit()))
                 || (c == b'.' && self.at(1).map_or(false, |d| d.is_ascii_digit())) =>
             {
-                self.number().map(Rhs::Lit)
+                self.number().map(Rhs::Lit)?
             }
             c if is_ident_start(c) => {
                 let n = self.ident().unwrap();
-                let mut r = match n.as_str() {
+                match n.as_str() {
                     "true" => Rhs::Lit(Value::Bool(true)),
                     "false" => Rhs::Lit(Value::Bool(false)),
                     "none" | "auto" => Rhs::Lit(Value::None),
                     _ => Rhs::Var(n),
-                };
-                while self.peek() == Some(b'.') && self.at(1).map_or(false, is_ident_start) {
-                    self.pos += 1;
-                    let f = self.ident().unwrap();
-                    r = Rhs::Field {
-                        base: Box::new(r),
-                        name: f,
-                    };
                 }
-                Some(r)
             }
-            _ => None,
+            _ => return None,
+        };
+        Some(self.with_suffix(base))
+    }
+
+    /// `.field` or `.name(args)` after an atom. `(` must follow the name
+    /// immediately; a bare `.name` stays a field.
+    fn with_suffix(&mut self, mut r: Rhs) -> Rhs {
+        while self.peek() == Some(b'.') && self.at(1).map_or(false, is_ident_start) {
+            self.pos += 1;
+            let name = self.ident().unwrap();
+            if self.peek() == Some(b'(') {
+                let args = self.rhs_call_args();
+                r = Rhs::Call {
+                    recv: Box::new(r),
+                    method: name,
+                    args,
+                };
+            } else {
+                r = Rhs::Field {
+                    base: Box::new(r),
+                    name,
+                };
+            }
         }
+        r
+    }
+
+    /// Argument list of a method call. The opening `(` is current.
+    fn rhs_call_args(&mut self) -> Vec<Rhs> {
+        self.pos += 1;
+        self.depth += 1;
+        if self.depth > 64 {
+            self.diag(Severity::Error, self.pos, "expression nested too deeply");
+            self.skip_balanced(b'(', b')');
+            self.depth -= 1;
+            return Vec::new();
+        }
+        let mut args = Vec::new();
+        loop {
+            self.skip_ws();
+            match self.peek() {
+                None => {
+                    self.diag(Severity::Error, self.pos, "unclosed `(`");
+                    break;
+                }
+                Some(b')') => {
+                    self.pos += 1;
+                    break;
+                }
+                _ => {}
+            }
+            match self.rhs() {
+                Some(v) => args.push(v),
+                None => {
+                    self.diag(Severity::Error, self.pos, "expected a value");
+                    break;
+                }
+            }
+            self.skip_ws();
+            match self.peek() {
+                Some(b',') => {
+                    self.pos += 1;
+                    self.skip_ws();
+                    if self.peek() == Some(b')') {
+                        self.pos += 1;
+                        break;
+                    }
+                }
+                Some(b')') => {
+                    self.pos += 1;
+                    break;
+                }
+                None => {
+                    self.diag(Severity::Error, self.pos, "unclosed `(`");
+                    break;
+                }
+                _ => {
+                    self.diag(Severity::Error, self.pos, "expected `,` or `)`");
+                    break;
+                }
+            }
+        }
+        self.depth -= 1;
+        args
     }
 
     /// Does an rhs operand start here?
@@ -1315,7 +1839,7 @@ impl<'a> P<'a> {
     }
 
     fn paren_inner(&mut self) -> Option<Value> {
-        if self.depth > 250 {
+        if self.depth > 64 {
             self.diag(Severity::Error, self.pos, "expression nested too deeply");
             self.skip_balanced(b'(', b')');
             return None;
@@ -1393,9 +1917,15 @@ impl<'a> P<'a> {
         }
     }
 
-    /// Remainder of an unrecognized `#foo` construct: trailing string /
-    /// `(...)` / `[...]` operands, or a `#show: ...`-style rest of line.
+    /// Remainder of an unrecognized `#foo` construct: an optional ident,
+    /// trailing string / `(...)` / `[...]` operands, or a `#show heading:
+    /// ...` rest of line. Bracket groups may span lines. The following
+    /// paragraph is left for the markup parser.
     fn skip_tail(&mut self) {
+        self.skip_hspace();
+        if self.peek().map_or(false, is_ident_start) {
+            let _ = self.ident();
+        }
         loop {
             self.skip_hspace();
             match self.peek() {
@@ -1411,12 +1941,162 @@ impl<'a> P<'a> {
                     self.skip_balanced(b'[', b']');
                 }
                 Some(b':') => {
-                    self.skip_to_eol();
+                    self.skip_colon_tail();
                     return;
                 }
                 _ => return,
             }
         }
+    }
+
+    /// After `:`, consume the rest of this line. A `[...]` or `(...)`
+    /// group is consumed whole, even when it crosses lines.
+    fn skip_colon_tail(&mut self) {
+        while let Some(c) = self.peek() {
+            match c {
+                b'\n' => return,
+                b'[' => {
+                    self.pos += 1;
+                    self.skip_balanced(b'[', b']');
+                }
+                b'(' => {
+                    self.pos += 1;
+                    self.skip_balanced(b'(', b')');
+                }
+                b'"' => {
+                    self.string(self.pos);
+                }
+                _ => self.pos += 1,
+            }
+        }
+    }
+
+    /// `#show target: param => body` for the five element targets.
+    /// Anything else is `not implemented` and is consumed so it is not
+    /// printed as page text.
+    fn parse_show(&mut self, a: usize, out: &mut Vec<Node>, text: &mut String) {
+        let start = self.pos;
+        self.skip_hspace();
+        let Some(target) = self.ident() else {
+            self.reject_show(a, start);
+            return;
+        };
+        if !matches!(
+            target.as_str(),
+            "heading" | "strong" | "emph" | "link" | "figure"
+        ) {
+            self.reject_show(a, start);
+            return;
+        }
+        self.skip_hspace();
+        if self.peek() != Some(b':') {
+            self.reject_show(a, start);
+            return;
+        }
+        self.pos += 1;
+        self.skip_ws();
+        if self.at_word("set") {
+            self.reject_show(a, start);
+            return;
+        }
+        let Some(param) = self.ident() else {
+            self.reject_show(a, start);
+            return;
+        };
+        self.skip_ws();
+        if self.peek() != Some(b'=') || self.at(1) != Some(b'>') {
+            self.reject_show(a, start);
+            return;
+        }
+        self.pos += 2;
+        let mark = self.lets.len();
+        self.lets.push(param.clone());
+        let body = self.show_rhs();
+        if self.lets.get(mark).map(|n| n == &param).unwrap_or(false) {
+            self.lets.remove(mark);
+        } else {
+            self.lets.truncate(mark);
+        }
+        let Some(body) = body else {
+            self.diag(Severity::Error, a, "expected a body in `#show`");
+            self.skip_colon_tail();
+            return;
+        };
+        flush(out, text);
+        out.push(Node::Expr(Expr::Show {
+            target,
+            param,
+            body,
+        }));
+    }
+
+    fn reject_show(&mut self, a: usize, start: usize) {
+        self.pos = start;
+        self.diag(Severity::NotImplemented, a, "#show is not implemented");
+        self.skip_show_rest();
+    }
+
+    /// Consume an unimplemented `#show` selector and transform. `self.pos`
+    /// is just after the `show` keyword. The following paragraph stays.
+    fn skip_show_rest(&mut self) {
+        self.skip_hspace();
+        if self.peek() == Some(b'"') {
+            self.string(self.pos);
+        } else if self.peek().map_or(false, is_ident_start) {
+            let _ = self.ident();
+            loop {
+                self.skip_hspace();
+                if self.peek() != Some(b'.') {
+                    break;
+                }
+                self.pos += 1;
+                let _ = self.ident();
+                self.skip_hspace();
+                if self.peek() == Some(b'(') {
+                    self.pos += 1;
+                    self.skip_balanced(b'(', b')');
+                }
+            }
+        }
+        self.skip_hspace();
+        if self.peek() == Some(b':') {
+            self.pos += 1;
+            self.skip_show_transform();
+        }
+    }
+
+    /// After the colon of an unimplemented show rule. A `set` rule, an
+    /// `ident => rhs` transform (body may span lines), or the rest of
+    /// this line.
+    fn skip_show_transform(&mut self) {
+        let line = self.pos;
+        self.skip_ws();
+        if self.at_word("set") {
+            self.word("set");
+            self.skip_ws();
+            let _ = self.ident();
+            self.skip_ws();
+            if self.peek() == Some(b'(') {
+                self.pos += 1;
+                self.skip_balanced(b'(', b')');
+            }
+            return;
+        }
+        if self.ident().is_some() {
+            self.skip_ws();
+            if self.peek() == Some(b'=') && self.at(1) == Some(b'>') {
+                self.pos += 2;
+                let mark = self.lets.len();
+                if self.show_rhs().is_none() {
+                    self.pos = line;
+                    self.skip_colon_tail();
+                }
+                self.lets.truncate(mark);
+                return;
+            }
+        }
+        self.pos = line;
+        self.skip_colon_tail();
     }
 
     fn parse_let(&mut self, a: usize, out: &mut Vec<Node>, text: &mut String) {
@@ -1428,33 +2108,7 @@ impl<'a> P<'a> {
         };
         self.skip_hspace();
         if self.peek() == Some(b'(') {
-            // `#let f(..) = ..` — function definitions are out of scope.
-            self.pos += 1;
-            self.skip_balanced(b'(', b')');
-            self.skip_hspace();
-            if self.peek() == Some(b'=') {
-                self.pos += 1;
-                self.skip_hspace();
-            }
-            match self.peek() {
-                Some(b'[') => {
-                    self.pos += 1;
-                    self.skip_balanced(b'[', b']');
-                }
-                Some(b'(') => {
-                    self.pos += 1;
-                    self.skip_balanced(b'(', b')');
-                }
-                Some(b'"') => {
-                    self.string(self.pos);
-                }
-                _ => self.skip_to_eol(),
-            }
-            self.diag(
-                Severity::NotImplemented,
-                a,
-                "#let function definitions are not implemented",
-            );
+            self.parse_let_fn(a, name, out, text);
             return;
         }
         if self.peek() != Some(b'=') {
@@ -1487,6 +2141,304 @@ impl<'a> P<'a> {
                 self.diag(Severity::Error, a, "expected a value in `#let`");
                 self.skip_to_eol();
             }
+        }
+    }
+
+    /// `#let name(params) = [content] | expr`.
+    fn parse_let_fn(&mut self, a: usize, name: String, out: &mut Vec<Node>, text: &mut String) {
+        let params = self.fn_params();
+        self.skip_hspace();
+        if self.peek() != Some(b'=') {
+            self.diag(Severity::Error, a, "expected `=` in `#let`");
+            self.skip_to_eol();
+            return;
+        }
+        self.pos += 1;
+        let mark = self.lets.len();
+        self.lets.push(name.clone());
+        for p in &params {
+            self.lets.push(p.name.clone());
+        }
+        let body = self.rhs();
+        self.lets.truncate(mark);
+        let Some(body) = body else {
+            self.diag(Severity::Error, a, "expected a value in `#let`");
+            self.skip_to_eol();
+            return;
+        };
+        if !self.lets.iter().any(|n| n == &name) {
+            self.lets.push(name.clone());
+        }
+        flush(out, text);
+        out.push(Node::Expr(Expr::LetFn { name, params, body }));
+    }
+
+    /// Parameter list, including the surrounding parentheses.
+    fn fn_params(&mut self) -> Vec<Param> {
+        self.pos += 1;
+        self.depth += 1;
+        let params = self.fn_param_list();
+        self.depth -= 1;
+        params
+    }
+
+    fn fn_param_list(&mut self) -> Vec<Param> {
+        if self.depth > 64 {
+            self.diag(Severity::Error, self.pos, "parameters nested too deeply");
+            self.skip_balanced(b'(', b')');
+            return Vec::new();
+        }
+        let mut params = Vec::new();
+        loop {
+            let start = self.pos;
+            self.skip_ws();
+            match self.peek() {
+                None => {
+                    self.diag(Severity::Error, self.pos, "unclosed `(`");
+                    break;
+                }
+                Some(b')') => {
+                    self.pos += 1;
+                    break;
+                }
+                Some(b'.') if self.at(1) == Some(b'.') => {
+                    self.diag(
+                        Severity::NotImplemented,
+                        self.pos,
+                        "parameter sinks are not implemented",
+                    );
+                    self.pos += 2;
+                    while self.peek().map_or(false, is_ident_cont) {
+                        self.pos += 1;
+                    }
+                    self.skip_param_tail();
+                }
+                Some(b'(') => {
+                    self.diag(
+                        Severity::NotImplemented,
+                        self.pos,
+                        "parameter destructuring is not implemented",
+                    );
+                    self.pos += 1;
+                    self.skip_balanced(b'(', b')');
+                    self.skip_param_tail();
+                }
+                _ => {
+                    if let Some(pname) = self.ident() {
+                    self.skip_ws();
+                    let default = if self.peek() == Some(b':') {
+                        self.pos += 1;
+                        let save = self.pos;
+                        match self.literal_default() {
+                            Some(v) => Some(v),
+                            None => {
+                                self.diag(
+                                    Severity::Error,
+                                    save,
+                                    "parameter default must be a literal",
+                                );
+                                if self.pos == save {
+                                    let _ = self.rhs();
+                                }
+                                None
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                    params.push(Param {
+                        name: pname,
+                        default,
+                    });
+                    self.skip_ws();
+                    match self.peek() {
+                        Some(b',') => self.pos += 1,
+                        Some(b')') | None => {}
+                        _ => {
+                            self.diag(Severity::Error, self.pos, "expected `,` or `)`");
+                            let before = self.pos;
+                            self.recover_arg();
+                            if self.pos == before
+                                && !matches!(self.peek(), Some(b',') | Some(b')') | None)
+                            {
+                                self.pos += 1;
+                            }
+                            if self.peek() == Some(b',') {
+                                self.pos += 1;
+                            }
+                        }
+                    }
+                    } else {
+                        self.diag(Severity::Error, self.pos, "expected a parameter name");
+                        let before = self.pos;
+                        self.recover_arg();
+                        if self.pos == before
+                            && !matches!(self.peek(), Some(b',') | Some(b')') | None)
+                        {
+                            self.pos += 1;
+                        }
+                        if self.peek() == Some(b',') {
+                            self.pos += 1;
+                        }
+                    }
+                }
+            }
+            if self.pos == start {
+                if self.eof() {
+                    break;
+                }
+                self.pos += 1;
+            }
+        }
+        params
+    }
+
+    fn skip_param_tail(&mut self) {
+        self.skip_ws();
+        if self.peek() == Some(b':') {
+            self.pos += 1;
+            let _ = self.rhs();
+        }
+        self.skip_ws();
+        if self.peek() == Some(b',') {
+            self.pos += 1;
+        }
+    }
+
+    /// Literal allowed as a parameter default: int, float, string, length, bool, none.
+    fn literal_default(&mut self) -> Option<Value> {
+        self.skip_ws();
+        match self.peek()? {
+            b'"' => Some(Value::Str(self.string(self.pos))),
+            c if c.is_ascii_digit()
+                || (matches!(c, b'-' | b'+') && self.at(1).map_or(false, |d| d.is_ascii_digit()))
+                || (c == b'.' && self.at(1).map_or(false, |d| d.is_ascii_digit())) =>
+            {
+                match self.number()? {
+                    v @ (Value::Int(_) | Value::Float(_) | Value::Length(_)) => Some(v),
+                    _ => None,
+                }
+            }
+            c if is_ident_start(c) => {
+                let save = self.pos;
+                let n = self.ident()?;
+                match n.as_str() {
+                    "true" => Some(Value::Bool(true)),
+                    "false" => Some(Value::Bool(false)),
+                    "none" => Some(Value::None),
+                    _ => {
+                        self.pos = save;
+                        None
+                    }
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// `(expr, name: expr, ...)` for a user-function call.
+    fn rhs_args(&mut self) -> Vec<RhsArg> {
+        self.pos += 1;
+        self.depth += 1;
+        let args = self.rhs_arg_list();
+        self.depth -= 1;
+        args
+    }
+
+    fn rhs_arg_list(&mut self) -> Vec<RhsArg> {
+        if self.depth > 64 {
+            self.diag(Severity::Error, self.pos, "arguments nested too deeply");
+            self.skip_balanced(b'(', b')');
+            return Vec::new();
+        }
+        let mut args = Vec::new();
+        loop {
+            let start = self.pos;
+            self.skip_ws();
+            match self.peek() {
+                None => {
+                    self.diag(Severity::Error, self.pos, "unclosed `(`");
+                    break;
+                }
+                Some(b')') => {
+                    self.pos += 1;
+                    break;
+                }
+                Some(b'.') if self.at(1) == Some(b'.') => {
+                    self.diag(
+                        Severity::NotImplemented,
+                        self.pos,
+                        "spread arguments are not implemented",
+                    );
+                    self.pos += 2;
+                    self.recover_arg();
+                    if self.peek() == Some(b',') {
+                        self.pos += 1;
+                    }
+                }
+                _ => {
+                    let mut name = None;
+                    let save = self.pos;
+                    if let Some(n) = self.ident() {
+                        self.skip_hspace();
+                        if self.peek() == Some(b':') {
+                            self.pos += 1;
+                            name = Some(n);
+                        } else {
+                            self.pos = save;
+                        }
+                    }
+                    if let Some(v) = self.rhs() {
+                        args.push(RhsArg { name, value: v });
+                    } else {
+                        self.diag(Severity::Error, self.pos, "expected a value");
+                        let before = self.pos;
+                        self.recover_arg();
+                        if self.pos == before
+                            && !matches!(self.peek(), Some(b',') | Some(b')') | None)
+                        {
+                            self.pos += 1;
+                        }
+                    }
+                    self.skip_ws();
+                    if self.peek() == Some(b',') {
+                        self.pos += 1;
+                    } else if !matches!(self.peek(), Some(b')') | None) {
+                        self.diag(Severity::Error, self.pos, "expected `,` or `)`");
+                        let before = self.pos;
+                        self.recover_arg();
+                        if self.pos == before
+                            && !matches!(self.peek(), Some(b',') | Some(b')') | None)
+                        {
+                            self.pos += 1;
+                        }
+                        if self.peek() == Some(b',') {
+                            self.pos += 1;
+                        }
+                    }
+                }
+            }
+            if self.pos == start {
+                if self.eof() {
+                    break;
+                }
+                self.pos += 1;
+            }
+        }
+        args
+    }
+
+    /// Trailing `[content]`, allowing spaces before the bracket.
+    fn trailing_content(&mut self) -> Option<Vec<Node>> {
+        let save = self.pos;
+        self.skip_hspace();
+        if self.peek() == Some(b'[') {
+            let bs = self.pos;
+            self.pos += 1;
+            Some(self.body(true, bs))
+        } else {
+            self.pos = save;
+            None
         }
     }
 
@@ -1531,7 +2483,7 @@ impl<'a> P<'a> {
     /// Arg list body after `(` is consumed. Nested `(x: v, ...)` groups
     /// become `Value::Dict`/`Value::Array` via `paren_value`.
     fn arg_list(&mut self) -> Vec<Arg> {
-        if self.depth > 250 {
+        if self.depth > 64 {
             self.diag(Severity::Error, self.pos, "arguments nested too deeply");
             self.skip_balanced(b'(', b')');
             return Vec::new();
@@ -1783,6 +2735,19 @@ mod tests {
         Node::Text(s.into())
     }
 
+    fn list_depth(nodes: &[Node]) -> usize {
+        nodes
+            .iter()
+            .map(|n| match n {
+                Node::List { items, .. } => {
+                    1 + items.iter().map(|it| list_depth(it)).max().unwrap_or(0)
+                }
+                _ => 0,
+            })
+            .max()
+            .unwrap_or(0)
+    }
+
     #[test]
     fn headings() {
         assert_eq!(
@@ -1802,6 +2767,53 @@ mod tests {
         assert_eq!(nodes("======= A"), vec![t("======= A")]);
         assert_eq!(nodes("=x"), vec![t("=x")]);
     }
+
+    #[test]
+    fn labels_and_refs_parse() {
+        assert_eq!(
+            nodes("= Intro <intro>"),
+            vec![Node::Heading {
+                level: 1,
+                body: vec![t("Intro "), Node::Label("intro".into())],
+            }]
+        );
+        let n = nodes("= Intro\n<intro>");
+        assert!(matches!(n[0], Node::Heading { level: 1, .. }));
+        assert!(matches!(&n[1], Node::Label(s) if s == "intro"));
+        assert_eq!(
+            nodes("See @intro now"),
+            vec![t("See "), Node::Ref("intro".into()), t(" now")]
+        );
+        let (n, d) = parse("<a-b_c.d> @a-b_c.d");
+        assert!(d.is_empty(), "{d:?}");
+        assert!(n.iter().any(|x| matches!(x, Node::Label(s) if s == "a-b_c.d")));
+        assert!(n.iter().any(|x| matches!(x, Node::Ref(s) if s == "a-b_c.d")));
+        assert!(!nodes("<a:b>").iter().any(|x| matches!(x, Node::Label(_))));
+        // A dot is part of the name only when a label character follows it.
+        assert_eq!(
+            nodes("Dot @intro."),
+            vec![t("Dot "), Node::Ref("intro".into()), t(".")]
+        );
+        assert_eq!(
+            nodes("@intro.."),
+            vec![Node::Ref("intro".into()), t("..")]
+        );
+        assert_eq!(
+            nodes("@fig.1 @a.b. @a..b"),
+            vec![
+                Node::Ref("fig.1".into()),
+                t(" "),
+                Node::Ref("a.b".into()),
+                t(". "),
+                Node::Ref("a..b".into()),
+            ]
+        );
+        assert_eq!(
+            nodes("@details!"),
+            vec![Node::Ref("details".into()), t("!")]
+        );
+    }
+
 
     #[test]
     fn strong_emph_nesting() {
@@ -1846,14 +2858,199 @@ mod tests {
                 },
             ]
         );
-        // continuation line and indented marker inside an item
+        // continuation line stays in the item; a non-marker indent is not a list
+        assert_eq!(
+            nodes("- a\n  cont\n- c"),
+            vec![Node::List {
+                ordered: false,
+                items: vec![vec![t("a cont")], vec![t("c")]],
+            }]
+        );
+        // indented marker nests; the following column-0 marker is a sibling
         assert_eq!(
             nodes("- a\n  cont\n  - b\n- c"),
             vec![Node::List {
                 ordered: false,
-                items: vec![vec![t("a cont - b")], vec![t("c")]],
+                items: vec![
+                    vec![
+                        t("a cont"),
+                        Node::List {
+                            ordered: false,
+                            items: vec![vec![t("b")]],
+                        },
+                    ],
+                    vec![t("c")],
+                ],
             }]
         );
+    }
+
+    #[test]
+    fn nested_and_mixed_lists() {
+        assert_eq!(
+            nodes("- a\n  - b\n- c"),
+            vec![Node::List {
+                ordered: false,
+                items: vec![
+                    vec![
+                        t("a"),
+                        Node::List {
+                            ordered: false,
+                            items: vec![vec![t("b")]],
+                        },
+                    ],
+                    vec![t("c")],
+                ],
+            }]
+        );
+        assert_eq!(
+            nodes("- a\n  + b\n  - c\n+ d"),
+            vec![
+                Node::List {
+                    ordered: false,
+                    items: vec![vec![
+                        t("a"),
+                        Node::List {
+                            ordered: true,
+                            items: vec![vec![t("b")]],
+                        },
+                        Node::List {
+                            ordered: false,
+                            items: vec![vec![t("c")]],
+                        },
+                    ]],
+                },
+                Node::List {
+                    ordered: true,
+                    items: vec![vec![t("d")]],
+                },
+            ]
+        );
+        // a tab is enough extra indent
+        assert_eq!(
+            nodes("- a\n\t- b"),
+            vec![Node::List {
+                ordered: false,
+                items: vec![vec![
+                    t("a"),
+                    Node::List {
+                        ordered: false,
+                        items: vec![vec![t("b")]],
+                    },
+                ]],
+            }]
+        );
+        // blank line ends the list
+        assert_eq!(
+            nodes("- a\n\n- b"),
+            vec![
+                Node::List {
+                    ordered: false,
+                    items: vec![vec![t("a")]],
+                },
+                Node::Parbreak,
+                Node::List {
+                    ordered: false,
+                    items: vec![vec![t("b")]],
+                },
+            ]
+        );
+        // a comment between items does not split the list
+        assert_eq!(
+            nodes("- a\n// c\n- b"),
+            vec![Node::List {
+                ordered: false,
+                items: vec![vec![t("a")], vec![t("b")]],
+            }]
+        );
+    }
+
+    #[test]
+    fn list_depth_limit() {
+        let mut src = String::new();
+        for i in 0..6 {
+            for _ in 0..i {
+                src.push(' ');
+            }
+            src.push_str("- x\n");
+        }
+        let (n, d) = parse(&src);
+        assert!(d.is_empty(), "{d:?}");
+        assert_eq!(list_depth(&n), 6);
+
+        src.push_str("      - y\n");
+        let (n, d) = parse(&src);
+        assert!(
+            d.iter()
+                .any(|x| x.severity == Severity::Warning && x.message.contains("nested")),
+            "{d:?}"
+        );
+        assert_eq!(list_depth(&n), 6);
+        fn has_literal(nodes: &[Node]) -> bool {
+            nodes.iter().any(|n| match n {
+                Node::Text(t) => t.contains("- y"),
+                Node::List { items, .. } => items.iter().any(|it| has_literal(it)),
+                _ => false,
+            })
+        }
+        assert!(has_literal(&n));
+    }
+
+    #[test]
+    fn term_lists() {
+        assert_eq!(
+            nodes("/ *A*: a _b_ `c`"),
+            vec![Node::Terms {
+                items: vec![TermEntry {
+                    term: vec![Node::Strong(vec![t("A")])],
+                    desc: vec![
+                        t("a "),
+                        Node::Emph(vec![t("b")]),
+                        t(" "),
+                        Node::Raw {
+                            text: "c".into(),
+                            block: false,
+                        },
+                    ],
+                }],
+            }]
+        );
+        assert_eq!(
+            nodes("/ a: b\n  c _d_\n/ e: f"),
+            vec![Node::Terms {
+                items: vec![
+                    TermEntry {
+                        term: vec![t("a")],
+                        desc: vec![t("b c "), Node::Emph(vec![t("d")])],
+                    },
+                    TermEntry {
+                        term: vec![t("e")],
+                        desc: vec![t("f")],
+                    },
+                ],
+            }]
+        );
+        // colon inside raw does not end the term; an indented `/` is literal
+        assert_eq!(
+            nodes("/ see `a:b`: done\n  / nested: no"),
+            vec![Node::Terms {
+                items: vec![TermEntry {
+                    term: vec![
+                        t("see "),
+                        Node::Raw {
+                            text: "a:b".into(),
+                            block: false,
+                        },
+                    ],
+                    desc: vec![t("done / nested: no")],
+                }],
+            }]
+        );
+        let (n, d) = parse("/ no colon");
+        assert_eq!(n, vec![t("/ no colon")]);
+        assert_eq!(d.len(), 1);
+        assert_eq!(d[0].severity, Severity::Warning);
+        assert!(d[0].message.contains(':'));
     }
 
     #[test]
@@ -2061,12 +3258,11 @@ mod tests {
             n,
             vec![Node::Expr(Expr::If {
                 arms: vec![(
-                    Cmp {
+                    Cond::Cmp(Cmp {
                         lhs: Rhs::Var("x".into()),
                         op: CmpOp::Ne,
                         rhs: Rhs::Lit(Value::None),
-                        negated: false,
-                    },
+                    }),
                     vec![t("yes")],
                 )],
                 els: None,
@@ -2079,9 +3275,12 @@ mod tests {
             panic!("{n:?}")
         };
         assert_eq!(arms.len(), 2);
-        assert_eq!(arms[0].0.op, CmpOp::Eq);
-        assert_eq!(arms[0].0.rhs, Rhs::Lit(Value::Int(1)));
-        assert!(arms[1].0.negated);
+        let Cond::Cmp(c0) = &arms[0].0 else {
+            panic!("{:?}", arms[0].0)
+        };
+        assert_eq!(c0.op, CmpOp::Eq);
+        assert_eq!(c0.rhs, Rhs::Lit(Value::Int(1)));
+        assert!(matches!(arms[1].0, Cond::Not(_)));
         assert_eq!(els.as_ref().unwrap()[0], t("z"));
 
         for (src, op) in [
@@ -2096,8 +3295,104 @@ mod tests {
             let Node::Expr(Expr::If { arms, .. }) = &n[0] else {
                 panic!("{src}")
             };
-            assert_eq!(arms[0].0.op, op, "{src}");
+            let Cond::Cmp(c) = &arms[0].0 else {
+                panic!("{src}")
+            };
+            assert_eq!(c.op, op, "{src}");
         }
+    }
+
+    #[test]
+    fn while_and_bool_combinators() {
+        let (n, d) = parse("#while n < 3 [x]");
+        assert!(d.is_empty(), "{d:?}");
+        let Node::Expr(Expr::While { cond, body }) = &n[0] else {
+            panic!("{n:?}")
+        };
+        let Cond::Cmp(c) = cond else { panic!("{cond:?}") };
+        assert_eq!(c.op, CmpOp::Lt);
+        assert_eq!(*body, vec![t("x")]);
+
+        let (n, d) = parse("#if a or b and c [x]");
+        assert!(d.is_empty(), "{d:?}");
+        let Node::Expr(Expr::If { arms, .. }) = &n[0] else {
+            panic!("{n:?}")
+        };
+        let Cond::Or(l, r) = &arms[0].0 else {
+            panic!("{:?}", arms[0].0)
+        };
+        assert!(matches!(l.as_ref(), Cond::Cmp(_)));
+        assert!(matches!(r.as_ref(), Cond::And(_, _)));
+
+        let (n, d) = parse("#if (a or b) and c [x]");
+        assert!(d.is_empty(), "{d:?}");
+        let Node::Expr(Expr::If { arms, .. }) = &n[0] else {
+            panic!("{n:?}")
+        };
+        let Cond::And(l, _) = &arms[0].0 else {
+            panic!("{:?}", arms[0].0)
+        };
+        assert!(matches!(l.as_ref(), Cond::Or(_, _)));
+
+        let (n, d) = parse("#if not a and b [x]");
+        assert!(d.is_empty(), "{d:?}");
+        let Node::Expr(Expr::If { arms, .. }) = &n[0] else {
+            panic!("{n:?}")
+        };
+        let Cond::And(l, _) = &arms[0].0 else {
+            panic!("{:?}", arms[0].0)
+        };
+        assert!(matches!(l.as_ref(), Cond::Not(_)));
+
+        let (n, d) = parse("#if (1) == 2 [x]");
+        assert!(d.is_empty(), "{d:?}");
+        let Node::Expr(Expr::If { arms, .. }) = &n[0] else {
+            panic!("{n:?}")
+        };
+        let Cond::Cmp(c) = &arms[0].0 else {
+            panic!("{:?}", arms[0].0)
+        };
+        assert_eq!(c.op, CmpOp::Eq);
+        assert_eq!(c.lhs, Rhs::Lit(Value::Int(1)));
+    }
+
+    #[test]
+    fn method_call_rhs() {
+        let (n, d) = parse("#let n = xs.len()\n#let y = xs.at(-1)\n#let z = m.x");
+        assert!(d.is_empty(), "{d:?}");
+        let lets: Vec<&Rhs> = n
+            .iter()
+            .filter_map(|n| {
+                if let Node::Expr(Expr::Let { value, .. }) = n {
+                    Some(value)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(lets.len(), 3);
+        let Rhs::Call { method, args, .. } = lets[0] else {
+            panic!("{lets:?}")
+        };
+        assert_eq!(method, "len");
+        assert!(args.is_empty());
+        let Rhs::Call { method, args, .. } = lets[1] else {
+            panic!("{lets:?}")
+        };
+        assert_eq!(method, "at");
+        assert_eq!(args, &[Rhs::Lit(Value::Int(-1))]);
+        let Rhs::Field { name, .. } = lets[2] else {
+            panic!("{lets:?}")
+        };
+        assert_eq!(name, "x");
+
+        let (n, d) = parse("#xs.at(i)");
+        assert!(d.is_empty(), "{d:?}");
+        let Node::Expr(Expr::Rhs(Rhs::Call { method, args, .. })) = &n[0] else {
+            panic!("{n:?}")
+        };
+        assert_eq!(method, "at");
+        assert_eq!(args, &[Rhs::Var("i".into())]);
     }
 
     #[test]
@@ -2191,6 +3486,132 @@ mod tests {
     }
 
     #[test]
+    fn image_args() {
+        let (n, d) = parse("#image(\"pic.jpg\", width: 100pt, height: 2cm)");
+        assert!(d.is_empty(), "{d:?}");
+        let Node::Expr(Expr::Func { name, args, content }) = &n[0] else {
+            panic!("{n:?}");
+        };
+        assert_eq!(name, "image");
+        assert!(content.is_none());
+        assert_eq!(args.len(), 3);
+        assert_eq!(args[0].name, None);
+        assert_eq!(args[0].value, Value::Str("pic.jpg".into()));
+        assert_eq!(args[1].name.as_deref(), Some("width"));
+        assert_eq!(args[1].value, Value::Length(Length::Pt(100.0)));
+        assert_eq!(args[2].name.as_deref(), Some("height"));
+        match args[2].value {
+            Value::Length(Length::Pt(p)) => assert!((p - 56.6929).abs() < 0.01, "{p}"),
+            ref other => panic!("{other:?}"),
+        }
+        let (n, d) = parse("#image(\"a.jpeg\", height: 12pt)");
+        assert!(d.is_empty(), "{d:?}");
+        let Node::Expr(Expr::Func { args, .. }) = &n[0] else {
+            panic!("{n:?}");
+        };
+        assert_eq!(args[0].value, Value::Str("a.jpeg".into()));
+        assert_eq!(args[1].name.as_deref(), Some("height"));
+    }
+
+    #[test]
+    fn stack_content_blocks_stay_positional() {
+        let (n, d) = parse("#stack(dir: ttb, spacing: 4pt)[a][b][c]");
+        assert!(d.is_empty(), "{d:?}");
+        let Node::Expr(Expr::Func { name, args, content }) = &n[0] else {
+            panic!("{n:?}");
+        };
+        assert_eq!(name, "stack");
+        assert!(content.is_none());
+        let blocks: Vec<_> = args.iter().filter(|a| a.name.is_none()).collect();
+        assert_eq!(blocks.len(), 3);
+        for (b, word) in blocks.iter().zip(["a", "b", "c"]) {
+            match &b.value {
+                Value::Content(ns) => assert_eq!(ns, &vec![Node::Text(word.into())]),
+                other => panic!("{other:?}"),
+            }
+        }
+        let (n, d) = parse("#emph[x][y]");
+        assert!(d.is_empty(), "{d:?}");
+        let Node::Expr(Expr::Func { name, content, .. }) = &n[0] else {
+            panic!("{n:?}");
+        };
+        assert_eq!(name, "emph");
+        assert_eq!(content.as_ref().map(|c| c.len()), Some(1));
+        assert_eq!(n[1], Node::Text("[y]".into()));
+    }
+
+    #[test]
+    fn let_functions() {
+        let (n, d) = parse("#let f(x) = x * 2");
+        assert!(d.is_empty(), "{d:?}");
+        assert_eq!(
+            n,
+            vec![Node::Expr(Expr::LetFn {
+                name: "f".into(),
+                params: vec![Param {
+                    name: "x".into(),
+                    default: None,
+                }],
+                body: Rhs::Bin {
+                    lhs: Box::new(Rhs::Var("x".into())),
+                    op: ArithOp::Mul,
+                    rhs: Box::new(Rhs::Lit(Value::Int(2))),
+                },
+            })]
+        );
+
+        let (n, d) = parse("#let f(name: \"Ada\") = name");
+        assert!(d.is_empty(), "{d:?}");
+        let Node::Expr(Expr::LetFn { params, .. }) = &n[0] else {
+            panic!("{n:?}")
+        };
+        assert_eq!(params[0].default, Some(Value::Str("Ada".into())));
+
+        let n = nodes("#let f(x) = x\n#f(1 + 2)");
+        let call = n.iter().find_map(|node| match node {
+            Node::Expr(Expr::Call { name, args, content }) => Some((name, args, content)),
+            _ => None,
+        });
+        let (name, args, content) = call.expect("call");
+        assert_eq!(name, "f");
+        assert!(content.is_none());
+        assert_eq!(args.len(), 1);
+        assert!(args[0].name.is_none());
+        assert_eq!(
+            args[0].value,
+            Rhs::Bin {
+                lhs: Box::new(Rhs::Lit(Value::Int(1))),
+                op: ArithOp::Add,
+                rhs: Box::new(Rhs::Lit(Value::Int(2))),
+            }
+        );
+
+        let n = nodes("#let f(x) = x\n#f[hi]");
+        let Node::Expr(Expr::Call { content, args, .. }) = n.last().unwrap() else {
+            panic!("{n:?}")
+        };
+        assert!(args.is_empty());
+        let c = content.as_ref().unwrap();
+        assert!(c.iter().any(|node| matches!(node, Node::Text(s) if s == "hi")));
+
+        let n = nodes("#let f(text) = [#text]\n#text");
+        let Node::Expr(Expr::LetFn { body, .. }) = &n[0] else {
+            panic!("{n:?}")
+        };
+        let Rhs::Lit(Value::Content(body)) = body else {
+            panic!("{body:?}")
+        };
+        assert!(body.iter().any(|node| matches!(
+            node,
+            Node::Expr(Expr::Var { name }) if name == "text"
+        )));
+        assert!(matches!(
+            n.last(),
+            Some(Node::Expr(Expr::Func { name, .. })) if name == "text"
+        ));
+    }
+
+    #[test]
     fn not_implemented() {
         let (n, d) = parse("$x^2$");
         assert!(n.is_empty());
@@ -2198,19 +3619,126 @@ mod tests {
         assert_eq!(d[0].severity, Severity::NotImplemented);
 
         for (src, what) in [
-            ("#image(\"x.png\")", "#image"),
-            ("#figure[..]", "#figure"),
-            ("/ term: desc", "term"),
+            ("#footnote[..]", "#footnote"),
             ("1. item", "numbered"),
-            ("<lbl>", "labels"),
-            ("@lbl", "references"),
-            ("#let f(x) = x * 2", "function definition"),
             ("#show: it => it", "#show"),
+            ("#break", "#break"),
+            ("#continue", "#continue"),
         ] {
             let (_, d) = parse(src);
             assert!(!d.is_empty(), "{src}");
             assert_eq!(d[0].severity, Severity::NotImplemented, "{src} ({what})");
         }
+    }
+
+    fn contains_text(nodes: &[Node], needle: &str) -> bool {
+        nodes.iter().any(|n| match n {
+            Node::Text(s) => s.contains(needle),
+            Node::Strong(body) | Node::Emph(body) => contains_text(body, needle),
+            Node::Heading { body, .. } => contains_text(body, needle),
+            Node::List { items, .. } => items.iter().any(|item| contains_text(item, needle)),
+            Node::Terms { items } => items.iter().any(|item| {
+                contains_text(&item.term, needle) || contains_text(&item.desc, needle)
+            }),
+            _ => false,
+        })
+    }
+
+    #[test]
+    fn show_rule_parses() {
+        let (n, d) = parse("#show heading: it => [Chapter #it]");
+        assert!(d.is_empty(), "{d:?}");
+        let Node::Expr(Expr::Show { target, param, body }) = &n[0] else {
+            panic!("{n:?}")
+        };
+        assert_eq!(target, "heading");
+        assert_eq!(param, "it");
+        let Rhs::Lit(Value::Content(body)) = body else {
+            panic!("{body:?}")
+        };
+        assert!(body.iter().any(|node| matches!(node, Node::Text(s) if s.contains("Chapter"))));
+        assert!(body.iter().any(|node| matches!(
+            node,
+            Node::Expr(Expr::Var { name }) if name == "it"
+        )));
+
+        let (n, d) = parse("#show emph: body => body");
+        assert!(d.is_empty(), "{d:?}");
+        let Node::Expr(Expr::Show { target, param, body }) = &n[0] else {
+            panic!("{n:?}")
+        };
+        assert_eq!(target, "emph");
+        assert_eq!(param, "body");
+        assert_eq!(body, &Rhs::Var("body".into()));
+
+        for target in ["strong", "link", "figure"] {
+            let (n, d) = parse(&format!("#show {target}: el => el"));
+            assert!(d.is_empty(), "{target} {d:?}");
+            assert!(matches!(
+                &n[0],
+                Node::Expr(Expr::Show { target: t, .. }) if t == target
+            ));
+        }
+
+        // The rule itself is not page text.
+        let (n, d) = parse("#show heading: it => it\nHello");
+        assert!(d.is_empty(), "{d:?}");
+        assert!(!contains_text(&n, "heading"), "{n:?}");
+        assert!(!contains_text(&n, "it"), "{n:?}");
+        assert!(contains_text(&n, "Hello"), "{n:?}");
+    }
+
+    #[test]
+    fn not_implemented_is_not_printed() {
+        let src = "#show quote: it => it";
+        let (n, d) = parse(src);
+        assert!(
+            d.iter().any(|x| {
+                x.severity == Severity::NotImplemented
+                    && x.span.map(|sp| crate::ir::line_col(src, sp.start)) == Some((1, 1))
+            }),
+            "{d:?}"
+        );
+        assert!(!contains_text(&n, "quote"), "{n:?}");
+        assert!(!contains_text(&n, "it"), "{n:?}");
+
+        let src = "#show quote: it => it\nHello";
+        let (n, d) = parse(src);
+        assert!(d.iter().any(|x| {
+            x.severity == Severity::NotImplemented && x.span.is_some()
+        }));
+        assert!(!contains_text(&n, "quote"), "{n:?}");
+        assert!(contains_text(&n, "Hello"), "{n:?}");
+
+        let src = "#show quote: it => [\nsecret\n]\nNext";
+        let (n, d) = parse(src);
+        assert!(d.iter().any(|x| x.severity == Severity::NotImplemented && x.span.is_some()));
+        assert!(!contains_text(&n, "secret"), "{n:?}");
+        assert!(!contains_text(&n, "quote"), "{n:?}");
+        assert!(contains_text(&n, "Next"), "{n:?}");
+
+        let src = "#show heading.where(level: 1): it => it\nHello";
+        let (n, d) = parse(src);
+        assert!(d.iter().any(|x| x.severity == Severity::NotImplemented && x.span.is_some()));
+        assert!(!contains_text(&n, "heading"), "{n:?}");
+        assert!(!contains_text(&n, "where"), "{n:?}");
+        assert!(!contains_text(&n, "it"), "{n:?}");
+        assert!(contains_text(&n, "Hello"), "{n:?}");
+
+        let src = "#show heading: set text(size: 12pt)\nHello";
+        let (n, d) = parse(src);
+        assert!(d.iter().any(|x| x.severity == Severity::NotImplemented && x.span.is_some()));
+        assert!(!contains_text(&n, "heading"), "{n:?}");
+        assert!(!contains_text(&n, "text"), "{n:?}");
+        assert!(contains_text(&n, "Hello"), "{n:?}");
+
+        let (n, d) = parse("$x$");
+        assert!(d.iter().any(|x| x.severity == Severity::NotImplemented && x.span.is_some()));
+        assert!(!contains_text(&n, "x"), "{n:?}");
+
+        let (n, d) = parse("hello");
+        assert!(d.iter().all(|x| x.severity != Severity::NotImplemented));
+        assert!(contains_text(&n, "hello"));
     }
 
     #[test]
@@ -2227,6 +3755,12 @@ mod tests {
             "#let 1",
             "#let x",
             "#let x =",
+            "#let f(",
+            "#let f()",
+            "#let f() =",
+            "#let f(x: ) = 1",
+            "#let f(..) = 1",
+            "#let f((a)) = 1",
             "#set",
             "#set x",
             "\"",
@@ -2255,6 +3789,18 @@ mod tests {
             "a\\\r\nb",
             "- a\n- \n- c",
             "#strong[",
+            "#show",
+            "#show:",
+            "#show heading",
+            "#show heading:",
+            "#show heading: it",
+            "#show heading: it =>",
+            "#show quote: it => it",
+            "#while",
+            "#while [",
+            "#if a and",
+            "#if (",
+            "#xs.len(",
             "\u{1f600} *é_ \u{4e2d}\u{6587}",
         ] {
             let _ = parse(src);

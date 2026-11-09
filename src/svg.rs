@@ -134,6 +134,18 @@ pub fn render(pages: &[Page], fonts: &[FontUse]) -> String {
                     )
                     .unwrap();
                 }
+                DrawItem::Link { .. } => {}
+                DrawItem::Image { x, y, w, h, .. } => {
+                    writeln!(
+                        s,
+                        "<rect x=\"{}\" y=\"{}\" width=\"{}\" height=\"{}\" fill=\"#808080\"/>",
+                        num(*x),
+                        num(top + *y),
+                        num(*w),
+                        num(*h)
+                    )
+                    .unwrap();
+                }
             }
         }
         top += page.height + GAP;
@@ -257,5 +269,24 @@ mod tests {
         let s = render(&[], &[]);
         assert!(s.contains("viewBox=\"0 0 0 0\""));
         assert!(s.ends_with("</svg>\n"));
+    }
+
+    #[test]
+    fn image_is_a_grey_rect() {
+        let pages = vec![Page {
+            width: 200.0,
+            height: 100.0,
+            items: vec![DrawItem::Image {
+                x: 10.0,
+                y: 20.0,
+                w: 30.0,
+                h: 40.0,
+                index: 0,
+            }],
+        }];
+        let s = render(&pages, &[]);
+        assert!(s.contains(
+            "<rect x=\"10\" y=\"20\" width=\"30\" height=\"40\" fill=\"#808080\"/>"
+        ));
     }
 }

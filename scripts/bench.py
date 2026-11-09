@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# Pass/fail 10x gate versus typst: scripts/speed_gate.py
 """Benchmark typrst vs typst: process wall-clock, median + best of N runs."""
 import subprocess, sys, time, statistics, tempfile, os
 

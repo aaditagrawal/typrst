@@ -11,6 +11,12 @@ enum Tok<'a> {
     G(f64),
     /// Forced line break.
     B,
+    /// Unbreakable framed run. Width is the outer width in pt.
+    F(&'a Inline, f64),
+    /// Start of a `#link`. Zero width; the url borrows the document.
+    Ls(&'a str),
+    /// End of a `#link`. Zero width.
+    Le,
 }
 
 /// One token of the line being filled. A word records its parent string
@@ -19,6 +25,14 @@ enum Atom<'a> {
     W(&'a str, u32, u32, TextStyle, f64),
     S(f64),
     G(f64),
+    /// Index into `Lx::frames`. A `u32` keeps `Atom` `Copy`, so a line of
+    /// words still matches by copy and a document with no frames never
+    /// touches the frame list.
+    F(u32),
+    /// Start of a `#link`. Zero width, so the character loop is unchanged.
+    Ls(&'a str),
+    /// End of a `#link`.
+    Le,
 }
 
 struct St {
@@ -58,6 +72,26 @@ struct Line {
     hard: bool,
 }
 
+/// A frame measured before it is painted. Tokens borrow the document.
+struct Prepared<'a> {
+    toks: Vec<Tok<'a>>,
+    lines: Vec<Line>,
+    outer_w: f64,
+    inset: f64,
+    /// Distance from the frame top to the first baseline.
+    above: f64,
+    /// Distance from the first baseline to the frame bottom.
+    below: f64,
+    height: f64,
+    font_size: f64,
+}
+
+struct Paint<'a> {
+    prep: Prepared<'a>,
+    fill: Option<f64>,
+    stroke: Option<f64>,
+}
+
 #[derive(Clone, Copy, PartialEq)]
 enum Sep {
     Cat, // previous token was a word: concat directly
@@ -91,6 +125,9 @@ pub fn layout<M: FontMetrics>(doc: &Document, metrics: &M) -> Vec<Page> {
         fresh: true,
         cur: Vec::new(),
         held: Vec::new(),
+        frames: Vec::new(),
+        term_prefix: None,
+        link_carry: None,
     };
     for b in &doc.blocks {
         lx.block(b);
@@ -114,6 +151,15 @@ struct Lx<'a, M: FontMetrics> {
     /// sees whether a line is the last one. Reused across blocks.
     cur: Vec<Atom<'a>>,
     held: Vec<Atom<'a>>,
+    /// Prepared inline frames for this document. Empty, and unread, when
+    /// the source never uses `#box`.
+    frames: Vec<Paint<'a>>,
+    /// Term-list label drawn with the first line's marker slot. Paragraphs
+    /// and bullet lists leave it `None`; the check lives in that slot.
+    term_prefix: Option<&'a [Inline]>,
+    /// URL still open from the previous line of this paragraph. `None`
+    /// unless a link wrapped, so a document with no links never walks it.
+    link_carry: Option<&'a str>,
 }
 
 impl<'a, M: FontMetrics> Lx<'a, M> {
@@ -153,14 +199,17 @@ impl<'a, M: FontMetrics> Lx<'a, M> {
     }
 
     fn block(&mut self, b: &'a Block) {
-        let ml = self.st.margin_left;
+        self.place(b, self.st.margin_left, self.text_w());
+    }
+
+    fn place(&mut self, b: &'a Block, ml: f64, avail: f64) {
         match b {
             Block::Paragraph { content, align } => {
                 // Paragraphs contribute below-spacing only (6.05pt), matching
                 // typst: heading->para gets no extra gap.
                 self.gap(0.0);
                 let justify = self.st.justify && *align == HAlign::Left;
-                self.flow(content, ml, self.text_w(), *align, justify, None, &ident);
+                self.flow(content, ml, avail, *align, justify, None, &ident);
                 self.after = self.st.par_spacing;
             }
             Block::Heading { level, content } => {
@@ -175,7 +224,7 @@ impl<'a, M: FontMetrics> Lx<'a, M> {
                 self.flow(
                     content,
                     ml,
-                    self.text_w(),
+                    avail,
                     HAlign::Left,
                     false,
                     None,
@@ -190,28 +239,14 @@ impl<'a, M: FontMetrics> Lx<'a, M> {
                 // Small before-gap; collapses to the previous block's
                 // trailing gap when larger.
                 self.gap(1.1);
-                for (i, it) in items.iter().enumerate() {
-                    let mk = if *ordered {
-                        format!("{}.", i + 1)
-                    } else {
-                        "\u{2022}".to_string()
-                    };
-                    let mst = TextStyle {
-                        font: FontId::Regular,
-                        size: self.st.font_size,
-                    };
-                    // typst hangs the marker at the margin; item text starts
-                    // after the marker + a 0.5em gap, continuations aligned.
-                    let ind = self.m.str_width(mst.font, mst.size, &mk) + 0.5 * mst.size;
-                    self.flow(
-                        it,
-                        ml + ind,
-                        self.text_w() - ind,
-                        HAlign::Left,
-                        false,
-                        Some((mk, mst, ml)),
-                        &ident,
-                    );
+                self.lay_list(*ordered, items, ml, ml + avail);
+                self.after = self.st.par_spacing;
+            }
+            Block::Terms { items } => {
+                self.gap(1.1);
+                let tw = avail;
+                for it in items {
+                    self.lay_term(&it.term, &it.desc, ml, tw);
                 }
                 self.after = self.st.par_spacing;
             }
@@ -261,7 +296,7 @@ impl<'a, M: FontMetrics> Lx<'a, M> {
                 // Empty/absent column specs degrade to a single auto column;
                 // specs beyond `columns.len()` are treated as Auto.
                 let ncols = columns.len().max(1);
-                let total = self.text_w();
+                let total = avail;
                 let mut widths = vec![0.0; ncols];
                 let mut used = 0.0;
                 let mut frsum = 0.0;
@@ -356,10 +391,22 @@ impl<'a, M: FontMetrics> Lx<'a, M> {
                             let (toks, lines) =
                                 self.cell_lines(&cells[i], (widths[c] - 2.0 * IX).max(0.0));
                             let mut base = top + IY;
+                            let mut carry = None;
                             for (k, l) in lines.iter().enumerate() {
                                 let (size, asc, _) = self.extents(&toks, *l, None);
                                 base += if k == 0 { asc } else { self.lh(size) };
-                                emit_line(&mut self.items, &toks, *l, cx + IX, base, 0.0, size);
+                                emit_line(
+                                    &mut self.items,
+                                    self.m,
+                                    self.st,
+                                    &toks,
+                                    *l,
+                                    cx + IX,
+                                    base,
+                                    0.0,
+                                    size,
+                                    &mut carry,
+                                );
                             }
                         }
                         cx += widths[c];
@@ -383,7 +430,343 @@ impl<'a, M: FontMetrics> Lx<'a, M> {
                 self.after = 0.0;
             }
             Block::PageBreak => self.finish_page(),
+            Block::Image { index, w, h } => {
+                self.gap(0.0);
+                let limit = self.st.page_height - self.st.margin_bottom;
+                let mut top = if self.fresh {
+                    self.st.margin_top
+                } else {
+                    self.y + self.pending_gap
+                };
+                self.pending_gap = 0.0;
+                if !self.items.is_empty() && top + *h > limit {
+                    self.finish_page();
+                    top = self.st.margin_top;
+                }
+                self.items.push(DrawItem::Image {
+                    x: ml,
+                    y: top,
+                    w: *w,
+                    h: *h,
+                    index: *index,
+                });
+                self.y = top + *h;
+                self.fresh = false;
+                self.after = self.st.par_spacing;
+            }
+            Block::Framed(f) => self.lay_frame(f, ml, avail),
+            Block::Stack {
+                horizontal,
+                spacing,
+                children,
+            } => {
+                if children.is_empty() {
+                    return;
+                }
+                if *horizontal {
+                    self.lay_row(children, *spacing, ml, avail);
+                } else {
+                    self.gap(0.0);
+                    for (i, c) in children.iter().enumerate() {
+                        if i > 0 {
+                            self.after = 0.0;
+                            self.pending_gap = *spacing;
+                        }
+                        self.place(c, ml, avail);
+                    }
+                }
+            }
+            Block::Figure(f) => self.lay_figure(f, ml, avail),
+            // Filled before layout when the document has an outline.
+            Block::Outline { .. } => {}
         }
+    }
+
+    /// Body, then the caption line 4pt below it. The caption inlines
+    /// already carry the 0.9em face.
+    fn lay_figure(&mut self, f: &'a Fig, ml: f64, avail: f64) {
+        let had_body = !f.body.is_empty();
+        for c in &f.body {
+            self.place(c, ml, avail);
+        }
+        if f.caption.is_empty() {
+            return;
+        }
+        if had_body && !self.fresh {
+            self.after = 0.0;
+            self.pending_gap = 4.0;
+        } else if !self.fresh {
+            self.gap(0.0);
+        }
+        self.flow(&f.caption, ml, avail, HAlign::Left, false, None, &ident);
+        self.after = self.st.par_spacing;
+    }
+
+    fn lay_frame(&mut self, f: &'a Frame, x: f64, avail: f64) {
+        self.gap(0.0);
+        let prep = prepare_frame(
+            self.m,
+            self.st,
+            &f.content,
+            f.width,
+            f.expand,
+            f.inset,
+            avail,
+        );
+        let limit = self.st.page_height - self.st.margin_bottom;
+        let mut top = if self.fresh {
+            self.st.margin_top
+        } else {
+            self.y + self.pending_gap
+        };
+        self.pending_gap = 0.0;
+        if !self.items.is_empty() && top + prep.height > limit {
+            self.finish_page();
+            top = self.st.margin_top;
+        }
+        paint_prepared(
+            &mut self.items,
+            self.m,
+            self.st,
+            &prep,
+            x,
+            top,
+            f.fill,
+            f.stroke,
+        );
+        self.y = top + prep.height;
+        self.fresh = false;
+        self.after = self.st.par_spacing;
+    }
+
+    fn lay_row(&mut self, children: &'a [Block], spacing: f64, ml: f64, avail: f64) {
+        let n = children.len();
+        if n == 0 {
+            return;
+        }
+        let slot = avail / n as f64;
+        let saved_y = self.y;
+        let saved_fresh = self.fresh;
+        let saved_gap = self.pending_gap;
+        let saved_after = self.after;
+        let mut max_y = saved_y;
+        let mut placed = false;
+        let mut x = ml;
+        let mut end_after = self.st.par_spacing;
+        for c in children {
+            self.y = saved_y;
+            self.fresh = saved_fresh;
+            self.pending_gap = saved_gap;
+            self.after = saved_after;
+            let w = explicit_child_width(c).unwrap_or(slot);
+            self.place(c, x, w);
+            if !self.fresh {
+                max_y = if placed { max_y.max(self.y) } else { self.y };
+                placed = true;
+            }
+            end_after = self.after;
+            x += w + spacing;
+        }
+        if placed {
+            self.y = max_y;
+            self.fresh = false;
+        } else {
+            self.y = saved_y;
+            self.fresh = saved_fresh;
+        }
+        self.pending_gap = 0.0;
+        self.after = end_after;
+    }
+
+    /// Bullet/enum list. `marker_x` is where this level's markers sit.
+    /// A nested list shifts by one hanging indent (marker width + 0.5em).
+    fn lay_list(&mut self, ordered: bool, items: &'a [ListItem], marker_x: f64, right: f64) {
+        for (i, it) in items.iter().enumerate() {
+            let mk = if ordered {
+                format!("{}.", i + 1)
+            } else {
+                "\u{2022}".to_string()
+            };
+            let mst = TextStyle {
+                font: FontId::Regular,
+                size: self.st.font_size,
+            };
+            // typst hangs the marker; item text starts after the marker
+            // plus a 0.5em gap, and continuations align there.
+            let ind = self.m.str_width(mst.font, mst.size, &mk) + 0.5 * mst.size;
+            let text_x = marker_x + ind;
+            let width = (right - text_x).max(0.0);
+            self.flow(
+                &it.content,
+                text_x,
+                width,
+                HAlign::Left,
+                false,
+                Some((mk, mst, marker_x)),
+                &ident,
+            );
+            if it.rest.is_empty() {
+                continue;
+            }
+            for part in &it.rest {
+                match part {
+                    ListRest::List(list) => self.lay_list(list.ordered, &list.items, text_x, right),
+                    ListRest::Inlines(content) => self.flow(
+                        content,
+                        text_x,
+                        width,
+                        HAlign::Left,
+                        false,
+                        None,
+                        &ident,
+                    ),
+                }
+            }
+        }
+    }
+
+    /// Term in bold, description on the same line when the term fits.
+    /// Continuations align under the description.
+    fn lay_term(&mut self, term: &'a [Inline], desc: &'a [Inline], ml: f64, tw: f64) {
+        let gap = 0.5 * self.st.font_size;
+        let Some(term_w) = self.inline_width(term) else {
+            self.flow(term, ml, tw, HAlign::Left, false, None, &ident);
+            if !desc.is_empty() {
+                self.flow(desc, ml, tw, HAlign::Left, false, None, &ident);
+            }
+            return;
+        };
+        let hang = if term.is_empty() { 0.0 } else { term_w + gap };
+        if hang >= tw {
+            if !term.is_empty() {
+                self.flow(term, ml, tw, HAlign::Left, false, None, &ident);
+            }
+            if !desc.is_empty() {
+                self.flow(desc, ml, tw, HAlign::Left, false, None, &ident);
+            }
+            return;
+        }
+        let mst = TextStyle {
+            font: FontId::Bold,
+            size: self.inline_size(term),
+        };
+        self.term_prefix = Some(term);
+        self.flow(
+            desc,
+            ml + hang,
+            tw - hang,
+            HAlign::Left,
+            false,
+            Some((String::new(), mst, ml)),
+            &ident,
+        );
+        self.term_prefix = None;
+    }
+
+    /// Width of a single-line inline run. `None` when it contains a break.
+    fn inline_width(&self, inl: &[Inline]) -> Option<f64> {
+        let mut w = 0.0;
+        for i in inl {
+            match i {
+                Inline::Text { text, style } => {
+                    if text.as_bytes().contains(&b'\n') {
+                        return None;
+                    }
+                    w += self.m.str_width(style.font, style.size, text);
+                }
+                Inline::HSpace(g) => w += *g,
+                Inline::Ref { name, style } => {
+                    if name.as_bytes().contains(&b'\n') {
+                        return None;
+                    }
+                    w += self.m.str_width(style.font, style.size, name);
+                }
+                Inline::LineBreak => return None,
+                Inline::Link(link) => w += self.inline_width(&link.content)?,
+                Inline::Frame(f) => {
+                    if let Some(fw) = f.width {
+                        w += fw;
+                    } else {
+                        let inner = self.inline_width(&f.content)?;
+                        w += inner + 2.0 * f.inset.max(0.0);
+                    }
+                }
+            }
+        }
+        Some(w)
+    }
+
+    fn inline_size(&self, inl: &[Inline]) -> f64 {
+        let mut s = self.st.font_size;
+        for i in inl {
+            match i {
+                Inline::Text { style, .. } | Inline::Ref { style, .. } => s = s.max(style.size),
+                Inline::Frame(f) => s = s.max(self.inline_size(&f.content)),
+                Inline::Link(link) => s = s.max(self.inline_size(&link.content)),
+                _ => {}
+            }
+        }
+        s
+    }
+
+    fn paint_prefix(&mut self, runs: &[Inline], mut x: f64, baseline: f64) -> f64 {
+        for r in runs {
+            match r {
+                Inline::Text { text, style } => {
+                    if text.is_empty() {
+                        continue;
+                    }
+                    let w = self.m.str_width(style.font, style.size, text);
+                    self.items.push(DrawItem::Text {
+                        x,
+                        y: baseline,
+                        font: style.font,
+                        size: style.size,
+                        text: InlineStr::from(text.as_str()),
+                    });
+                    x += w;
+                }
+                Inline::HSpace(g) => x += *g,
+                Inline::Ref { name, style } => {
+                    if name.is_empty() {
+                        continue;
+                    }
+                    let w = self.m.str_width(style.font, style.size, name);
+                    self.items.push(DrawItem::Text {
+                        x,
+                        y: baseline,
+                        font: style.font,
+                        size: style.size,
+                        text: InlineStr::from(name.as_str()),
+                    });
+                    x += w;
+                }
+                Inline::LineBreak => {}
+                Inline::Frame(f) => {
+                    let adv = f.width.unwrap_or_else(|| {
+                        self.inline_width(&f.content).unwrap_or(0.0) + 2.0 * f.inset.max(0.0)
+                    });
+                    self.paint_prefix(&f.content, x + f.inset, baseline);
+                    x += adv;
+                }
+                Inline::Link(link) => {
+                    let x0 = x;
+                    let at = self.items.len();
+                    let url = link.url.as_str();
+                    x = self.paint_prefix(&link.content, x, baseline);
+                    if x > x0 {
+                        close_link(
+                            &mut self.items,
+                            self.m,
+                            LinkMark { url, x0, at },
+                            x,
+                            baseline,
+                        );
+                    }
+                }
+            }
+        }
+        x
     }
 
     /// Lay out inline content one line at a time. The finished line is held
@@ -421,35 +804,19 @@ impl<'a, M: FontMetrics> Lx<'a, M> {
             spaces: 0,
             hard: false,
         };
+        // A link does not cross a block. Drop a carry left by the last one.
+        self.link_carry = None;
         for inl in content {
-            match inl {
-                Inline::Text { text, style } => {
-                    self.feed_text(
-                        text,
-                        xf(*style),
-                        &mut cur,
-                        &mut held,
-                        &mut st,
-                        &mut meta,
-                        &g,
-                        &mut marker,
-                    );
-                }
-                Inline::LineBreak => {
-                    self.park(
-                        true,
-                        &mut cur,
-                        &mut held,
-                        &mut st,
-                        &mut meta,
-                        &g,
-                        &mut marker,
-                    );
-                }
-                Inline::HSpace(w) => {
-                    self.push_gap(*w, &mut cur, &mut held, &mut st, &mut meta, &g, &mut marker);
-                }
-            }
+            self.feed_inline(
+                inl,
+                &mut cur,
+                &mut held,
+                &mut st,
+                &mut meta,
+                &g,
+                &mut marker,
+                xf,
+            );
         }
         if st.has {
             self.park(
@@ -461,6 +828,10 @@ impl<'a, M: FontMetrics> Lx<'a, M> {
                 &g,
                 &mut marker,
             );
+        } else if meta.on && cur.iter().any(|a| matches!(a, Atom::Ls(_) | Atom::Le)) {
+            // A closer after a hard break sits on an empty line. Attach it
+            // to the line being placed so the link does not stay open.
+            held.extend(cur.drain(..));
         }
         if meta.on {
             self.place_atoms(&held, meta.w, meta.spaces, meta.hard, &g, true, &mut marker);
@@ -469,6 +840,90 @@ impl<'a, M: FontMetrics> Lx<'a, M> {
         }
         self.cur = cur;
         self.held = held;
+    }
+
+    fn feed_inline<F: Fn(TextStyle) -> TextStyle>(
+        &mut self,
+        inl: &'a Inline,
+        cur: &mut Vec<Atom<'a>>,
+        held: &mut Vec<Atom<'a>>,
+        st: &mut St,
+        meta: &mut Meta,
+        g: &Geom,
+        marker: &mut Option<(String, TextStyle, f64)>,
+        xf: &F,
+    ) {
+        match inl {
+            Inline::Text { text, style } => {
+                self.feed_text(text, xf(*style), cur, held, st, meta, g, marker);
+            }
+            Inline::Ref { name, style } => {
+                self.feed_text(name, xf(*style), cur, held, st, meta, g, marker);
+            }
+            Inline::LineBreak => {
+                self.park(true, cur, held, st, meta, g, marker);
+            }
+            Inline::HSpace(w) => {
+                self.push_gap(*w, cur, held, st, meta, g, marker);
+            }
+            Inline::Frame(f) => {
+                let prep = prepare_frame(
+                    self.m,
+                    self.st,
+                    &f.content,
+                    f.width,
+                    false,
+                    f.inset,
+                    g.width,
+                );
+                let outer = prep.outer_w;
+                if st.has && st.w + st.pend_w + outer > g.width {
+                    st.pend_w = 0.0;
+                    st.pend_n = 0;
+                    self.park(false, cur, held, st, meta, g, marker);
+                }
+                if st.has && st.pend_n > 0 {
+                    cur.push(Atom::S(st.pend_w));
+                    st.w += st.pend_w;
+                    st.spaces += 1;
+                }
+                let idx = self.frames.len() as u32;
+                self.frames.push(Paint {
+                    prep,
+                    fill: f.fill,
+                    stroke: f.stroke,
+                });
+                cur.push(Atom::F(idx));
+                st.w += outer;
+                st.has = true;
+                st.pend_w = 0.0;
+                st.pend_n = 0;
+            }
+            Inline::Link(link) => {
+                // Markers only. The character loop in `feed_text` is unchanged,
+                // and `link_carry` stays `None` when this arm never runs.
+                // A pending space belongs to the text before the link.
+                if st.has && st.pend_n > 0 {
+                    cur.push(Atom::S(st.pend_w));
+                    st.w += st.pend_w;
+                    st.spaces += 1;
+                    st.pend_w = 0.0;
+                    st.pend_n = 0;
+                }
+                cur.push(Atom::Ls(link.url.as_str()));
+                for c in &link.content {
+                    self.feed_inline(c, cur, held, st, meta, g, marker, xf);
+                }
+                if st.has && st.pend_n > 0 {
+                    cur.push(Atom::S(st.pend_w));
+                    st.w += st.pend_w;
+                    st.spaces += 1;
+                    st.pend_w = 0.0;
+                    st.pend_n = 0;
+                }
+                cur.push(Atom::Le);
+            }
+        }
     }
 
     fn feed_text(
@@ -641,7 +1096,7 @@ impl<'a, M: FontMetrics> Lx<'a, M> {
 
     fn place_atoms(
         &mut self,
-        atoms: &[Atom],
+        atoms: &[Atom<'a>],
         line_w: f64,
         spaces: u32,
         hard: bool,
@@ -677,16 +1132,42 @@ impl<'a, M: FontMetrics> Lx<'a, M> {
                 HAlign::Left => 0.0,
             };
         if let Some((mt, mst, mx)) = mk {
-            self.items.push(DrawItem::Text {
-                x: mx,
-                y: baseline,
-                font: mst.font,
-                size: mst.size,
-                text: InlineStr::from(mt.as_str()),
-            });
+            if !mt.is_empty() {
+                self.items.push(DrawItem::Text {
+                    x: mx,
+                    y: baseline,
+                    font: mst.font,
+                    size: mst.size,
+                    text: InlineStr::from(mt.as_str()),
+                });
+            }
+            // Term lists only. Bullet markers take the branch above;
+            // `term_prefix` stays `None` for them.
+            if let Some(pref) = self.term_prefix.take() {
+                self.paint_prefix(pref, mx, baseline);
+            }
         }
-        emit_atoms(&mut self.items, atoms, x, baseline, extra);
+        let below = emit_atoms(
+            &mut self.items,
+            atoms,
+            x,
+            baseline,
+            extra,
+            self.m,
+            self.st,
+            &self.frames,
+            &mut self.link_carry,
+        );
         self.y = baseline;
+        if below > 0.0 {
+            let body = self.st.font_size;
+            let body_asc = self.m.ascent(FontId::Regular) * body / 1000.0;
+            let clearance = (self.lh(body) - body_asc).max(0.0);
+            let extra_drop = below - clearance;
+            if extra_drop > 0.0 {
+                self.y += extra_drop;
+            }
+        }
         self.fresh = false;
     }
 
@@ -706,6 +1187,14 @@ impl<'a, M: FontMetrics> Lx<'a, M> {
         }
         if let Some(st) = marker {
             extent(st);
+        }
+        for a in atoms {
+            if let Atom::F(i) = a {
+                let fr = &self.frames[*i as usize];
+                size = size.max(fr.prep.font_size);
+                asc = asc.max(fr.prep.above);
+                desc = desc.max(fr.prep.below);
+            }
         }
         if size == 0.0 {
             size = self.st.font_size;
@@ -761,8 +1250,21 @@ impl<'a, M: FontMetrics> Lx<'a, M> {
                         w = w.max(self.m.str_width(style.font, style.size, wd));
                     }
                 }
+                Inline::Ref { name, style } => {
+                    for wd in name.split_whitespace() {
+                        w = w.max(self.m.str_width(style.font, style.size, wd));
+                    }
+                }
                 Inline::HSpace(g) => w = w.max(*g),
                 Inline::LineBreak => {}
+                Inline::Frame(f) => {
+                    if let Some(fw) = f.width {
+                        w = w.max(fw);
+                    } else {
+                        w = w.max(self.cell_word_w(&f.content) + 2.0 * f.inset.max(0.0));
+                    }
+                }
+                Inline::Link(link) => w = w.max(self.cell_word_w(&link.content)),
             }
         }
         w
@@ -794,9 +1296,71 @@ fn ws_run(text: &str, i: usize) -> usize {
     j - i
 }
 
+/// A link open on this line. Closed at `Le` or at the line end.
+struct LinkMark<'a> {
+    url: &'a str,
+    x0: f64,
+    at: usize,
+}
+
+/// Underline (gray 0) plus a URI annotation over the span. No-op when the
+/// span has no width, so a marker that merely wraps does not emit.
+fn close_link<M: FontMetrics>(
+    items: &mut Vec<DrawItem>,
+    m: &M,
+    mark: LinkMark,
+    x1: f64,
+    baseline: f64,
+) {
+    let w = x1 - mark.x0;
+    if w <= 0.0 {
+        return;
+    }
+    let mut asc: f64 = 0.0;
+    let mut desc: f64 = 0.0;
+    for it in &items[mark.at..] {
+        if let DrawItem::Text { font, size, .. } = it {
+            asc = asc.max(m.ascent(*font) * *size / 1000.0);
+            desc = desc.max(m.descent(*font) * *size / 1000.0);
+        }
+    }
+    if asc == 0.0 {
+        asc = m.ascent(FontId::Regular) * 11.0 / 1000.0;
+        desc = m.descent(FontId::Regular) * 11.0 / 1000.0;
+    }
+    let uh = 0.5;
+    let uy = baseline + 1.0;
+    items.push(DrawItem::Rule {
+        x: mark.x0,
+        y: uy,
+        w,
+        h: uh,
+        gray: 0.0,
+    });
+    let top = baseline - asc;
+    let bot = (uy + uh).max(baseline + desc);
+    items.push(DrawItem::Link {
+        x: mark.x0,
+        y: top,
+        w,
+        h: bot - top,
+        url: InlineStr::from(mark.url),
+    });
+}
+
 /// Emit one line of atoms. Same-style words separated by a single source
 /// space become one draw item copied from that parent slice.
-fn emit_atoms(items: &mut Vec<DrawItem>, atoms: &[Atom], mut x: f64, baseline: f64, extra: f64) {
+fn emit_atoms<'a, M: FontMetrics>(
+    items: &mut Vec<DrawItem>,
+    atoms: &[Atom<'a>],
+    mut x: f64,
+    baseline: f64,
+    extra: f64,
+    m: &M,
+    styles: &Styles,
+    frames: &[Paint],
+    carry: &mut Option<&'a str>,
+) -> f64 {
     let mut sep = Sep::Brk;
     let mut buf = InlineStr::new();
     let mut bx = 0.0;
@@ -809,9 +1373,73 @@ fn emit_atoms(items: &mut Vec<DrawItem>, atoms: &[Atom], mut x: f64, baseline: f
     let mut span_a = 0usize;
     let mut span_b = 0usize;
     let mut span_ok = false;
+    let mut depth = 0.0f64;
+    let mut open: Option<LinkMark<'a>> = carry.take().map(|url| LinkMark {
+        url,
+        x0: x,
+        at: items.len(),
+    });
 
     for t in atoms {
         match *t {
+            Atom::Ls(url) => {
+                if has {
+                    items.push(DrawItem::Text {
+                        x: bx,
+                        y: baseline,
+                        font: bs.font,
+                        size: bs.size,
+                        text: take_run(&mut buf, span_ok, span_src, span_a, span_b),
+                    });
+                    has = false;
+                    span_ok = false;
+                }
+                if let Some(mark) = open.take() {
+                    close_link(items, m, mark, x, baseline);
+                }
+                open = Some(LinkMark {
+                    url,
+                    x0: x,
+                    at: items.len(),
+                });
+                sep = Sep::Brk;
+            }
+            Atom::Le => {
+                if has {
+                    items.push(DrawItem::Text {
+                        x: bx,
+                        y: baseline,
+                        font: bs.font,
+                        size: bs.size,
+                        text: take_run(&mut buf, span_ok, span_src, span_a, span_b),
+                    });
+                    has = false;
+                    span_ok = false;
+                }
+                if let Some(mark) = open.take() {
+                    close_link(items, m, mark, x, baseline);
+                }
+                sep = Sep::Brk;
+            }
+            Atom::F(i) => {
+                let fr = &frames[i as usize];
+                if has {
+                    items.push(DrawItem::Text {
+                        x: bx,
+                        y: baseline,
+                        font: bs.font,
+                        size: bs.size,
+                        text: take_run(&mut buf, span_ok, span_src, span_a, span_b),
+                    });
+                    has = false;
+                    span_ok = false;
+                }
+                let top = baseline - fr.prep.above;
+                paint_prepared(items, m, styles, &fr.prep, x, top, fr.fill, fr.stroke);
+                x += fr.prep.outer_w;
+                sep = Sep::Brk;
+                depth = depth.max(fr.prep.below);
+            }
             Atom::W(src, a, b, st, wid) => {
                 let a = a as usize;
                 let b = b as usize;
@@ -872,6 +1500,12 @@ fn emit_atoms(items: &mut Vec<DrawItem>, atoms: &[Atom], mut x: f64, baseline: f
             text: take_run(&mut buf, span_ok, span_src, span_a, span_b),
         });
     }
+    if let Some(mark) = open.take() {
+        let url = mark.url;
+        close_link(items, m, mark, x, baseline);
+        *carry = Some(url);
+    }
+    depth
 }
 
 fn take_run(
@@ -891,14 +1525,17 @@ fn take_run(
 /// Emit merged draw runs for one line of tokens starting at x on `baseline`.
 /// Adjacent same-style words merge into a single `DrawItem::Text`; `extra`
 /// is per-space justification stretch (0 for ragged-right).
-fn emit_line(
+fn emit_line<'a, M: FontMetrics>(
     items: &mut Vec<DrawItem>,
-    toks: &[Tok],
+    m: &M,
+    styles: &Styles,
+    toks: &[Tok<'a>],
     l: Line,
     mut x: f64,
     baseline: f64,
     extra: f64,
     size: f64,
+    carry: &mut Option<&'a str>,
 ) {
     let mut sep = Sep::Brk;
     let mut buf = InlineStr::new();
@@ -908,8 +1545,50 @@ fn emit_line(
         size,
     };
     let mut has = false;
+    let mut open: Option<LinkMark<'a>> = carry.take().map(|url| LinkMark {
+        url,
+        x0: x,
+        at: items.len(),
+    });
     for t in &toks[l.start..l.end] {
         match *t {
+            Tok::Ls(url) => {
+                if has {
+                    items.push(DrawItem::Text {
+                        x: bx,
+                        y: baseline,
+                        font: bs.font,
+                        size: bs.size,
+                        text: std::mem::take(&mut buf),
+                    });
+                    has = false;
+                }
+                if let Some(mark) = open.take() {
+                    close_link(items, m, mark, x, baseline);
+                }
+                open = Some(LinkMark {
+                    url,
+                    x0: x,
+                    at: items.len(),
+                });
+                sep = Sep::Brk;
+            }
+            Tok::Le => {
+                if has {
+                    items.push(DrawItem::Text {
+                        x: bx,
+                        y: baseline,
+                        font: bs.font,
+                        size: bs.size,
+                        text: std::mem::take(&mut buf),
+                    });
+                    has = false;
+                }
+                if let Some(mark) = open.take() {
+                    close_link(items, m, mark, x, baseline);
+                }
+                sep = Sep::Brk;
+            }
             Tok::W(w, st, wid) => {
                 if has && bs == st && sep != Sep::Brk {
                     if sep == Sep::Sp {
@@ -943,6 +1622,25 @@ fn emit_line(
                 sep = Sep::Brk;
             }
             Tok::B => {}
+            Tok::F(inl, outer) => {
+                if has {
+                    items.push(DrawItem::Text {
+                        x: bx,
+                        y: baseline,
+                        font: bs.font,
+                        size: bs.size,
+                        text: std::mem::take(&mut buf),
+                    });
+                    has = false;
+                }
+                if let Inline::Frame(f) = inl {
+                    let prep = prepare_frame(m, styles, &f.content, Some(outer), false, f.inset, outer);
+                    let top = baseline - prep.above;
+                    paint_prepared(items, m, styles, &prep, x, top, f.fill, f.stroke);
+                }
+                x += outer;
+                sep = Sep::Brk;
+            }
         }
     }
     if has {
@@ -953,6 +1651,11 @@ fn emit_line(
             size: bs.size,
             text: buf,
         });
+    }
+    if let Some(mark) = open.take() {
+        let url = mark.url;
+        close_link(items, m, mark, x, baseline);
+        *carry = Some(url);
     }
 }
 
@@ -1089,10 +1792,70 @@ fn tokenize<'a, M: FontMetrics, F: Fn(TextStyle) -> TextStyle>(
                     push_text_slow(toks, text, st, m);
                 }
             }
+            Inline::Ref { name, style } => {
+                let st = xf(*style);
+                if let Some(lut) = m.ascii_units(st.font) {
+                    push_text_lut(toks, name, st, lut, m);
+                } else {
+                    push_text_slow(toks, name, st, m);
+                }
+            }
             Inline::LineBreak => toks.push(Tok::B),
             Inline::HSpace(w) => toks.push(Tok::G(*w)),
+            Inline::Frame(f) => toks.push(Tok::F(i, frame_outer(m, f))),
+            Inline::Link(link) => {
+                toks.push(Tok::Ls(&link.url));
+                tokenize(toks, &link.content, m, xf);
+                toks.push(Tok::Le);
+            }
         }
     }
+}
+
+fn is_link_tok(t: &Tok) -> bool {
+    matches!(t, Tok::Ls(_) | Tok::Le)
+}
+
+/// Markers in `[end, stop)` stay on the line being closed. A space between
+/// the last word and a marker is included with that marker. No marker
+/// leaves `end` unchanged.
+fn absorb_markers(toks: &[Tok], end: usize, stop: usize) -> usize {
+    let mut i = end;
+    let mut last = end;
+    while i < stop {
+        match &toks[i] {
+            Tok::Ls(_) | Tok::Le => {
+                i += 1;
+                last = i;
+            }
+            Tok::S(_) | Tok::G(_) => i += 1,
+            _ => break,
+        }
+    }
+    last
+}
+
+/// On a wrap, markers glued to the previous word stay behind. Markers
+/// after the pending space start the next line. No markers returns
+/// `(end, at)`, the split the breaker used before links existed.
+fn split_markers(toks: &[Tok], end: usize, at: usize) -> (usize, usize) {
+    if end >= at || !toks[end..at].iter().any(is_link_tok) {
+        return (end, at);
+    }
+    let mut line_end = end;
+    while line_end < at && is_link_tok(&toks[line_end]) {
+        line_end += 1;
+    }
+    let mut next = line_end;
+    while next < at && matches!(toks[next], Tok::S(_) | Tok::G(_)) {
+        next += 1;
+    }
+    let restart = if next < at && is_link_tok(&toks[next]) {
+        next
+    } else {
+        at
+    };
+    (line_end, restart)
 }
 
 /// Greedy line breaking at space tokens; `LineBreak` forces a break.
@@ -1106,16 +1869,17 @@ fn break_lines(toks: &[Tok], width: f64, lines: &mut Vec<Line>) {
     let mut i = 0;
     while i < toks.len() {
         match toks[i] {
-            Tok::W(_, _, ww) => {
+            Tok::W(_, _, ww) | Tok::F(_, ww) => {
                 if end > start && w + pend_w + ww > width {
+                    let (line_end, restart) = split_markers(toks, end, i);
                     lines.push(Line {
                         start,
-                        end,
+                        end: line_end,
                         w,
                         spaces: sp,
                         hard: false,
                     });
-                    start = i;
+                    start = restart;
                     end = i + 1;
                     w = ww;
                     sp = 0;
@@ -1138,9 +1902,14 @@ fn break_lines(toks: &[Tok], width: f64, lines: &mut Vec<Line>) {
             }
             Tok::G(gw) => {
                 if end > start && w + pend_w + gw > width {
+                    let line_end = if end < i && toks[end..i].iter().any(is_link_tok) {
+                        absorb_markers(toks, end, i)
+                    } else {
+                        end
+                    };
                     lines.push(Line {
                         start,
-                        end,
+                        end: line_end,
                         w,
                         spaces: sp,
                         hard: false,
@@ -1162,10 +1931,16 @@ fn break_lines(toks: &[Tok], width: f64, lines: &mut Vec<Line>) {
                 pend_w = 0.0;
                 pend_n = 0;
             }
+            Tok::Ls(_) | Tok::Le => i += 1,
             Tok::B => {
+                let line_end = if end < i && toks[end..i].iter().any(is_link_tok) {
+                    absorb_markers(toks, end, i)
+                } else {
+                    end
+                };
                 lines.push(Line {
                     start,
-                    end,
+                    end: line_end,
                     w,
                     spaces: sp,
                     hard: true,
@@ -1181,6 +1956,11 @@ fn break_lines(toks: &[Tok], width: f64, lines: &mut Vec<Line>) {
         }
     }
     if end > start {
+        let end = if end < toks.len() && toks[end..].iter().any(is_link_tok) {
+            absorb_markers(toks, end, toks.len())
+        } else {
+            end
+        };
         lines.push(Line {
             start,
             end,
@@ -1188,6 +1968,212 @@ fn break_lines(toks: &[Tok], width: f64, lines: &mut Vec<Line>) {
             spaces: sp,
             hard: false,
         });
+    }
+}
+
+
+fn explicit_child_width(b: &Block) -> Option<f64> {
+    match b {
+        Block::Framed(f) => f.width.map(|w| w.max(0.0)),
+        Block::Paragraph { content, .. } if content.len() == 1 => match &content[0] {
+            Inline::Frame(f) => f.width.map(|w| w.max(0.0)),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn frame_outer<M: FontMetrics>(m: &M, f: &Frame) -> f64 {
+    match f.width {
+        Some(w) => w.max(0.0),
+        None => natural_inner(m, &f.content) + 2.0 * f.inset.max(0.0),
+    }
+}
+
+fn natural_inner<M: FontMetrics>(m: &M, content: &[Inline]) -> f64 {
+    let mut toks = Vec::new();
+    tokenize(&mut toks, content, m, &ident);
+    let mut best = 0.0f64;
+    let mut line = 0.0f64;
+    for t in &toks {
+        match t {
+            Tok::W(_, _, w) | Tok::F(_, w) => line += *w,
+            Tok::S(w) | Tok::G(w) => line += *w,
+            Tok::Ls(_) | Tok::Le => {}
+            Tok::B => {
+                best = best.max(line);
+                line = 0.0;
+            }
+        }
+    }
+    best.max(line)
+}
+
+fn line_box<M: FontMetrics>(m: &M, st: &Styles, toks: &[Tok], l: &Line) -> (f64, f64, f64) {
+    let mut size = 0.0f64;
+    let mut asc = 0.0f64;
+    let mut desc = 0.0f64;
+    for t in &toks[l.start..l.end] {
+        match t {
+            Tok::W(_, style, _) => {
+                size = size.max(style.size);
+                asc = asc.max(m.ascent(style.font) * style.size / 1000.0);
+                desc = desc.max(m.descent(style.font) * style.size / 1000.0);
+            }
+            Tok::F(inl, _) => {
+                if let Inline::Frame(f) = *inl {
+                    let prep = prepare_frame(m, st, &f.content, f.width, false, f.inset, 1.0e9);
+                    size = size.max(prep.font_size);
+                    asc = asc.max(prep.above);
+                    desc = desc.max(prep.below);
+                }
+            }
+            _ => {}
+        }
+    }
+    if size == 0.0 {
+        size = st.font_size;
+        asc = m.ascent(FontId::Regular) * size / 1000.0;
+        desc = m.descent(FontId::Regular) * size / 1000.0;
+    }
+    (size, asc, desc)
+}
+
+fn prepare_frame<'a, M: FontMetrics>(
+    m: &M,
+    st: &Styles,
+    content: &'a [Inline],
+    width: Option<f64>,
+    expand: bool,
+    inset: f64,
+    avail: f64,
+) -> Prepared<'a> {
+    let inset = inset.max(0.0);
+    let mut toks = Vec::new();
+    tokenize(&mut toks, content, m, &ident);
+    let outer = if let Some(w) = width {
+        w.max(0.0)
+    } else if expand {
+        avail.max(0.0)
+    } else {
+        let mut wide = Vec::new();
+        break_lines(&toks, 1.0e9, &mut wide);
+        let max_w = wide.iter().map(|l| l.w).fold(0.0, f64::max);
+        (max_w + 2.0 * inset).min(avail.max(0.0)).max(0.0)
+    };
+    let inner = (outer - 2.0 * inset).max(0.0);
+    let mut lines = Vec::new();
+    break_lines(&toks, inner, &mut lines);
+    let (above, below, font_size) = if lines.is_empty() {
+        (inset, inset, st.font_size)
+    } else {
+        let (sz0, asc0, desc0) = line_box(m, st, &toks, &lines[0]);
+        let mut font_size = sz0;
+        let mut rest = 0.0;
+        let mut last_desc = desc0;
+        for l in lines.iter().skip(1) {
+            let (sz, _, desc) = line_box(m, st, &toks, l);
+            font_size = font_size.max(sz);
+            let step = if st.font_size > 0.0 {
+                sz * st.line_height / st.font_size
+            } else {
+                sz * 1.3082
+            };
+            rest += step;
+            last_desc = desc;
+        }
+        (inset + asc0, inset + rest + last_desc, font_size)
+    };
+    Prepared {
+        toks,
+        lines,
+        outer_w: outer,
+        inset,
+        above,
+        below,
+        height: above + below,
+        font_size,
+    }
+}
+
+fn paint_prepared<M: FontMetrics>(
+    items: &mut Vec<DrawItem>,
+    m: &M,
+    st: &Styles,
+    prep: &Prepared,
+    x: f64,
+    top: f64,
+    fill: Option<f64>,
+    stroke: Option<f64>,
+) {
+    if let Some(gray) = fill {
+        items.push(DrawItem::Rule {
+            x,
+            y: top,
+            w: prep.outer_w,
+            h: prep.height,
+            gray,
+        });
+    }
+    let mut base = top + prep.above;
+    let mut carry = None;
+    for (i, l) in prep.lines.iter().enumerate() {
+        emit_line(
+            items,
+            m,
+            st,
+            &prep.toks,
+            *l,
+            x + prep.inset,
+            base,
+            0.0,
+            prep.font_size,
+            &mut carry,
+        );
+        if i + 1 < prep.lines.len() {
+            let (sz, _, _) = line_box(m, st, &prep.toks, &prep.lines[i + 1]);
+            let step = if st.font_size > 0.0 {
+                sz * st.line_height / st.font_size
+            } else {
+                sz * 1.3082
+            };
+            base += step;
+        }
+    }
+    if let Some(sw0) = stroke {
+        let t = sw0.max(0.0).min(prep.outer_w).min(prep.height);
+        if t > 0.0 {
+            let yb = top + prep.height - t;
+            let xr = x + prep.outer_w - t;
+            items.push(DrawItem::Rule {
+                x,
+                y: top,
+                w: prep.outer_w,
+                h: t,
+                gray: 0.0,
+            });
+            items.push(DrawItem::Rule {
+                x,
+                y: yb,
+                w: prep.outer_w,
+                h: t,
+                gray: 0.0,
+            });
+            items.push(DrawItem::Rule {
+                x,
+                y: top,
+                w: t,
+                h: prep.height,
+                gray: 0.0,
+            });
+            items.push(DrawItem::Rule {
+                x: xr,
+                y: top,
+                w: t,
+                h: prep.height,
+                gray: 0.0,
+            });
+        }
     }
 }
 
@@ -1208,6 +2194,7 @@ mod tests {
             blocks,
             diags: vec![],
             fonts: vec![],
+            images: vec![],
         }
     }
 
@@ -1249,6 +2236,20 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    fn lit(text: &str, font: FontId) -> Inline {
+        Inline::Text {
+            text: text.into(),
+            style: TextStyle { font, size: 11.0 },
+        }
+    }
+
+    fn flat(text: &str) -> ListItem {
+        ListItem {
+            content: vec![lit(text, FontId::Regular)],
+            rest: Vec::new(),
+        }
     }
 
     fn cell(t: &str) -> Vec<Inline> {
@@ -1316,22 +2317,7 @@ mod tests {
             },
             Block::List {
                 ordered: true,
-                items: vec![
-                    vec![Inline::Text {
-                        text: "first".into(),
-                        style: TextStyle {
-                            font: FontId::Regular,
-                            size: 11.0,
-                        },
-                    }],
-                    vec![Inline::Text {
-                        text: "second".into(),
-                        style: TextStyle {
-                            font: FontId::Regular,
-                            size: 11.0,
-                        },
-                    }],
-                ],
+                items: vec![flat("first"), flat("second")],
             },
         ]);
         let pages = layout(&doc, &Fake);
@@ -1352,6 +2338,97 @@ mod tests {
         let m2 = items.iter().find(|i| i.2 == "2.").unwrap();
         // item 2 baseline = item1 baseline + lh
         assert!((m2.1 - m1.1 - 14.39).abs() < 1e-6);
+    }
+
+    #[test]
+    fn layout_nested_and_mixed_lists() {
+        let doc = tdoc(vec![Block::List {
+            ordered: false,
+            items: vec![ListItem {
+                content: vec![lit("parent", FontId::Regular)],
+                rest: vec![ListRest::List(Box::new(ListBody {
+                    ordered: false,
+                    items: vec![flat("child")],
+                }))],
+            }],
+        }]);
+        let pages = layout(&doc, &Fake);
+        let items = texts(&pages[0]);
+        let parent_m = items.iter().find(|i| i.2 == "\u{2022}").unwrap();
+        let parent_t = items.iter().find(|i| i.2 == "parent").unwrap();
+        assert!((parent_m.0 - 70.866).abs() < 1e-6);
+        // bullet 5.5pt + 0.5em 5.5pt
+        assert!((parent_t.0 - 70.866 - 11.0).abs() < 1e-6);
+        assert_eq!(parent_m.1, parent_t.1);
+        let child_m = items.iter().filter(|i| i.2 == "\u{2022}").nth(1).unwrap();
+        let child_t = items.iter().find(|i| i.2 == "child").unwrap();
+        assert!((child_m.0 - parent_t.0).abs() < 1e-6);
+        assert!((child_t.0 - child_m.0 - 11.0).abs() < 1e-6);
+        assert!((child_m.1 - parent_m.1 - 14.39).abs() < 1e-6);
+
+        // mixed: nested enum under a bullet. "1." is 11pt + 0.5em.
+        let doc = tdoc(vec![Block::List {
+            ordered: false,
+            items: vec![ListItem {
+                content: vec![lit("a", FontId::Regular)],
+                rest: vec![ListRest::List(Box::new(ListBody {
+                    ordered: true,
+                    items: vec![flat("b")],
+                }))],
+            }],
+        }]);
+        let pages = layout(&doc, &Fake);
+        let items = texts(&pages[0]);
+        let bullet = items.iter().find(|i| i.2 == "\u{2022}").unwrap();
+        let num = items.iter().find(|i| i.2 == "1.").unwrap();
+        let b = items.iter().find(|i| i.2 == "b").unwrap();
+        assert!((num.0 - bullet.0 - 11.0).abs() < 1e-6);
+        assert!((b.0 - num.0 - 16.5).abs() < 1e-6);
+        assert_eq!(num.1, b.1);
+    }
+
+    #[test]
+    fn layout_term_list() {
+        let term = vec![lit("Term", FontId::Bold)];
+        let desc = vec![lit(
+            &vec!["aaaa"; 20].join(" "),
+            FontId::Regular,
+        )];
+        // emphasis in the description stays italic and shares the line
+        let emph = vec![
+            lit("a ", FontId::Regular),
+            lit("b", FontId::Italic),
+        ];
+        let doc = tdoc(vec![
+            Block::Terms {
+                items: vec![TermItem {
+                    term: term.clone(),
+                    desc: emph,
+                }],
+            },
+            Block::Terms {
+                items: vec![TermItem { term, desc }],
+            },
+        ]);
+        let pages = layout(&doc, &Fake);
+        let items = texts(&pages[0]);
+        let term_i = items.iter().find(|i| i.2 == "Term").unwrap();
+        assert_eq!(term_i.3, FontId::Bold);
+        assert!((term_i.0 - 70.866).abs() < 1e-6);
+        // "Term" = 22pt, gap 0.5em = 5.5, description at +27.5
+        let a = items.iter().find(|i| i.2 == "a").unwrap();
+        assert!((a.0 - 70.866 - 27.5).abs() < 1e-3);
+        assert_eq!(a.1, term_i.1);
+        let b = items.iter().find(|i| i.2 == "b").unwrap();
+        assert_eq!(b.3, FontId::Italic);
+        assert_eq!(b.1, a.1);
+        assert!((b.0 - a.0 - 11.0).abs() < 1e-3); // "a" + space
+        // wrapped description hangs at the same x as the first desc line
+        let lines: Vec<_> = items.iter().filter(|i| i.2.contains("aaaa")).collect();
+        assert!(lines.len() >= 2, "{lines:?}");
+        assert!((lines[0].0 - 70.866 - 27.5).abs() < 1e-3);
+        assert!((lines[1].0 - lines[0].0).abs() < 1e-6);
+        assert!((lines[1].1 - lines[0].1 - 14.39).abs() < 1e-6);
     }
 
     #[test]
@@ -1545,4 +2622,187 @@ mod tests {
             .iter()
             .any(|r| (r.1 - bottom).abs() < 1e-3 && (r.2 - 300.0).abs() < 1e-6));
     }
+
+    #[test]
+    fn layout_image_advances_past_the_box() {
+        let doc = tdoc(vec![
+            para(1),
+            Block::Image {
+                index: 0,
+                w: 120.0,
+                h: 40.0,
+            },
+            para(1),
+        ]);
+        let pages = layout(&doc, &Fake);
+        assert_eq!(pages.len(), 1);
+        let img = pages[0]
+            .items
+            .iter()
+            .find_map(|i| match i {
+                DrawItem::Image { x, y, w, h, index } => Some((*x, *y, *w, *h, *index)),
+                _ => None,
+            })
+            .unwrap();
+        assert!((img.0 - 70.866).abs() < 1e-6);
+        assert_eq!((img.2, img.3, img.4), (120.0, 40.0, 0));
+        let texts: Vec<f64> = pages[0]
+            .items
+            .iter()
+            .filter_map(|i| match i {
+                DrawItem::Text { y, .. } => Some(*y),
+                _ => None,
+            })
+            .collect();
+        assert!(texts[0] < img.1);
+        assert!(texts[1] >= img.1 + img.3);
+        let doc = tdoc(vec![
+            para(1),
+            Block::Image {
+                index: 0,
+                w: 10.0,
+                h: 800.0,
+            },
+        ]);
+        let pages = layout(&doc, &Fake);
+        assert_eq!(pages.len(), 2);
+        match &pages[1].items[0] {
+            DrawItem::Image { y, h, .. } => {
+                assert!((*y - 70.866).abs() < 1e-6);
+                assert_eq!(*h, 800.0);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    fn lay_src(src: &str) -> Vec<Page> {
+        let (nodes, _) = crate::syntax::parse(src);
+        let mut d = Vec::new();
+        let doc = crate::eval::eval_plain(nodes, &mut d, std::path::Path::new("."));
+        layout(&doc, &Fake)
+    }
+
+    fn text_items(page: &Page) -> Vec<(f64, f64, String)> {
+        page.items
+            .iter()
+            .filter_map(|i| match i {
+                DrawItem::Text { x, y, text, .. } => Some((*x, *y, text.to_string())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn frame_rules(page: &Page) -> Vec<(f64, f64, f64, f64, f64)> {
+        page.items
+            .iter()
+            .filter_map(|i| match i {
+                DrawItem::Rule { x, y, w, h, gray } => Some((*x, *y, *w, *h, *gray)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn block_inset_fill_paints_rule_and_text() {
+        let pages = lay_src("#block(inset: 4pt, fill: 0.8)[Hello]");
+        assert_eq!(pages.len(), 1);
+        let rs = frame_rules(&pages[0]);
+        assert!(
+            rs.iter()
+                .any(|r| (r.4 - 0.8).abs() < 1e-9 && (r.0 - 70.866).abs() < 1e-3),
+            "{rs:?}"
+        );
+        let rule = rs.iter().find(|r| (r.4 - 0.8).abs() < 1e-9).unwrap();
+        assert!((rule.1 - 70.866).abs() < 1e-3);
+        assert!((rule.2 - 453.544).abs() < 1e-2);
+        let texts = text_items(&pages[0]);
+        assert!(texts.iter().any(|t| t.2 == "Hello"), "{texts:?}");
+        let hello = texts.iter().find(|t| t.2 == "Hello").unwrap();
+        assert!((hello.0 - (rule.0 + 4.0)).abs() < 1e-6);
+        let asc = 718.0 * 11.0 / 1000.0;
+        assert!((hello.1 - (rule.1 + 4.0 + asc)).abs() < 1e-3);
+        let rule_at = pages[0]
+            .items
+            .iter()
+            .position(|i| matches!(i, DrawItem::Rule { gray, .. } if (*gray - 0.8).abs() < 1e-9))
+            .unwrap();
+        let text_at = pages[0]
+            .items
+            .iter()
+            .position(|i| matches!(i, DrawItem::Text { text, .. } if text.as_str() == "Hello"))
+            .unwrap();
+        assert!(rule_at < text_at);
+    }
+
+    #[test]
+    fn stack_ttb_inserts_spacing() {
+        let pages = lay_src("#stack(spacing: 20pt)[aaaa][bbbb]");
+        let texts = text_items(&pages[0]);
+        let a = texts.iter().find(|t| t.2.contains("aaaa")).unwrap();
+        let b = texts.iter().find(|t| t.2.contains("bbbb")).unwrap();
+        assert!((b.1 - a.1 - (14.39 + 20.0)).abs() < 1e-3, "{a:?} {b:?}");
+        let tight = lay_src("#stack(spacing: 0pt)[aaaa][bbbb]");
+        let texts = text_items(&tight[0]);
+        let a = texts.iter().find(|t| t.2.contains("aaaa")).unwrap();
+        let b = texts.iter().find(|t| t.2.contains("bbbb")).unwrap();
+        assert!((b.1 - a.1 - 14.39).abs() < 1e-3, "{a:?} {b:?}");
+    }
+
+    #[test]
+    fn stack_ltr_places_a_row() {
+        let pages = lay_src("#stack(dir: ltr, spacing: 10pt)[aaaa][bbbb]");
+        let texts = text_items(&pages[0]);
+        let a = texts.iter().find(|t| t.2.contains("aaaa")).unwrap();
+        let b = texts.iter().find(|t| t.2.contains("bbbb")).unwrap();
+        assert!((a.1 - b.1).abs() < 1e-6, "{a:?} {b:?}");
+        let avail = 595.276 - 2.0 * 70.866;
+        assert!((b.0 - (70.866 + avail / 2.0 + 10.0)).abs() < 1e-2, "{b:?}");
+        let fixed = lay_src("#stack(dir: ltr, spacing: 10pt)[#box(width: 40pt)[aaaa]][bbbb]");
+        let texts = text_items(&fixed[0]);
+        let b = texts.iter().find(|t| t.2.contains("bbbb")).unwrap();
+        assert!((b.0 - (70.866 + 40.0 + 10.0)).abs() < 1e-2, "{b:?}");
+    }
+
+    #[test]
+    fn link_layout_emits_annotation() {
+        let style = TextStyle {
+            font: FontId::Regular,
+            size: 11.0,
+        };
+        let doc = tdoc(vec![Block::Paragraph {
+            align: HAlign::Left,
+            content: vec![
+                Inline::Text {
+                    text: "See ".into(),
+                    style,
+                },
+                Inline::Link(Box::new(LinkRun {
+                    url: "https://example.com".into(),
+                    content: vec![Inline::Text {
+                        text: "docs".into(),
+                        style,
+                    }],
+                })),
+            ],
+        }]);
+        let pages = layout(&doc, &Fake);
+        let link = pages[0].items.iter().find_map(|i| match i {
+            DrawItem::Link { x, w, url, .. } => Some((*x, *w, url.as_str().to_string())),
+            _ => None,
+        });
+        let Some((x, w, url)) = link else {
+            panic!("no annotation: {:?}", pages[0].items)
+        };
+        assert_eq!(url, "https://example.com");
+        // Fake metrics: 500 units, 11pt -> 5.5pt per char. "docs" is 22pt.
+        assert!((w - 22.0).abs() < 1e-6, "{w}");
+        assert!((x - (70.866 + 22.0)).abs() < 1e-3, "{x}");
+        assert!(pages[0].items.iter().any(|i| matches!(
+            i,
+            DrawItem::Rule { x: rx, w: rw, h, gray, .. }
+                if (*rx - x).abs() < 1e-6 && (*rw - w).abs() < 1e-6 && *h > 0.0 && *gray == 0.0
+        )));
+        assert!(text_items(&pages[0]).iter().any(|t| t.2 == "docs"));
+    }
+
 }
