@@ -4048,5 +4048,27 @@ mod tests {
         );
     }
 
+    #[test]
+    fn box_unknown_fill_warns() {
+        let (doc, d) = run_src("#box(fill: \"red\")[Hi]", Path::new("."));
+        assert!(
+            d.iter()
+                .any(|x| x.severity == Severity::Warning && x.message.contains("fill")),
+            "{d:?}"
+        );
+        assert!(all_text(&doc).contains("Hi"), "{}", all_text(&doc));
+        let (_, d) = run_src("#box(fill: 2.0)[Hi]", Path::new("."));
+        assert!(
+            d.iter()
+                .any(|x| x.severity == Severity::Warning && x.message.contains("fill")),
+            "{d:?}"
+        );
+        let (_, d) = run_src("#box(fill: none)[Hi]", Path::new("."));
+        assert!(
+            d.iter().all(|x| !x.message.contains("fill")),
+            "{d:?}"
+        );
+    }
+
 
 }

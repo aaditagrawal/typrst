@@ -3313,6 +3313,33 @@ mod tests {
     }
 
     #[test]
+    fn stack_content_blocks_stay_positional() {
+        let (n, d) = parse("#stack(dir: ttb, spacing: 4pt)[a][b][c]");
+        assert!(d.is_empty(), "{d:?}");
+        let Node::Expr(Expr::Func { name, args, content }) = &n[0] else {
+            panic!("{n:?}");
+        };
+        assert_eq!(name, "stack");
+        assert!(content.is_none());
+        let blocks: Vec<_> = args.iter().filter(|a| a.name.is_none()).collect();
+        assert_eq!(blocks.len(), 3);
+        for (b, word) in blocks.iter().zip(["a", "b", "c"]) {
+            match &b.value {
+                Value::Content(ns) => assert_eq!(ns, &vec![Node::Text(word.into())]),
+                other => panic!("{other:?}"),
+            }
+        }
+        let (n, d) = parse("#emph[x][y]");
+        assert!(d.is_empty(), "{d:?}");
+        let Node::Expr(Expr::Func { name, content, .. }) = &n[0] else {
+            panic!("{n:?}");
+        };
+        assert_eq!(name, "emph");
+        assert_eq!(content.as_ref().map(|c| c.len()), Some(1));
+        assert_eq!(n[1], Node::Text("[y]".into()));
+    }
+
+    #[test]
     fn let_functions() {
         let (n, d) = parse("#let f(x) = x * 2");
         assert!(d.is_empty(), "{d:?}");

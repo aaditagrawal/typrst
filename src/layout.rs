@@ -11,6 +11,8 @@ enum Tok<'a> {
     G(f64),
     /// Forced line break.
     B,
+    /// Unbreakable framed run. Width is the outer width in pt.
+    F(&'a Inline, f64),
 }
 
 /// One token of the line being filled. A word records its parent string
@@ -19,6 +21,10 @@ enum Atom<'a> {
     W(&'a str, u32, u32, TextStyle, f64),
     S(f64),
     G(f64),
+    /// Index into `Lx::frames`. A `u32` keeps `Atom` `Copy`, so a line of
+    /// words still matches by copy and a document with no frames never
+    /// touches the frame list.
+    F(u32),
 }
 
 struct St {
@@ -58,6 +64,26 @@ struct Line {
     hard: bool,
 }
 
+/// A frame measured before it is painted. Tokens borrow the document.
+struct Prepared<'a> {
+    toks: Vec<Tok<'a>>,
+    lines: Vec<Line>,
+    outer_w: f64,
+    inset: f64,
+    /// Distance from the frame top to the first baseline.
+    above: f64,
+    /// Distance from the first baseline to the frame bottom.
+    below: f64,
+    height: f64,
+    font_size: f64,
+}
+
+struct Paint<'a> {
+    prep: Prepared<'a>,
+    fill: Option<f64>,
+    stroke: Option<f64>,
+}
+
 #[derive(Clone, Copy, PartialEq)]
 enum Sep {
     Cat, // previous token was a word: concat directly
@@ -91,6 +117,7 @@ pub fn layout<M: FontMetrics>(doc: &Document, metrics: &M) -> Vec<Page> {
         fresh: true,
         cur: Vec::new(),
         held: Vec::new(),
+        frames: Vec::new(),
         term_prefix: None,
     };
     for b in &doc.blocks {
@@ -115,6 +142,9 @@ struct Lx<'a, M: FontMetrics> {
     /// sees whether a line is the last one. Reused across blocks.
     cur: Vec<Atom<'a>>,
     held: Vec<Atom<'a>>,
+    /// Prepared inline frames for this document. Empty, and unread, when
+    /// the source never uses `#box`.
+    frames: Vec<Paint<'a>>,
     /// Term-list label drawn with the first line's marker slot. Paragraphs
     /// and bullet lists leave it `None`; the check lives in that slot.
     term_prefix: Option<&'a [Inline]>,
@@ -157,14 +187,17 @@ impl<'a, M: FontMetrics> Lx<'a, M> {
     }
 
     fn block(&mut self, b: &'a Block) {
-        let ml = self.st.margin_left;
+        self.place(b, self.st.margin_left, self.text_w());
+    }
+
+    fn place(&mut self, b: &'a Block, ml: f64, avail: f64) {
         match b {
             Block::Paragraph { content, align } => {
                 // Paragraphs contribute below-spacing only (6.05pt), matching
                 // typst: heading->para gets no extra gap.
                 self.gap(0.0);
                 let justify = self.st.justify && *align == HAlign::Left;
-                self.flow(content, ml, self.text_w(), *align, justify, None, &ident);
+                self.flow(content, ml, avail, *align, justify, None, &ident);
                 self.after = self.st.par_spacing;
             }
             Block::Heading { level, content } => {
@@ -179,7 +212,7 @@ impl<'a, M: FontMetrics> Lx<'a, M> {
                 self.flow(
                     content,
                     ml,
-                    self.text_w(),
+                    avail,
                     HAlign::Left,
                     false,
                     None,
@@ -194,12 +227,12 @@ impl<'a, M: FontMetrics> Lx<'a, M> {
                 // Small before-gap; collapses to the previous block's
                 // trailing gap when larger.
                 self.gap(1.1);
-                self.lay_list(*ordered, items, ml);
+                self.lay_list(*ordered, items, ml, ml + avail);
                 self.after = self.st.par_spacing;
             }
             Block::Terms { items } => {
                 self.gap(1.1);
-                let tw = self.text_w();
+                let tw = avail;
                 for it in items {
                     self.lay_term(&it.term, &it.desc, ml, tw);
                 }
@@ -251,7 +284,7 @@ impl<'a, M: FontMetrics> Lx<'a, M> {
                 // Empty/absent column specs degrade to a single auto column;
                 // specs beyond `columns.len()` are treated as Auto.
                 let ncols = columns.len().max(1);
-                let total = self.text_w();
+                let total = avail;
                 let mut widths = vec![0.0; ncols];
                 let mut used = 0.0;
                 let mut frsum = 0.0;
@@ -407,15 +440,110 @@ impl<'a, M: FontMetrics> Lx<'a, M> {
                 self.fresh = false;
                 self.after = self.st.par_spacing;
             }
-            Block::Framed(_) | Block::Stack { .. } => {}
+            Block::Framed(f) => self.lay_frame(f, ml, avail),
+            Block::Stack {
+                horizontal,
+                spacing,
+                children,
+            } => {
+                if children.is_empty() {
+                    return;
+                }
+                if *horizontal {
+                    self.lay_row(children, *spacing, ml, avail);
+                } else {
+                    self.gap(0.0);
+                    for (i, c) in children.iter().enumerate() {
+                        if i > 0 {
+                            self.after = 0.0;
+                            self.pending_gap = *spacing;
+                        }
+                        self.place(c, ml, avail);
+                    }
+                }
+            }
         }
+    }
+
+    fn lay_frame(&mut self, f: &'a Frame, x: f64, avail: f64) {
+        self.gap(0.0);
+        let prep = prepare_frame(
+            self.m,
+            self.st,
+            &f.content,
+            f.width,
+            f.expand,
+            f.inset,
+            avail,
+        );
+        let limit = self.st.page_height - self.st.margin_bottom;
+        let mut top = if self.fresh {
+            self.st.margin_top
+        } else {
+            self.y + self.pending_gap
+        };
+        self.pending_gap = 0.0;
+        if !self.items.is_empty() && top + prep.height > limit {
+            self.finish_page();
+            top = self.st.margin_top;
+        }
+        paint_prepared(
+            &mut self.items,
+            self.m,
+            self.st,
+            &prep,
+            x,
+            top,
+            f.fill,
+            f.stroke,
+        );
+        self.y = top + prep.height;
+        self.fresh = false;
+        self.after = self.st.par_spacing;
+    }
+
+    fn lay_row(&mut self, children: &'a [Block], spacing: f64, ml: f64, avail: f64) {
+        let n = children.len();
+        if n == 0 {
+            return;
+        }
+        let slot = avail / n as f64;
+        let saved_y = self.y;
+        let saved_fresh = self.fresh;
+        let saved_gap = self.pending_gap;
+        let saved_after = self.after;
+        let mut max_y = saved_y;
+        let mut placed = false;
+        let mut x = ml;
+        let mut end_after = self.st.par_spacing;
+        for c in children {
+            self.y = saved_y;
+            self.fresh = saved_fresh;
+            self.pending_gap = saved_gap;
+            self.after = saved_after;
+            let w = explicit_child_width(c).unwrap_or(slot);
+            self.place(c, x, w);
+            if !self.fresh {
+                max_y = if placed { max_y.max(self.y) } else { self.y };
+                placed = true;
+            }
+            end_after = self.after;
+            x += w + spacing;
+        }
+        if placed {
+            self.y = max_y;
+            self.fresh = false;
+        } else {
+            self.y = saved_y;
+            self.fresh = saved_fresh;
+        }
+        self.pending_gap = 0.0;
+        self.after = end_after;
     }
 
     /// Bullet/enum list. `marker_x` is where this level's markers sit.
     /// A nested list shifts by one hanging indent (marker width + 0.5em).
-    fn lay_list(&mut self, ordered: bool, items: &'a [ListItem], marker_x: f64) {
-        let ml = self.st.margin_left;
-        let right = ml + self.text_w();
+    fn lay_list(&mut self, ordered: bool, items: &'a [ListItem], marker_x: f64, right: f64) {
         for (i, it) in items.iter().enumerate() {
             let mk = if ordered {
                 format!("{}.", i + 1)
@@ -445,7 +573,7 @@ impl<'a, M: FontMetrics> Lx<'a, M> {
             }
             for part in &it.rest {
                 match part {
-                    ListRest::List(list) => self.lay_list(list.ordered, &list.items, text_x),
+                    ListRest::List(list) => self.lay_list(list.ordered, &list.items, text_x, right),
                     ListRest::Inlines(content) => self.flow(
                         content,
                         text_x,
@@ -517,7 +645,14 @@ impl<'a, M: FontMetrics> Lx<'a, M> {
                     w += self.m.str_width(style.font, style.size, name);
                 }
                 Inline::LineBreak => return None,
-                Inline::Frame(_) => {}
+                Inline::Frame(f) => {
+                    if let Some(fw) = f.width {
+                        w += fw;
+                    } else {
+                        let inner = self.inline_width(&f.content)?;
+                        w += inner + 2.0 * f.inset.max(0.0);
+                    }
+                }
             }
         }
         Some(w)
@@ -526,8 +661,10 @@ impl<'a, M: FontMetrics> Lx<'a, M> {
     fn inline_size(&self, inl: &[Inline]) -> f64 {
         let mut s = self.st.font_size;
         for i in inl {
-            if let Inline::Text { style, .. } | Inline::Ref { style, .. } = i {
-                s = s.max(style.size);
+            match i {
+                Inline::Text { style, .. } | Inline::Ref { style, .. } => s = s.max(style.size),
+                Inline::Frame(f) => s = s.max(self.inline_size(&f.content)),
+                _ => {}
             }
         }
         s
@@ -566,7 +703,13 @@ impl<'a, M: FontMetrics> Lx<'a, M> {
                     x += w;
                 }
                 Inline::LineBreak => {}
-                Inline::Frame(_) => {}
+                Inline::Frame(f) => {
+                    let adv = f.width.unwrap_or_else(|| {
+                        self.inline_width(&f.content).unwrap_or(0.0) + 2.0 * f.inset.max(0.0)
+                    });
+                    self.paint_prefix(&f.content, x + f.inset, baseline);
+                    x += adv;
+                }
             }
         }
     }
@@ -646,7 +789,39 @@ impl<'a, M: FontMetrics> Lx<'a, M> {
                 Inline::HSpace(w) => {
                     self.push_gap(*w, &mut cur, &mut held, &mut st, &mut meta, &g, &mut marker);
                 }
-                Inline::Frame(_) => {}
+                Inline::Frame(f) => {
+                    let prep = prepare_frame(
+                        self.m,
+                        self.st,
+                        &f.content,
+                        f.width,
+                        false,
+                        f.inset,
+                        g.width,
+                    );
+                    let outer = prep.outer_w;
+                    if st.has && st.w + st.pend_w + outer > g.width {
+                        st.pend_w = 0.0;
+                        st.pend_n = 0;
+                        self.park(false, &mut cur, &mut held, &mut st, &mut meta, &g, &mut marker);
+                    }
+                    if st.has && st.pend_n > 0 {
+                        cur.push(Atom::S(st.pend_w));
+                        st.w += st.pend_w;
+                        st.spaces += 1;
+                    }
+                    let idx = self.frames.len() as u32;
+                    self.frames.push(Paint {
+                        prep,
+                        fill: f.fill,
+                        stroke: f.stroke,
+                    });
+                    cur.push(Atom::F(idx));
+                    st.w += outer;
+                    st.has = true;
+                    st.pend_w = 0.0;
+                    st.pend_n = 0;
+                }
             }
         }
         if st.has {
@@ -890,8 +1065,26 @@ impl<'a, M: FontMetrics> Lx<'a, M> {
                 self.paint_prefix(pref, mx, baseline);
             }
         }
-        emit_atoms(&mut self.items, atoms, x, baseline, extra);
+        let below = emit_atoms(
+            &mut self.items,
+            atoms,
+            x,
+            baseline,
+            extra,
+            self.m,
+            self.st,
+            &self.frames,
+        );
         self.y = baseline;
+        if below > 0.0 {
+            let body = self.st.font_size;
+            let body_asc = self.m.ascent(FontId::Regular) * body / 1000.0;
+            let clearance = (self.lh(body) - body_asc).max(0.0);
+            let extra_drop = below - clearance;
+            if extra_drop > 0.0 {
+                self.y += extra_drop;
+            }
+        }
         self.fresh = false;
     }
 
@@ -911,6 +1104,14 @@ impl<'a, M: FontMetrics> Lx<'a, M> {
         }
         if let Some(st) = marker {
             extent(st);
+        }
+        for a in atoms {
+            if let Atom::F(i) = a {
+                let fr = &self.frames[*i as usize];
+                size = size.max(fr.prep.font_size);
+                asc = asc.max(fr.prep.above);
+                desc = desc.max(fr.prep.below);
+            }
         }
         if size == 0.0 {
             size = self.st.font_size;
@@ -973,7 +1174,13 @@ impl<'a, M: FontMetrics> Lx<'a, M> {
                 }
                 Inline::HSpace(g) => w = w.max(*g),
                 Inline::LineBreak => {}
-                Inline::Frame(_) => {}
+                Inline::Frame(f) => {
+                    if let Some(fw) = f.width {
+                        w = w.max(fw);
+                    } else {
+                        w = w.max(self.cell_word_w(&f.content) + 2.0 * f.inset.max(0.0));
+                    }
+                }
             }
         }
         w
@@ -1007,7 +1214,16 @@ fn ws_run(text: &str, i: usize) -> usize {
 
 /// Emit one line of atoms. Same-style words separated by a single source
 /// space become one draw item copied from that parent slice.
-fn emit_atoms(items: &mut Vec<DrawItem>, atoms: &[Atom], mut x: f64, baseline: f64, extra: f64) {
+fn emit_atoms<M: FontMetrics>(
+    items: &mut Vec<DrawItem>,
+    atoms: &[Atom],
+    mut x: f64,
+    baseline: f64,
+    extra: f64,
+    m: &M,
+    styles: &Styles,
+    frames: &[Paint],
+) -> f64 {
     let mut sep = Sep::Brk;
     let mut buf = InlineStr::new();
     let mut bx = 0.0;
@@ -1020,9 +1236,29 @@ fn emit_atoms(items: &mut Vec<DrawItem>, atoms: &[Atom], mut x: f64, baseline: f
     let mut span_a = 0usize;
     let mut span_b = 0usize;
     let mut span_ok = false;
+    let mut depth = 0.0f64;
 
     for t in atoms {
         match *t {
+            Atom::F(i) => {
+                let fr = &frames[i as usize];
+                if has {
+                    items.push(DrawItem::Text {
+                        x: bx,
+                        y: baseline,
+                        font: bs.font,
+                        size: bs.size,
+                        text: take_run(&mut buf, span_ok, span_src, span_a, span_b),
+                    });
+                    has = false;
+                    span_ok = false;
+                }
+                let top = baseline - fr.prep.above;
+                paint_prepared(items, m, styles, &fr.prep, x, top, fr.fill, fr.stroke);
+                x += fr.prep.outer_w;
+                sep = Sep::Brk;
+                depth = depth.max(fr.prep.below);
+            }
             Atom::W(src, a, b, st, wid) => {
                 let a = a as usize;
                 let b = b as usize;
@@ -1083,6 +1319,7 @@ fn emit_atoms(items: &mut Vec<DrawItem>, atoms: &[Atom], mut x: f64, baseline: f
             text: take_run(&mut buf, span_ok, span_src, span_a, span_b),
         });
     }
+    depth
 }
 
 fn take_run(
@@ -1104,8 +1341,8 @@ fn take_run(
 /// is per-space justification stretch (0 for ragged-right).
 fn emit_line<M: FontMetrics>(
     items: &mut Vec<DrawItem>,
-    _m: &M,
-    _styles: &Styles,
+    m: &M,
+    styles: &Styles,
     toks: &[Tok],
     l: Line,
     mut x: f64,
@@ -1156,6 +1393,25 @@ fn emit_line<M: FontMetrics>(
                 sep = Sep::Brk;
             }
             Tok::B => {}
+            Tok::F(inl, outer) => {
+                if has {
+                    items.push(DrawItem::Text {
+                        x: bx,
+                        y: baseline,
+                        font: bs.font,
+                        size: bs.size,
+                        text: std::mem::take(&mut buf),
+                    });
+                    has = false;
+                }
+                if let Inline::Frame(f) = inl {
+                    let prep = prepare_frame(m, styles, &f.content, Some(outer), false, f.inset, outer);
+                    let top = baseline - prep.above;
+                    paint_prepared(items, m, styles, &prep, x, top, f.fill, f.stroke);
+                }
+                x += outer;
+                sep = Sep::Brk;
+            }
         }
     }
     if has {
@@ -1312,7 +1568,7 @@ fn tokenize<'a, M: FontMetrics, F: Fn(TextStyle) -> TextStyle>(
             }
             Inline::LineBreak => toks.push(Tok::B),
             Inline::HSpace(w) => toks.push(Tok::G(*w)),
-            Inline::Frame(_) => {}
+            Inline::Frame(f) => toks.push(Tok::F(i, frame_outer(m, f))),
         }
     }
 }
@@ -1328,7 +1584,7 @@ fn break_lines(toks: &[Tok], width: f64, lines: &mut Vec<Line>) {
     let mut i = 0;
     while i < toks.len() {
         match toks[i] {
-            Tok::W(_, _, ww) => {
+            Tok::W(_, _, ww) | Tok::F(_, ww) => {
                 if end > start && w + pend_w + ww > width {
                     lines.push(Line {
                         start,
@@ -1410,6 +1666,209 @@ fn break_lines(toks: &[Tok], width: f64, lines: &mut Vec<Line>) {
             spaces: sp,
             hard: false,
         });
+    }
+}
+
+
+fn explicit_child_width(b: &Block) -> Option<f64> {
+    match b {
+        Block::Framed(f) => f.width.map(|w| w.max(0.0)),
+        Block::Paragraph { content, .. } if content.len() == 1 => match &content[0] {
+            Inline::Frame(f) => f.width.map(|w| w.max(0.0)),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn frame_outer<M: FontMetrics>(m: &M, f: &Frame) -> f64 {
+    match f.width {
+        Some(w) => w.max(0.0),
+        None => natural_inner(m, &f.content) + 2.0 * f.inset.max(0.0),
+    }
+}
+
+fn natural_inner<M: FontMetrics>(m: &M, content: &[Inline]) -> f64 {
+    let mut toks = Vec::new();
+    tokenize(&mut toks, content, m, &ident);
+    let mut best = 0.0f64;
+    let mut line = 0.0f64;
+    for t in &toks {
+        match t {
+            Tok::W(_, _, w) | Tok::F(_, w) => line += *w,
+            Tok::S(w) | Tok::G(w) => line += *w,
+            Tok::B => {
+                best = best.max(line);
+                line = 0.0;
+            }
+        }
+    }
+    best.max(line)
+}
+
+fn line_box<M: FontMetrics>(m: &M, st: &Styles, toks: &[Tok], l: &Line) -> (f64, f64, f64) {
+    let mut size = 0.0f64;
+    let mut asc = 0.0f64;
+    let mut desc = 0.0f64;
+    for t in &toks[l.start..l.end] {
+        match t {
+            Tok::W(_, style, _) => {
+                size = size.max(style.size);
+                asc = asc.max(m.ascent(style.font) * style.size / 1000.0);
+                desc = desc.max(m.descent(style.font) * style.size / 1000.0);
+            }
+            Tok::F(inl, _) => {
+                if let Inline::Frame(f) = *inl {
+                    let prep = prepare_frame(m, st, &f.content, f.width, false, f.inset, 1.0e9);
+                    size = size.max(prep.font_size);
+                    asc = asc.max(prep.above);
+                    desc = desc.max(prep.below);
+                }
+            }
+            _ => {}
+        }
+    }
+    if size == 0.0 {
+        size = st.font_size;
+        asc = m.ascent(FontId::Regular) * size / 1000.0;
+        desc = m.descent(FontId::Regular) * size / 1000.0;
+    }
+    (size, asc, desc)
+}
+
+fn prepare_frame<'a, M: FontMetrics>(
+    m: &M,
+    st: &Styles,
+    content: &'a [Inline],
+    width: Option<f64>,
+    expand: bool,
+    inset: f64,
+    avail: f64,
+) -> Prepared<'a> {
+    let inset = inset.max(0.0);
+    let mut toks = Vec::new();
+    tokenize(&mut toks, content, m, &ident);
+    let outer = if let Some(w) = width {
+        w.max(0.0)
+    } else if expand {
+        avail.max(0.0)
+    } else {
+        let mut wide = Vec::new();
+        break_lines(&toks, 1.0e9, &mut wide);
+        let max_w = wide.iter().map(|l| l.w).fold(0.0, f64::max);
+        (max_w + 2.0 * inset).min(avail.max(0.0)).max(0.0)
+    };
+    let inner = (outer - 2.0 * inset).max(0.0);
+    let mut lines = Vec::new();
+    break_lines(&toks, inner, &mut lines);
+    let (above, below, font_size) = if lines.is_empty() {
+        (inset, inset, st.font_size)
+    } else {
+        let (sz0, asc0, desc0) = line_box(m, st, &toks, &lines[0]);
+        let mut font_size = sz0;
+        let mut rest = 0.0;
+        let mut last_desc = desc0;
+        for l in lines.iter().skip(1) {
+            let (sz, _, desc) = line_box(m, st, &toks, l);
+            font_size = font_size.max(sz);
+            let step = if st.font_size > 0.0 {
+                sz * st.line_height / st.font_size
+            } else {
+                sz * 1.3082
+            };
+            rest += step;
+            last_desc = desc;
+        }
+        (inset + asc0, inset + rest + last_desc, font_size)
+    };
+    Prepared {
+        toks,
+        lines,
+        outer_w: outer,
+        inset,
+        above,
+        below,
+        height: above + below,
+        font_size,
+    }
+}
+
+fn paint_prepared<M: FontMetrics>(
+    items: &mut Vec<DrawItem>,
+    m: &M,
+    st: &Styles,
+    prep: &Prepared,
+    x: f64,
+    top: f64,
+    fill: Option<f64>,
+    stroke: Option<f64>,
+) {
+    if let Some(gray) = fill {
+        items.push(DrawItem::Rule {
+            x,
+            y: top,
+            w: prep.outer_w,
+            h: prep.height,
+            gray,
+        });
+    }
+    let mut base = top + prep.above;
+    for (i, l) in prep.lines.iter().enumerate() {
+        emit_line(
+            items,
+            m,
+            st,
+            &prep.toks,
+            *l,
+            x + prep.inset,
+            base,
+            0.0,
+            prep.font_size,
+        );
+        if i + 1 < prep.lines.len() {
+            let (sz, _, _) = line_box(m, st, &prep.toks, &prep.lines[i + 1]);
+            let step = if st.font_size > 0.0 {
+                sz * st.line_height / st.font_size
+            } else {
+                sz * 1.3082
+            };
+            base += step;
+        }
+    }
+    if let Some(sw0) = stroke {
+        let t = sw0.max(0.0).min(prep.outer_w).min(prep.height);
+        if t > 0.0 {
+            let yb = top + prep.height - t;
+            let xr = x + prep.outer_w - t;
+            items.push(DrawItem::Rule {
+                x,
+                y: top,
+                w: prep.outer_w,
+                h: t,
+                gray: 0.0,
+            });
+            items.push(DrawItem::Rule {
+                x,
+                y: yb,
+                w: prep.outer_w,
+                h: t,
+                gray: 0.0,
+            });
+            items.push(DrawItem::Rule {
+                x,
+                y: top,
+                w: t,
+                h: prep.height,
+                gray: 0.0,
+            });
+            items.push(DrawItem::Rule {
+                x: xr,
+                y: top,
+                w: t,
+                h: prep.height,
+                gray: 0.0,
+            });
+        }
     }
 }
 
@@ -1910,4 +2369,93 @@ mod tests {
             other => panic!("{other:?}"),
         }
     }
+
+    fn lay_src(src: &str) -> Vec<Page> {
+        let (nodes, _) = crate::syntax::parse(src);
+        let mut d = Vec::new();
+        let doc = crate::eval::eval_plain(nodes, &mut d, std::path::Path::new("."));
+        layout(&doc, &Fake)
+    }
+
+    fn text_items(page: &Page) -> Vec<(f64, f64, String)> {
+        page.items
+            .iter()
+            .filter_map(|i| match i {
+                DrawItem::Text { x, y, text, .. } => Some((*x, *y, text.to_string())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn frame_rules(page: &Page) -> Vec<(f64, f64, f64, f64, f64)> {
+        page.items
+            .iter()
+            .filter_map(|i| match i {
+                DrawItem::Rule { x, y, w, h, gray } => Some((*x, *y, *w, *h, *gray)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn block_inset_fill_paints_rule_and_text() {
+        let pages = lay_src("#block(inset: 4pt, fill: 0.8)[Hello]");
+        assert_eq!(pages.len(), 1);
+        let rs = frame_rules(&pages[0]);
+        assert!(
+            rs.iter()
+                .any(|r| (r.4 - 0.8).abs() < 1e-9 && (r.0 - 70.866).abs() < 1e-3),
+            "{rs:?}"
+        );
+        let rule = rs.iter().find(|r| (r.4 - 0.8).abs() < 1e-9).unwrap();
+        assert!((rule.1 - 70.866).abs() < 1e-3);
+        assert!((rule.2 - 453.544).abs() < 1e-2);
+        let texts = text_items(&pages[0]);
+        assert!(texts.iter().any(|t| t.2 == "Hello"), "{texts:?}");
+        let hello = texts.iter().find(|t| t.2 == "Hello").unwrap();
+        assert!((hello.0 - (rule.0 + 4.0)).abs() < 1e-6);
+        let asc = 718.0 * 11.0 / 1000.0;
+        assert!((hello.1 - (rule.1 + 4.0 + asc)).abs() < 1e-3);
+        let rule_at = pages[0]
+            .items
+            .iter()
+            .position(|i| matches!(i, DrawItem::Rule { gray, .. } if (*gray - 0.8).abs() < 1e-9))
+            .unwrap();
+        let text_at = pages[0]
+            .items
+            .iter()
+            .position(|i| matches!(i, DrawItem::Text { text, .. } if text.as_str() == "Hello"))
+            .unwrap();
+        assert!(rule_at < text_at);
+    }
+
+    #[test]
+    fn stack_ttb_inserts_spacing() {
+        let pages = lay_src("#stack(spacing: 20pt)[aaaa][bbbb]");
+        let texts = text_items(&pages[0]);
+        let a = texts.iter().find(|t| t.2.contains("aaaa")).unwrap();
+        let b = texts.iter().find(|t| t.2.contains("bbbb")).unwrap();
+        assert!((b.1 - a.1 - (14.39 + 20.0)).abs() < 1e-3, "{a:?} {b:?}");
+        let tight = lay_src("#stack(spacing: 0pt)[aaaa][bbbb]");
+        let texts = text_items(&tight[0]);
+        let a = texts.iter().find(|t| t.2.contains("aaaa")).unwrap();
+        let b = texts.iter().find(|t| t.2.contains("bbbb")).unwrap();
+        assert!((b.1 - a.1 - 14.39).abs() < 1e-3, "{a:?} {b:?}");
+    }
+
+    #[test]
+    fn stack_ltr_places_a_row() {
+        let pages = lay_src("#stack(dir: ltr, spacing: 10pt)[aaaa][bbbb]");
+        let texts = text_items(&pages[0]);
+        let a = texts.iter().find(|t| t.2.contains("aaaa")).unwrap();
+        let b = texts.iter().find(|t| t.2.contains("bbbb")).unwrap();
+        assert!((a.1 - b.1).abs() < 1e-6, "{a:?} {b:?}");
+        let avail = 595.276 - 2.0 * 70.866;
+        assert!((b.0 - (70.866 + avail / 2.0 + 10.0)).abs() < 1e-2, "{b:?}");
+        let fixed = lay_src("#stack(dir: ltr, spacing: 10pt)[#box(width: 40pt)[aaaa]][bbbb]");
+        let texts = text_items(&fixed[0]);
+        let b = texts.iter().find(|t| t.2.contains("bbbb")).unwrap();
+        assert!((b.0 - (70.866 + 40.0 + 10.0)).abs() < 1e-2, "{b:?}");
+    }
+
 }
