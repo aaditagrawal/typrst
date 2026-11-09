@@ -6,8 +6,8 @@
 //! `~/.cache/typrst/fontdb-v1.bin` (`XDG_CACHE_HOME`-aware) and reused while
 //! every scanned directory's mtime is unchanged, so a warm `discover()` is
 //! a single file read. `Registry` adapts the db to the evaluator's
-//! `FaceRegistry`; `load_metrics` reads cmap+hmtx for layout and PDF
-//! embedding.
+//! `FaceRegistry`; `load_metrics` reads cmap+hmtx, and a legacy `kern`
+//! format 0 table when the face has one, for layout and PDF embedding.
 use crate::ir::{FaceRegistry, FontId, FontUse};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -753,6 +753,9 @@ pub struct FaceMetrics {
     widths: Vec<u16>,      // hmtx advances, numGlyphs entries
     cmap4: Option<Vec<u8>>,
     cmap12: Option<Vec<u8>>,
+    /// Legacy `kern` format 0: (left glyph, right glyph) -> font units.
+    /// Empty when the table is absent or not a format we read.
+    kern: HashMap<(u16, u16), i16>,
 }
 
 impl FaceMetrics {
@@ -775,18 +778,45 @@ impl FaceMetrics {
 
     /// Advance of `c` in 1/1000 em. Unmapped chars use '?' like the
     /// base-14 tables; a missing '?' falls back to .notdef, then 500.
+    /// A single glyph has no kerning partner; pair adjustments are
+    /// applied in [`str_width`](Self::str_width).
     pub fn char_width(&self, c: char) -> f64 {
+        self.advance(self.glyph_id(c)) as f64 * 1000.0 / self.upm.max(1) as f64
+    }
+
+    /// Width of `s` at `size` pt. hmtx advances, plus a format-0 kern
+    /// value between consecutive glyphs when the face has that pair.
+    pub fn str_width(&self, size: f64, s: &str) -> f64 {
+        let scale = 1000.0 / self.upm.max(1) as f64;
+        let mut sum = 0.0;
+        let mut prev: Option<u16> = None;
+        for c in s.chars() {
+            let g = self.glyph_id(c);
+            sum += self.advance(g) as f64 * scale;
+            if let (Some(left), Some(right)) = (prev, u16::try_from(g).ok()) {
+                if let Some(k) = self.kern.get(&(left, right)) {
+                    sum += *k as f64 * scale;
+                }
+            }
+            prev = u16::try_from(g).ok();
+        }
+        sum * size / 1000.0
+    }
+
+    fn glyph_id(&self, c: char) -> u32 {
         let mut g = self.glyph(c);
         if g == 0 && c != '?' {
             g = self.glyph('?');
         }
-        let w = self
-            .widths
+        g
+    }
+
+    fn advance(&self, g: u32) -> u16 {
+        self.widths
             .get(g as usize)
             .or(self.widths.first())
             .copied()
-            .unwrap_or(500);
-        w as f64 * 1000.0 / self.upm.max(1) as f64
+            .unwrap_or(500)
     }
 
     /// Typographic ascent in 1/1000 em.
@@ -872,7 +902,93 @@ fn cmap12_lookup(t: &[u8], c: u32) -> u32 {
     }
 }
 
-/// Parse cmap (fmt 4 + 12), hmtx, hhea, head, maxp, post for one face.
+/// Legacy OpenType `kern` version 0, format 0.
+///
+/// Coverage bits (OpenType): 8–15 format, 0 horizontal, 1 minimum,
+/// 2 cross-stream, 3 override. Only horizontal format 0 is applied.
+/// An Apple version-1.0 header or any other format yields an empty map,
+/// so widths stay hmtx-only. A single subtable whose `length` is shorter
+/// than its pairs (Open Sans, Calibri) is read to the end of the table.
+fn kern_format0(tab: &[u8]) -> HashMap<(u16, u16), i16> {
+    let mut map = HashMap::new();
+    if u16be(tab, 0) != Some(0) {
+        return map;
+    }
+    let Some(n_tables) = u16be(tab, 2) else {
+        return map;
+    };
+    let only = n_tables == 1;
+    let mut off = 4usize;
+    for _ in 0..n_tables {
+        if off.saturating_add(6) > tab.len() {
+            break;
+        }
+        let (Some(length), Some(coverage)) = (u16be(tab, off + 2), u16be(tab, off + 4)) else {
+            break;
+        };
+        let format = coverage >> 8;
+        let flags = coverage & 0xff;
+        if format == 0 && flags & 0x1 != 0 && flags & 0x6 == 0 {
+            let end = kern_pair_end(tab, off, length as usize, only);
+            read_kern_pairs(tab, off, end, flags & 0x8 != 0, &mut map);
+        }
+        if length < 6 {
+            break;
+        }
+        off = off.saturating_add(length as usize);
+    }
+    map
+}
+
+fn kern_pair_end(tab: &[u8], off: usize, length: usize, only: bool) -> usize {
+    let declared = off.saturating_add(length).min(tab.len());
+    if !only {
+        return declared;
+    }
+    match u16be(tab, off + 6) {
+        Some(n) => off
+            .saturating_add(14 + 6 * n as usize)
+            .min(tab.len())
+            .max(declared),
+        None => declared,
+    }
+}
+
+fn read_kern_pairs(
+    tab: &[u8],
+    off: usize,
+    end: usize,
+    replace: bool,
+    map: &mut HashMap<(u16, u16), i16>,
+) {
+    if off.saturating_add(14) > end {
+        return;
+    }
+    let Some(n) = u16be(tab, off + 6) else {
+        return;
+    };
+    let mut p = off + 14;
+    for _ in 0..n {
+        if p.saturating_add(6) > end {
+            break;
+        }
+        let (Some(left), Some(right), Some(value)) =
+            (u16be(tab, p), u16be(tab, p + 2), i16be(tab, p + 4))
+        else {
+            break;
+        };
+        if replace {
+            map.insert((left, right), value);
+        } else if value != 0 {
+            map.entry((left, right))
+                .and_modify(|slot| *slot = slot.saturating_add(value))
+                .or_insert(value);
+        }
+        p += 6;
+    }
+}
+
+/// Parse cmap (fmt 4 + 12), hmtx, hhea, head, maxp, post, and kern for one face.
 pub fn load_metrics(path: &Path, ttc_index: u32) -> Option<FaceMetrics> {
     let d = fs::read(path).ok()?;
     let base = face_base(&d, ttc_index)?;
@@ -949,6 +1065,9 @@ pub fn load_metrics(path: &Path, ttc_index: u32) -> Option<FaceMetrics> {
         widths,
         cmap4: c4,
         cmap12: c12,
+        kern: table(&d, base, b"kern")
+            .map(kern_format0)
+            .unwrap_or_default(),
     })
 }
 
@@ -1051,6 +1170,29 @@ pub(crate) fn synth_tables(
         (b"OS/2", os2),
         (b"post", post),
     ]
+}
+
+/// OpenType `kern` version 0 with one horizontal format-0 subtable.
+#[cfg(test)]
+pub(crate) fn synth_kern(pairs: &[(u16, u16, i16)]) -> Vec<u8> {
+    let n = pairs.len() as u16;
+    let sub_len = 14 + 6 * pairs.len();
+    let mut t = Vec::new();
+    t.extend(0u16.to_be_bytes());
+    t.extend(1u16.to_be_bytes());
+    t.extend(0u16.to_be_bytes());
+    t.extend((sub_len as u16).to_be_bytes());
+    t.extend(0x0001u16.to_be_bytes()); // format 0, horizontal
+    t.extend(n.to_be_bytes());
+    t.extend(0u16.to_be_bytes());
+    t.extend(0u16.to_be_bytes());
+    t.extend(0u16.to_be_bytes());
+    for (left, right, value) in pairs {
+        t.extend(left.to_be_bytes());
+        t.extend(right.to_be_bytes());
+        t.extend(value.to_be_bytes());
+    }
+    t
 }
 
 /// Assemble sfnt bytes from (tag, data) tables. Checksums are computed;
@@ -1160,7 +1302,60 @@ mod tests {
         assert_eq!(m.char_width('\u{1F600}'), 700.0); // unmappable -> '?'
         assert_eq!(m.ascent(), 800.0);
         assert_eq!(m.descent(), 200.0);
+        // No kern table: the string width is the hmtx sum.
+        assert_eq!(m.str_width(1000.0, "A?"), m.char_width('A') + m.char_width('?'));
         fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn kern_format0_adjusts_pair() {
+        let dir = env::temp_dir().join(format!("typrst-kern-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("kern.ttf");
+        let mut tables = synth_tables("Kern Face", "Regular", "KernFace", 400, false, false);
+        // Glyph 1 is 'A' (advance 600). The pair pulls the two together by 100.
+        tables.push((b"kern", synth_kern(&[(1, 1, -100)])));
+        fs::write(&p, synth_ttf(&tables)).unwrap();
+        let m = load_metrics(&p, 0).unwrap();
+        assert_eq!(m.char_width('A'), 600.0);
+        assert_eq!(m.str_width(10.0, "A"), 6.0);
+        assert_eq!(m.str_width(10.0, "AA"), 11.0);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn installed_serif_kern_narrows_av() {
+        let p = Path::new("/usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf");
+        if !p.exists() {
+            return;
+        }
+        let m = load_metrics(p, 0).unwrap();
+        let pair = m.str_width(1000.0, "AV");
+        let sum = m.char_width('A') + m.char_width('V');
+        assert!(pair < sum, "kern should narrow AV: {pair} vs {sum}");
+    }
+
+    #[test]
+    fn kern_unknown_format_stays_hmtx() {
+        assert!(kern_format0(&[]).is_empty());
+        // Apple version 1.0 header is not the legacy table.
+        assert!(kern_format0(&0x00010000u32.to_be_bytes()).is_empty());
+        // Format 2 (high byte), horizontal bit set: not read.
+        let mut t = Vec::new();
+        t.extend(0u16.to_be_bytes());
+        t.extend(1u16.to_be_bytes());
+        t.extend(0u16.to_be_bytes());
+        t.extend(14u16.to_be_bytes());
+        t.extend(0x0201u16.to_be_bytes());
+        t.extend(0u16.to_be_bytes());
+        t.extend(0u16.to_be_bytes());
+        t.extend(0u16.to_be_bytes());
+        t.extend(0u16.to_be_bytes());
+        assert!(kern_format0(&t).is_empty());
+        // Format 0 but vertical (horizontal bit clear).
+        t[8] = 0;
+        t[9] = 0;
+        assert!(kern_format0(&t).is_empty());
     }
 
     #[test]

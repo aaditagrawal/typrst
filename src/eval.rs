@@ -4371,6 +4371,52 @@ mod tests {
     }
 
     #[test]
+    fn fixture_fonts_stay_empty() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        for name in ["fixtures/small.typ", "fixtures/large.typ"] {
+            let src = std::fs::read_to_string(root.join(name)).unwrap();
+            let (nodes, mut diags) = crate::syntax::parse(&src);
+            let mut fonts = Vec::new();
+            let db_cell = std::cell::OnceCell::new();
+            let mut loaded = HashSet::new();
+            let mut doc = {
+                let mut reg = crate::fontdb::Registry::lazy(&db_cell, &mut fonts);
+                let mut env = EvalEnv {
+                    base_dir: &root.join("fixtures"),
+                    registry: &mut reg,
+                    depth: 0,
+                    loaded: &mut loaded,
+                };
+                eval(nodes, &mut diags, &mut env)
+            };
+            doc.fonts = fonts;
+            diags.extend(doc.diags.iter().cloned());
+            assert!(
+                diags.iter().all(|d| d.severity != Severity::Error),
+                "{name} {diags:?}"
+            );
+            assert!(doc.fonts.is_empty(), "{name}");
+            // No family lookup, so the font database is never opened.
+            assert!(db_cell.get().is_none(), "{name}");
+            let pages = crate::layout::layout(&doc, &crate::font::Afm);
+            let pdf = crate::pdf::write_pdf(&pages, &doc.fonts, &doc.images);
+            assert!(pdf.starts_with(b"%PDF-1.4"), "{name}");
+            assert!(
+                !pdf.windows(b"/FontFile2".len()).any(|w| w == b"/FontFile2"),
+                "{name}"
+            );
+            assert!(
+                !pdf.windows(b"/TrueType".len()).any(|w| w == b"/TrueType"),
+                "{name}"
+            );
+            assert!(
+                !pdf.windows(b"/XObject".len()).any(|w| w == b"/XObject"),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
     fn user_fn_content_body() {
         let (doc, d) = run_src("#let greet(name) = [Hello #name]\n#greet(\"Ada\")", Path::new("."));
         assert!(d.is_empty(), "{d:?}");

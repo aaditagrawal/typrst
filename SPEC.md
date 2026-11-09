@@ -213,6 +213,8 @@ fractions `1fr` (table context only).
   `FontId::Ext` face: layout uses real cmap+hmtx metrics; the PDF writer
   embeds the font as `/TrueType` + `/FontFile2` (TTC faces are extracted
   to standalone sfnts first). CFF/OTTO faces fall back to base-14.
+- Non-base-14 faces use cached hmtx widths and legacy kern pairs when
+  the table exists.
 
 ## Layout model
 
