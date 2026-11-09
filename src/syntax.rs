@@ -1,5 +1,7 @@
 //! Markup parser: source text -> Vec<Node> (see ir.rs / SPEC.md).
-use crate::ir::{Arg, ArithOp, Cmp, CmpOp, Diag, Expr, Length, Node, Rhs, Severity, Span, Value};
+use crate::ir::{
+    Arg, ArithOp, Cmp, CmpOp, Diag, Expr, Length, Node, Rhs, Severity, Span, TermEntry, Value,
+};
 
 /// `#name` calls the parser accepts. Anything else (bound `#let` names
 /// aside) is a `not implemented` diagnostic.
@@ -344,18 +346,11 @@ impl<'a> P<'a> {
                 true
             }
             Some(m @ (b'-' | b'+')) if matches!(self.at(1), Some(b' ') | Some(b'\t')) => {
-                self.list(out, text, m == b'+', in_bracket);
+                self.list(out, text, m == b'+', in_bracket, 0, 1);
                 true
             }
             Some(b'/') if matches!(self.at(1), Some(b' ') | Some(b'\t')) => {
-                let a = self.pos;
-                self.skip_to_eol();
-                self.diag(
-                    Severity::NotImplemented,
-                    a,
-                    "term lists are not implemented",
-                );
-                true
+                self.terms(out, text, in_bracket)
             }
             Some(c) if c.is_ascii_digit() && self.starts_block() => {
                 let a = self.pos;
@@ -422,67 +417,323 @@ impl<'a> P<'a> {
         });
     }
 
-    /// `- ` / `+ ` list. Items end at the next column-0 marker, a blank
-    /// line, a heading, or a fence; indented markers are literal text.
-    fn list(&mut self, out: &mut Vec<Node>, text: &mut String, ordered: bool, in_bracket: bool) {
+    /// `- ` / `+ ` list whose marker sits at `indent` (leading spaces/tabs).
+    /// `depth` is 1 at the outermost list and at most 6. A column-0
+    /// sibling is recognized before any indent is counted.
+    fn list(
+        &mut self,
+        out: &mut Vec<Node>,
+        text: &mut String,
+        ordered: bool,
+        in_bracket: bool,
+        indent: usize,
+        depth: u8,
+    ) {
         let marker = if ordered { b'+' } else { b'-' };
         let mut items = Vec::new();
         loop {
             self.pos += 1;
             self.skip_hspace();
-            let mut nodes: Vec<Node> = Vec::new();
-            let mut t = String::new();
-            loop {
-                self.inline(&mut nodes, &mut t, in_bracket, None);
-                let gs = self.pos;
-                let mut nls = 0;
-                let mut stop = false;
-                loop {
-                    match self.peek() {
-                        Some(b'\n') => {
-                            self.pos += 1;
-                            nls += 1;
-                            if self.peek() == Some(marker)
-                                && matches!(self.at(1), Some(b' ') | Some(b'\t'))
-                            {
-                                stop = true; // next item, keep pos at marker
-                                break;
-                            }
-                            if self.block_at(self.pos) {
-                                stop = true;
-                                break;
-                            }
-                        }
-                        Some(b' ') | Some(b'\t') | Some(b'\r') => self.pos += 1,
-                        Some(b'/') if self.at(1) == Some(b'/') => self.line_comment(),
-                        Some(b'/') if self.at(1) == Some(b'*') => self.block_comment(),
-                        _ => break,
-                    }
-                }
-                if stop {
-                    if !(self.peek() == Some(marker)
-                        && matches!(self.at(1), Some(b' ') | Some(b'\t')))
-                    {
-                        self.pos = gs; // let body() recount the boundary
-                    }
-                    break;
-                }
-                if self.eof() || nls >= 2 || (in_bracket && self.peek() == Some(b']')) {
-                    self.pos = gs;
-                    break;
-                }
-                if nls > 0 {
-                    pad(&mut t, &nodes);
-                }
-            }
-            flush(&mut nodes, &mut t);
-            items.push(nodes);
-            if !(self.peek() == Some(marker) && matches!(self.at(1), Some(b' ') | Some(b'\t'))) {
+            items.push(self.list_item(marker, indent, depth, in_bracket));
+            if self.peek() != Some(marker) || !matches!(self.at(1), Some(b' ') | Some(b'\t')) {
                 break;
             }
         }
         flush(out, text);
         out.push(Node::List { ordered, items });
+    }
+
+    /// One item. Ends at a same-indent sibling marker, a blank line, a
+    /// heading, or a fence. A deeper `-`/`+` marker becomes a nested list.
+    fn list_item(
+        &mut self,
+        marker: u8,
+        parent_indent: usize,
+        depth: u8,
+        in_bracket: bool,
+    ) -> Vec<Node> {
+        let mut nodes = Vec::new();
+        let mut t = String::new();
+        loop {
+            self.inline(&mut nodes, &mut t, in_bracket, None);
+            let gs = self.pos;
+            // `row` counts consecutive newlines with only whitespace
+            // between them. A comment breaks the streak so `- a\n// c\n- b`
+            // stays one list, while a real blank line ends it.
+            let mut row = 0usize;
+            let mut line_indent = 0usize;
+            let mut counting = false;
+            let mut blank = false;
+            let mut sibling = false;
+            let mut hard_stop = false;
+            loop {
+                match self.peek() {
+                    Some(b'\n') => {
+                        self.pos += 1;
+                        row += 1;
+                        if row >= 2 {
+                            blank = true;
+                            break;
+                        }
+                        line_indent = 0;
+                        counting = true;
+                        // Flat lists: the next byte is the marker or a
+                        // block start. Don't measure indent on that path.
+                        if parent_indent == 0 {
+                            if self.peek() == Some(marker)
+                                && matches!(self.at(1), Some(b' ') | Some(b'\t'))
+                            {
+                                sibling = true;
+                                break;
+                            }
+                            if self.block_at(self.pos) {
+                                hard_stop = true;
+                                break;
+                            }
+                        }
+                    }
+                    Some(b' ') | Some(b'\t') if counting => {
+                        self.pos += 1;
+                        line_indent += 1;
+                    }
+                    Some(b'\r') => self.pos += 1,
+                    Some(b'/') if self.at(1) == Some(b'/') => {
+                        self.line_comment();
+                        counting = false;
+                        row = 0;
+                    }
+                    Some(b'/') if self.at(1) == Some(b'*') => {
+                        self.block_comment();
+                        counting = false;
+                        row = 0;
+                    }
+                    _ => break,
+                }
+            }
+            if blank || self.eof() || (in_bracket && self.peek() == Some(b']')) {
+                self.pos = gs;
+                break;
+            }
+            if sibling {
+                break;
+            }
+            if hard_stop {
+                self.pos = gs;
+                break;
+            }
+            if row == 0 {
+                if self.pos == gs {
+                    break;
+                }
+                continue;
+            }
+            let marker_here = matches!(self.peek(), Some(b'-') | Some(b'+'))
+                && matches!(self.at(1), Some(b' ') | Some(b'\t'));
+            if marker_here && line_indent > parent_indent {
+                if depth >= 6 {
+                    self.diag(Severity::Warning, self.pos, "lists nested too deeply");
+                    pad(&mut t, &nodes);
+                    continue;
+                }
+                flush(&mut nodes, &mut t);
+                let ordered = self.peek() == Some(b'+');
+                self.list(
+                    &mut nodes,
+                    &mut t,
+                    ordered,
+                    in_bracket,
+                    line_indent,
+                    depth + 1,
+                );
+                continue;
+            }
+            if marker_here && line_indent == parent_indent && self.peek() == Some(marker) {
+                break;
+            }
+            if line_indent < parent_indent
+                || (marker_here && line_indent == parent_indent)
+                || (!marker_here && line_indent <= parent_indent && self.block_at(self.pos))
+            {
+                self.pos = gs;
+                break;
+            }
+            // Continuation. A run that follows a nested list is its own
+            // text node; don't glue a leading space onto it.
+            if !(matches!(nodes.last(), Some(Node::List { .. })) && t.is_empty()) {
+                pad(&mut t, &nodes);
+            }
+        }
+        flush(&mut nodes, &mut t);
+        nodes
+    }
+
+    /// `/ term: description` list. Returns false (and rewinds) when the
+    /// first marker has no colon, so the line is ordinary text.
+    fn terms(&mut self, out: &mut Vec<Node>, text: &mut String, in_bracket: bool) -> bool {
+        let mut items: Vec<TermEntry> = Vec::new();
+        loop {
+            if self.peek() != Some(b'/') || !matches!(self.at(1), Some(b' ') | Some(b'\t')) {
+                break;
+            }
+            let mark = self.pos;
+            self.pos += 1;
+            self.skip_hspace();
+            let Some(col) = self.find_term_colon() else {
+                self.diag(Severity::Warning, mark, "term list item missing ':'");
+                self.pos = mark;
+                break;
+            };
+            let term = self.parse_restricted(col, in_bracket);
+            self.pos = col + 1;
+            self.skip_hspace();
+            let desc = self.term_desc(in_bracket);
+            items.push(TermEntry { term, desc });
+            if self.peek() != Some(b'/') || !matches!(self.at(1), Some(b' ') | Some(b'\t')) {
+                break;
+            }
+        }
+        if items.is_empty() {
+            return false;
+        }
+        flush(out, text);
+        out.push(Node::Terms { items });
+        true
+    }
+
+    /// First colon that ends a term: not escaped, not inside `` `raw` ``
+    /// or a `#"..."`. Stops at end of line.
+    fn find_term_colon(&self) -> Option<usize> {
+        let s = self.bytes;
+        let mut i = self.pos;
+        while i < s.len() {
+            match s[i] {
+                b'\n' => return None,
+                b'\\' => {
+                    i += 1;
+                    if i < s.len() && s[i] != b'\n' {
+                        i += 1;
+                    }
+                }
+                b'`' => {
+                    i += 1;
+                    while i < s.len() && s[i] != b'`' && s[i] != b'\n' {
+                        i += 1;
+                    }
+                    if i < s.len() && s[i] == b'`' {
+                        i += 1;
+                    }
+                }
+                b'#' if s.get(i + 1) == Some(&b'"') => {
+                    i += 2;
+                    while i < s.len() && s[i] != b'"' && s[i] != b'\n' {
+                        if s[i] == b'\\' && i + 1 < s.len() {
+                            i += 2;
+                        } else {
+                            i += 1;
+                        }
+                    }
+                    if i < s.len() && s[i] == b'"' {
+                        i += 1;
+                    }
+                }
+                b':' => return Some(i),
+                _ => i += 1,
+            }
+        }
+        None
+    }
+
+    /// Parse inline markup in `self.src[..end]`, then restore the full
+    /// source. Positions stay absolute, so no extra scan of other text.
+    fn parse_restricted(&mut self, end: usize, in_bracket: bool) -> Vec<Node> {
+        let src = self.src;
+        let bytes = self.bytes;
+        self.src = &src[..end];
+        self.bytes = &bytes[..end];
+        let mut nodes = Vec::new();
+        let mut t = String::new();
+        self.inline(&mut nodes, &mut t, in_bracket, None);
+        flush(&mut nodes, &mut t);
+        self.src = src;
+        self.bytes = bytes;
+        nodes
+    }
+
+    /// Description: the rest of this line, plus lines indented further
+    /// than the `/`. An indented `/` stays literal.
+    fn term_desc(&mut self, in_bracket: bool) -> Vec<Node> {
+        let mut nodes = Vec::new();
+        let mut t = String::new();
+        loop {
+            self.inline(&mut nodes, &mut t, in_bracket, None);
+            let gs = self.pos;
+            let mut row = 0usize;
+            let mut line_indent = 0usize;
+            let mut counting = false;
+            let mut stop_rewind = false;
+            let mut stop_sibling = false;
+            loop {
+                match self.peek() {
+                    Some(b'\n') => {
+                        self.pos += 1;
+                        row += 1;
+                        if row >= 2 {
+                            stop_rewind = true;
+                            break;
+                        }
+                        line_indent = 0;
+                        counting = true;
+                        if self.peek() == Some(b'/')
+                            && matches!(self.at(1), Some(b' ') | Some(b'\t'))
+                        {
+                            stop_sibling = true;
+                            break;
+                        }
+                        if self.block_at(self.pos) {
+                            stop_rewind = true;
+                            break;
+                        }
+                    }
+                    Some(b' ') | Some(b'\t') if counting => {
+                        self.pos += 1;
+                        line_indent += 1;
+                    }
+                    Some(b'\r') => self.pos += 1,
+                    Some(b'/') if self.at(1) == Some(b'/') => {
+                        self.line_comment();
+                        counting = false;
+                        row = 0;
+                    }
+                    Some(b'/') if self.at(1) == Some(b'*') => {
+                        self.block_comment();
+                        counting = false;
+                        row = 0;
+                    }
+                    _ => break,
+                }
+            }
+            if stop_rewind || self.eof() || (in_bracket && self.peek() == Some(b']')) {
+                self.pos = gs;
+                break;
+            }
+            if stop_sibling {
+                break;
+            }
+            if row == 0 {
+                if self.pos == gs {
+                    break;
+                }
+                continue;
+            }
+            if line_indent > 0 {
+                pad(&mut t, &nodes);
+                continue;
+            }
+            self.pos = gs;
+            break;
+        }
+        flush(&mut nodes, &mut t);
+        nodes
     }
 
     /// One line of inline content; stops at `\n`, `]` (in bracket), the
@@ -1783,6 +2034,19 @@ mod tests {
         Node::Text(s.into())
     }
 
+    fn list_depth(nodes: &[Node]) -> usize {
+        nodes
+            .iter()
+            .map(|n| match n {
+                Node::List { items, .. } => {
+                    1 + items.iter().map(|it| list_depth(it)).max().unwrap_or(0)
+                }
+                _ => 0,
+            })
+            .max()
+            .unwrap_or(0)
+    }
+
     #[test]
     fn headings() {
         assert_eq!(
@@ -1846,14 +2110,199 @@ mod tests {
                 },
             ]
         );
-        // continuation line and indented marker inside an item
+        // continuation line stays in the item; a non-marker indent is not a list
+        assert_eq!(
+            nodes("- a\n  cont\n- c"),
+            vec![Node::List {
+                ordered: false,
+                items: vec![vec![t("a cont")], vec![t("c")]],
+            }]
+        );
+        // indented marker nests; the following column-0 marker is a sibling
         assert_eq!(
             nodes("- a\n  cont\n  - b\n- c"),
             vec![Node::List {
                 ordered: false,
-                items: vec![vec![t("a cont - b")], vec![t("c")]],
+                items: vec![
+                    vec![
+                        t("a cont"),
+                        Node::List {
+                            ordered: false,
+                            items: vec![vec![t("b")]],
+                        },
+                    ],
+                    vec![t("c")],
+                ],
             }]
         );
+    }
+
+    #[test]
+    fn nested_and_mixed_lists() {
+        assert_eq!(
+            nodes("- a\n  - b\n- c"),
+            vec![Node::List {
+                ordered: false,
+                items: vec![
+                    vec![
+                        t("a"),
+                        Node::List {
+                            ordered: false,
+                            items: vec![vec![t("b")]],
+                        },
+                    ],
+                    vec![t("c")],
+                ],
+            }]
+        );
+        assert_eq!(
+            nodes("- a\n  + b\n  - c\n+ d"),
+            vec![
+                Node::List {
+                    ordered: false,
+                    items: vec![vec![
+                        t("a"),
+                        Node::List {
+                            ordered: true,
+                            items: vec![vec![t("b")]],
+                        },
+                        Node::List {
+                            ordered: false,
+                            items: vec![vec![t("c")]],
+                        },
+                    ]],
+                },
+                Node::List {
+                    ordered: true,
+                    items: vec![vec![t("d")]],
+                },
+            ]
+        );
+        // a tab is enough extra indent
+        assert_eq!(
+            nodes("- a\n\t- b"),
+            vec![Node::List {
+                ordered: false,
+                items: vec![vec![
+                    t("a"),
+                    Node::List {
+                        ordered: false,
+                        items: vec![vec![t("b")]],
+                    },
+                ]],
+            }]
+        );
+        // blank line ends the list
+        assert_eq!(
+            nodes("- a\n\n- b"),
+            vec![
+                Node::List {
+                    ordered: false,
+                    items: vec![vec![t("a")]],
+                },
+                Node::Parbreak,
+                Node::List {
+                    ordered: false,
+                    items: vec![vec![t("b")]],
+                },
+            ]
+        );
+        // a comment between items does not split the list
+        assert_eq!(
+            nodes("- a\n// c\n- b"),
+            vec![Node::List {
+                ordered: false,
+                items: vec![vec![t("a")], vec![t("b")]],
+            }]
+        );
+    }
+
+    #[test]
+    fn list_depth_limit() {
+        let mut src = String::new();
+        for i in 0..6 {
+            for _ in 0..i {
+                src.push(' ');
+            }
+            src.push_str("- x\n");
+        }
+        let (n, d) = parse(&src);
+        assert!(d.is_empty(), "{d:?}");
+        assert_eq!(list_depth(&n), 6);
+
+        src.push_str("      - y\n");
+        let (n, d) = parse(&src);
+        assert!(
+            d.iter()
+                .any(|x| x.severity == Severity::Warning && x.message.contains("nested")),
+            "{d:?}"
+        );
+        assert_eq!(list_depth(&n), 6);
+        fn has_literal(nodes: &[Node]) -> bool {
+            nodes.iter().any(|n| match n {
+                Node::Text(t) => t.contains("- y"),
+                Node::List { items, .. } => items.iter().any(|it| has_literal(it)),
+                _ => false,
+            })
+        }
+        assert!(has_literal(&n));
+    }
+
+    #[test]
+    fn term_lists() {
+        assert_eq!(
+            nodes("/ *A*: a _b_ `c`"),
+            vec![Node::Terms {
+                items: vec![TermEntry {
+                    term: vec![Node::Strong(vec![t("A")])],
+                    desc: vec![
+                        t("a "),
+                        Node::Emph(vec![t("b")]),
+                        t(" "),
+                        Node::Raw {
+                            text: "c".into(),
+                            block: false,
+                        },
+                    ],
+                }],
+            }]
+        );
+        assert_eq!(
+            nodes("/ a: b\n  c _d_\n/ e: f"),
+            vec![Node::Terms {
+                items: vec![
+                    TermEntry {
+                        term: vec![t("a")],
+                        desc: vec![t("b c "), Node::Emph(vec![t("d")])],
+                    },
+                    TermEntry {
+                        term: vec![t("e")],
+                        desc: vec![t("f")],
+                    },
+                ],
+            }]
+        );
+        // colon inside raw does not end the term; an indented `/` is literal
+        assert_eq!(
+            nodes("/ see `a:b`: done\n  / nested: no"),
+            vec![Node::Terms {
+                items: vec![TermEntry {
+                    term: vec![
+                        t("see "),
+                        Node::Raw {
+                            text: "a:b".into(),
+                            block: false,
+                        },
+                    ],
+                    desc: vec![t("done / nested: no")],
+                }],
+            }]
+        );
+        let (n, d) = parse("/ no colon");
+        assert_eq!(n, vec![t("/ no colon")]);
+        assert_eq!(d.len(), 1);
+        assert_eq!(d[0].severity, Severity::Warning);
+        assert!(d[0].message.contains(':'));
     }
 
     #[test]
@@ -2200,7 +2649,6 @@ mod tests {
         for (src, what) in [
             ("#image(\"x.png\")", "#image"),
             ("#figure[..]", "#figure"),
-            ("/ term: desc", "term"),
             ("1. item", "numbered"),
             ("<lbl>", "labels"),
             ("@lbl", "references"),

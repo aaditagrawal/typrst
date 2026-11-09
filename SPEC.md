@@ -19,14 +19,22 @@ parser recovers to the next paragraph boundary. Diagnostics from
   `\[`, `\]`, `\(`, `\)`, `\~`, `\$`, `\"` — backslash followed by any
   other ASCII punctuation emits that punctuation literally; `\` at
   end-of-line (or anywhere inline) is a hard line break (`Node::LineBreak`)
-- Lists: `- item` bullet, `+ item` enumeration. Consecutive items group
-  into one `Node::List`. An item's body runs until the next item marker,
-  a blank line, a heading, or a fence. Nested lists are NOT supported —
-  an indented marker inside an item is literal text.
-- Term lists `/ term: desc`, `$..$` math, `#image`, `#figure`,
-  `#footnote`, `#stack`, `#box`, `#block`, `#show`, `#context`,
-  numbering patterns, labels `<x>`, references `@x`, `#while`,
-  `#let f(x) = ...` function definitions → `not implemented` diagnostics.
+- Lists: `- item` bullet, `+ item` enumeration. Consecutive items at the
+  same indent group into one `Node::List`. An item's body runs until the
+  next sibling marker at the same indent, a blank line, a heading, or a
+  fence. A `-` or `+` marker indented further than its parent marker (at
+  least one extra space or tab) is a nested list, up to 6 levels. A
+  deeper marker is a warning and stays literal text.
+- Term lists: `/ term: description`. Consecutive items group. The term is
+  inline markup up to the first unescaped colon outside raw spans
+  (rendered bold). The description is the rest of the line plus following
+  indented lines, and may contain inline markup. A missing colon is a
+  warning and the line stays literal text. An indented `/` is literal
+  (nested term lists are not supported).
+- `$..$` math, `#image`, `#figure`, `#footnote`, `#stack`, `#box`,
+  `#block`, `#show`, `#context`, numbering patterns, labels `<x>`,
+  references `@x`, `#while`, `#let f(x) = ...` function definitions →
+  `not implemented` diagnostics.
 
 ## Expressions (`#expr`)
 
@@ -118,7 +126,13 @@ fractions `1fr` (table context only).
 - Headings: bold, sizes rel. to base — L1 1.4em, L2 1.2em, L3 1.05em,
   L4+ 1.0em; space before = 0.536em of heading size, after ≈ 0.
 - Lists: bullet `•` / `n.` marker at the margin, 0.5em gap, hanging
-  indent — continuation lines align at text start.
+  indent — continuation lines align at text start. A nested list shifts
+  its marker by one hanging indent (marker width + 0.5em) per level and
+  repeats that hanging indent.
+- Term lists: the term is bold, then a 0.5em gap and the description on
+  the same line when the term fits in the text block. Continuation lines
+  align under the description. A term wider than the block is its own
+  line and the description follows at the margin.
 - Raw inline: Courier, same size. Raw block: Courier at 0.9em, preserving
   internal line breaks, surrounded by block spacing.
 - Tables: cell inset 5pt/4pt, atomic-row pagination, 0.5pt borders when

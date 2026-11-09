@@ -297,17 +297,10 @@ impl<'e, 'a> Ev<'e, 'a> {
             Node::List { ordered, items } => {
                 self.flush(out);
                 let st = self.cur();
-                let mut out_items = Vec::with_capacity(items.len());
-                for it in items {
-                    let mut c = Vec::new();
-                    self.eat_styled(it, st, &mut c);
-                    out_items.push(c);
-                }
-                self.blocks.push(Block::List {
-                    ordered,
-                    items: out_items,
-                });
+                let items = items.into_iter().map(|it| self.eat_item(it, st)).collect();
+                self.blocks.push(Block::List { ordered, items });
             }
+            Node::Terms { items } => self.eat_terms(items, out),
             Node::Raw { text, block: true } => {
                 self.flush(out);
                 self.blocks.push(Block::RawBlock { text });
@@ -343,13 +336,116 @@ impl<'e, 'a> Ev<'e, 'a> {
                 });
                 }
                 Node::Parbreak => out.push(Inline::LineBreak),
-                Node::Heading { .. } | Node::List { .. } => self.diag(
+                Node::Heading { .. } | Node::List { .. } | Node::Terms { .. } => self.diag(
                     Severity::NotImplemented,
                     "block-level construct inside inline content",
                 ),
                 Node::Expr(e) => inline_expr(&e, st, out, self),
             }
         }
+    }
+
+    /// Flat items take the existing inline walk. The `List` check is one
+    /// match per node; `rest` is allocated only when a nested list exists.
+    fn eat_item(&mut self, nodes: Vec<Node>, st: TextStyle) -> ListItem {
+        if !nodes.iter().any(|n| matches!(n, Node::List { .. })) {
+            let mut content = Vec::new();
+            self.eat_styled(nodes, st, &mut content);
+            return ListItem {
+                content,
+                rest: Vec::new(),
+            };
+        }
+        let mut content = Vec::new();
+        let mut rest = Vec::new();
+        let mut buf = Vec::new();
+        let mut seen = false;
+        for n in nodes {
+            if let Node::List { ordered, items } = n {
+                if !seen {
+                    self.eat_styled(std::mem::take(&mut buf), st, &mut content);
+                    seen = true;
+                } else if !buf.is_empty() {
+                    let mut inl = Vec::new();
+                    self.eat_styled(std::mem::take(&mut buf), st, &mut inl);
+                    if !inl.is_empty() {
+                        rest.push(ListRest::Inlines(inl));
+                    }
+                }
+                let items = items.into_iter().map(|it| self.eat_item(it, st)).collect();
+                rest.push(ListRest::List(Box::new(ListBody { ordered, items })));
+            } else {
+                buf.push(n);
+            }
+        }
+        if !seen {
+            self.eat_styled(buf, st, &mut content);
+        } else if !buf.is_empty() {
+            let mut inl = Vec::new();
+            self.eat_styled(buf, st, &mut inl);
+            if !inl.is_empty() {
+                rest.push(ListRest::Inlines(inl));
+            }
+        }
+        ListItem { content, rest }
+    }
+
+    fn eat_terms(&mut self, items: Vec<TermEntry>, out: &mut Vec<Inline>) {
+        self.flush(out);
+        let st = self.cur();
+        let bold = with_font(st, self.vary(st.font, Some(true), None, None));
+        let mut out_items = Vec::with_capacity(items.len());
+        for it in items {
+            let mut term = Vec::new();
+            let mut desc = Vec::new();
+            self.eat_styled(it.term, bold, &mut term);
+            self.eat_styled(it.desc, st, &mut desc);
+            out_items.push(TermItem { term, desc });
+        }
+        self.blocks.push(Block::Terms { items: out_items });
+    }
+
+    fn item_ref(&mut self, nodes: &[Node], st: TextStyle) -> ListItem {
+        if !nodes.iter().any(|n| matches!(n, Node::List { .. })) {
+            let mut content = Vec::new();
+            inlines(nodes, st, &mut content, self);
+            return ListItem {
+                content,
+                rest: Vec::new(),
+            };
+        }
+        let mut content = Vec::new();
+        let mut rest = Vec::new();
+        let mut start = 0;
+        let mut seen = false;
+        for (i, n) in nodes.iter().enumerate() {
+            if let Node::List { ordered, items } = n {
+                if !seen {
+                    inlines(&nodes[start..i], st, &mut content, self);
+                    seen = true;
+                } else if start < i {
+                    let mut inl = Vec::new();
+                    inlines(&nodes[start..i], st, &mut inl, self);
+                    if !inl.is_empty() {
+                        rest.push(ListRest::Inlines(inl));
+                    }
+                }
+                let items = items.iter().map(|it| self.item_ref(it, st)).collect();
+                rest.push(ListRest::List(Box::new(ListBody {
+                    ordered: *ordered,
+                    items,
+                })));
+                start = i + 1;
+            }
+        }
+        if seen && start < nodes.len() {
+            let mut inl = Vec::new();
+            inlines(&nodes[start..], st, &mut inl, self);
+            if !inl.is_empty() {
+                rest.push(ListRest::Inlines(inl));
+            }
+        }
+        ListItem { content, rest }
     }
 
     fn node(&mut self, n: &Node, out: &mut Vec<Inline>) {
@@ -393,18 +489,27 @@ impl<'e, 'a> Ev<'e, 'a> {
             Node::List { ordered, items } => {
                 self.flush(out);
                 let st = self.cur();
-                let items = items
-                    .iter()
-                    .map(|it| {
-                        let mut c = Vec::new();
-                        inlines(it, st, &mut c, self);
-                        c
-                    })
-                    .collect();
+                let items = items.iter().map(|it| self.item_ref(it, st)).collect();
                 self.blocks.push(Block::List {
                     ordered: *ordered,
                     items,
                 });
+            }
+            Node::Terms { items } => {
+                self.flush(out);
+                let st = self.cur();
+                let bold = with_font(st, self.vary(st.font, Some(true), None, None));
+                let items = items
+                    .iter()
+                    .map(|it| {
+                        let mut term = Vec::new();
+                        let mut desc = Vec::new();
+                        inlines(&it.term, bold, &mut term, self);
+                        inlines(&it.desc, st, &mut desc, self);
+                        TermItem { term, desc }
+                    })
+                    .collect();
+                self.blocks.push(Block::Terms { items });
             }
             Node::Raw { text, block: true } => {
                 self.flush(out);
@@ -1397,7 +1502,7 @@ fn inlines(nodes: &[Node], st: TextStyle, out: &mut Vec<Inline>, cx: &mut Ev) {
                 });
             }
             Node::Parbreak => out.push(Inline::LineBreak),
-            Node::Heading { .. } | Node::List { .. } => cx.diag(
+            Node::Heading { .. } | Node::List { .. } | Node::Terms { .. } => cx.diag(
                 Severity::NotImplemented,
                 "block-level construct inside inline content",
             ),
@@ -1584,12 +1689,27 @@ mod tests {
                 }
             }
         }
+        fn walk_item(it: &ListItem, s: &mut String) {
+            walk(&it.content, s);
+            for r in &it.rest {
+                match r {
+                    ListRest::Inlines(v) => walk(v, s),
+                    ListRest::List(b) => b.items.iter().for_each(|i| walk_item(i, s)),
+                }
+            }
+        }
         for b in &doc.blocks {
             match b {
                 Block::Paragraph { content, .. } | Block::Heading { content, .. } => {
                     walk(content, &mut s)
                 }
-                Block::List { items, .. } => items.iter().for_each(|i| walk(i, &mut s)),
+                Block::List { items, .. } => items.iter().for_each(|i| walk_item(i, &mut s)),
+                Block::Terms { items } => {
+                    for it in items {
+                        walk(&it.term, &mut s);
+                        walk(&it.desc, &mut s);
+                    }
+                }
                 Block::Table { cells, .. } => cells.iter().for_each(|c| walk(c, &mut s)),
                 _ => {}
             }
@@ -1677,6 +1797,108 @@ mod tests {
             panic!()
         };
         assert_eq!(style.font, FontId::Mono);
+    }
+
+    fn text_of(inl: &[Inline]) -> String {
+        inl.iter()
+            .filter_map(|i| match i {
+                Inline::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("")
+    }
+
+    #[test]
+    fn eval_lists_and_terms() {
+        let (doc, d) = run_src("- a\n- b", Path::new("."));
+        assert!(d.is_empty(), "{d:?}");
+        let Block::List { ordered, items } = &doc.blocks[0] else {
+            panic!("{:?}", doc.blocks)
+        };
+        assert!(!ordered);
+        assert_eq!(items.len(), 2);
+        assert!(items.iter().all(|it| it.rest.is_empty()));
+        assert_eq!(text_of(&items[0].content), "a");
+        assert_eq!(text_of(&items[1].content), "b");
+
+        let (doc, d) = run_src("- a\n  - b\n+ c", Path::new("."));
+        assert!(d.is_empty(), "{d:?}");
+        let Block::List { items, .. } = &doc.blocks[0] else {
+            panic!("{:?}", doc.blocks)
+        };
+        assert_eq!(text_of(&items[0].content), "a");
+        let ListRest::List(nested) = &items[0].rest[0] else {
+            panic!("{:?}", items[0].rest)
+        };
+        assert!(!nested.ordered);
+        assert!(nested.items[0].rest.is_empty());
+        assert_eq!(text_of(&nested.items[0].content), "b");
+        let Block::List { ordered, items } = &doc.blocks[1] else {
+            panic!("{:?}", doc.blocks)
+        };
+        assert!(ordered);
+        assert!(items[0].rest.is_empty());
+
+        let (doc, d) = run_src("- a\n  + b\n  - c", Path::new("."));
+        assert!(d.is_empty(), "{d:?}");
+        let Block::List { items, .. } = &doc.blocks[0] else {
+            panic!("{:?}", doc.blocks)
+        };
+        assert_eq!(items[0].rest.len(), 2);
+        let ListRest::List(en) = &items[0].rest[0] else {
+            panic!()
+        };
+        assert!(en.ordered);
+        assert_eq!(text_of(&en.items[0].content), "b");
+        let ListRest::List(bu) = &items[0].rest[1] else {
+            panic!()
+        };
+        assert!(!bu.ordered);
+        assert_eq!(text_of(&bu.items[0].content), "c");
+
+        let (doc, d) = run_src("/ *T*: a _b_ c", Path::new("."));
+        assert!(d.is_empty(), "{d:?}");
+        let Block::Terms { items } = &doc.blocks[0] else {
+            panic!("{:?}", doc.blocks)
+        };
+        assert_eq!(items.len(), 1);
+        let Inline::Text { text, style } = &items[0].term[0] else {
+            panic!("{:?}", items[0].term)
+        };
+        assert_eq!(text, "T");
+        assert_eq!(style.font, FontId::Bold);
+        assert_eq!(items[0].desc.len(), 3);
+        let Inline::Text { text, style } = &items[0].desc[0] else {
+            panic!()
+        };
+        assert_eq!(text, "a ");
+        assert_eq!(style.font, FontId::Regular);
+        let Inline::Text { text, style } = &items[0].desc[1] else {
+            panic!()
+        };
+        assert_eq!(text, "b");
+        assert_eq!(style.font, FontId::Italic);
+
+        // `#if` evaluates lists on the borrowing path.
+        let (doc, d) = run_src("#if 1 == 1 [\n- a\n  + b\n]", Path::new("."));
+        assert!(d.is_empty(), "{d:?}");
+        let Block::List { items, .. } = &doc.blocks[0] else {
+            panic!("{:?}", doc.blocks)
+        };
+        assert_eq!(text_of(&items[0].content), "a");
+        let ListRest::List(nested) = &items[0].rest[0] else {
+            panic!("{:?}", items[0].rest)
+        };
+        assert!(nested.ordered);
+        assert_eq!(text_of(&nested.items[0].content), "b");
+
+        let (doc, d) = run_src("/ no colon", Path::new("."));
+        assert!(d.iter().any(|x| x.severity == Severity::Warning && x.message.contains(':')));
+        let Block::Paragraph { content, .. } = &doc.blocks[0] else {
+            panic!("{:?}", doc.blocks)
+        };
+        assert_eq!(text_of(content), "/ no colon");
     }
 
     #[test]

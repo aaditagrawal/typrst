@@ -91,6 +91,7 @@ pub fn layout<M: FontMetrics>(doc: &Document, metrics: &M) -> Vec<Page> {
         fresh: true,
         cur: Vec::new(),
         held: Vec::new(),
+        term_prefix: None,
     };
     for b in &doc.blocks {
         lx.block(b);
@@ -114,6 +115,9 @@ struct Lx<'a, M: FontMetrics> {
     /// sees whether a line is the last one. Reused across blocks.
     cur: Vec<Atom<'a>>,
     held: Vec<Atom<'a>>,
+    /// Term-list label drawn with the first line's marker slot. Paragraphs
+    /// and bullet lists leave it `None`; the check lives in that slot.
+    term_prefix: Option<&'a [Inline]>,
 }
 
 impl<'a, M: FontMetrics> Lx<'a, M> {
@@ -190,28 +194,14 @@ impl<'a, M: FontMetrics> Lx<'a, M> {
                 // Small before-gap; collapses to the previous block's
                 // trailing gap when larger.
                 self.gap(1.1);
-                for (i, it) in items.iter().enumerate() {
-                    let mk = if *ordered {
-                        format!("{}.", i + 1)
-                    } else {
-                        "\u{2022}".to_string()
-                    };
-                    let mst = TextStyle {
-                        font: FontId::Regular,
-                        size: self.st.font_size,
-                    };
-                    // typst hangs the marker at the margin; item text starts
-                    // after the marker + a 0.5em gap, continuations aligned.
-                    let ind = self.m.str_width(mst.font, mst.size, &mk) + 0.5 * mst.size;
-                    self.flow(
-                        it,
-                        ml + ind,
-                        self.text_w() - ind,
-                        HAlign::Left,
-                        false,
-                        Some((mk, mst, ml)),
-                        &ident,
-                    );
+                self.lay_list(*ordered, items, ml);
+                self.after = self.st.par_spacing;
+            }
+            Block::Terms { items } => {
+                self.gap(1.1);
+                let tw = self.text_w();
+                for it in items {
+                    self.lay_term(&it.term, &it.desc, ml, tw);
                 }
                 self.after = self.st.par_spacing;
             }
@@ -383,6 +373,144 @@ impl<'a, M: FontMetrics> Lx<'a, M> {
                 self.after = 0.0;
             }
             Block::PageBreak => self.finish_page(),
+        }
+    }
+
+    /// Bullet/enum list. `marker_x` is where this level's markers sit.
+    /// A nested list shifts by one hanging indent (marker width + 0.5em).
+    fn lay_list(&mut self, ordered: bool, items: &'a [ListItem], marker_x: f64) {
+        let ml = self.st.margin_left;
+        let right = ml + self.text_w();
+        for (i, it) in items.iter().enumerate() {
+            let mk = if ordered {
+                format!("{}.", i + 1)
+            } else {
+                "\u{2022}".to_string()
+            };
+            let mst = TextStyle {
+                font: FontId::Regular,
+                size: self.st.font_size,
+            };
+            // typst hangs the marker; item text starts after the marker
+            // plus a 0.5em gap, and continuations align there.
+            let ind = self.m.str_width(mst.font, mst.size, &mk) + 0.5 * mst.size;
+            let text_x = marker_x + ind;
+            let width = (right - text_x).max(0.0);
+            self.flow(
+                &it.content,
+                text_x,
+                width,
+                HAlign::Left,
+                false,
+                Some((mk, mst, marker_x)),
+                &ident,
+            );
+            if it.rest.is_empty() {
+                continue;
+            }
+            for part in &it.rest {
+                match part {
+                    ListRest::List(list) => self.lay_list(list.ordered, &list.items, text_x),
+                    ListRest::Inlines(content) => self.flow(
+                        content,
+                        text_x,
+                        width,
+                        HAlign::Left,
+                        false,
+                        None,
+                        &ident,
+                    ),
+                }
+            }
+        }
+    }
+
+    /// Term in bold, description on the same line when the term fits.
+    /// Continuations align under the description.
+    fn lay_term(&mut self, term: &'a [Inline], desc: &'a [Inline], ml: f64, tw: f64) {
+        let gap = 0.5 * self.st.font_size;
+        let Some(term_w) = self.inline_width(term) else {
+            self.flow(term, ml, tw, HAlign::Left, false, None, &ident);
+            if !desc.is_empty() {
+                self.flow(desc, ml, tw, HAlign::Left, false, None, &ident);
+            }
+            return;
+        };
+        let hang = if term.is_empty() { 0.0 } else { term_w + gap };
+        if hang >= tw {
+            if !term.is_empty() {
+                self.flow(term, ml, tw, HAlign::Left, false, None, &ident);
+            }
+            if !desc.is_empty() {
+                self.flow(desc, ml, tw, HAlign::Left, false, None, &ident);
+            }
+            return;
+        }
+        let mst = TextStyle {
+            font: FontId::Bold,
+            size: self.inline_size(term),
+        };
+        self.term_prefix = Some(term);
+        self.flow(
+            desc,
+            ml + hang,
+            tw - hang,
+            HAlign::Left,
+            false,
+            Some((String::new(), mst, ml)),
+            &ident,
+        );
+        self.term_prefix = None;
+    }
+
+    /// Width of a single-line inline run. `None` when it contains a break.
+    fn inline_width(&self, inl: &[Inline]) -> Option<f64> {
+        let mut w = 0.0;
+        for i in inl {
+            match i {
+                Inline::Text { text, style } => {
+                    if text.as_bytes().contains(&b'\n') {
+                        return None;
+                    }
+                    w += self.m.str_width(style.font, style.size, text);
+                }
+                Inline::HSpace(g) => w += *g,
+                Inline::LineBreak => return None,
+            }
+        }
+        Some(w)
+    }
+
+    fn inline_size(&self, inl: &[Inline]) -> f64 {
+        let mut s = self.st.font_size;
+        for i in inl {
+            if let Inline::Text { style, .. } = i {
+                s = s.max(style.size);
+            }
+        }
+        s
+    }
+
+    fn paint_prefix(&mut self, runs: &[Inline], mut x: f64, baseline: f64) {
+        for r in runs {
+            match r {
+                Inline::Text { text, style } => {
+                    if text.is_empty() {
+                        continue;
+                    }
+                    let w = self.m.str_width(style.font, style.size, text);
+                    self.items.push(DrawItem::Text {
+                        x,
+                        y: baseline,
+                        font: style.font,
+                        size: style.size,
+                        text: InlineStr::from(text.as_str()),
+                    });
+                    x += w;
+                }
+                Inline::HSpace(g) => x += *g,
+                Inline::LineBreak => {}
+            }
         }
     }
 
@@ -677,13 +805,20 @@ impl<'a, M: FontMetrics> Lx<'a, M> {
                 HAlign::Left => 0.0,
             };
         if let Some((mt, mst, mx)) = mk {
-            self.items.push(DrawItem::Text {
-                x: mx,
-                y: baseline,
-                font: mst.font,
-                size: mst.size,
-                text: InlineStr::from(mt.as_str()),
-            });
+            if !mt.is_empty() {
+                self.items.push(DrawItem::Text {
+                    x: mx,
+                    y: baseline,
+                    font: mst.font,
+                    size: mst.size,
+                    text: InlineStr::from(mt.as_str()),
+                });
+            }
+            // Term lists only. Bullet markers take the branch above;
+            // `term_prefix` stays `None` for them.
+            if let Some(pref) = self.term_prefix.take() {
+                self.paint_prefix(pref, mx, baseline);
+            }
         }
         emit_atoms(&mut self.items, atoms, x, baseline, extra);
         self.y = baseline;
@@ -1251,6 +1386,20 @@ mod tests {
             .collect()
     }
 
+    fn lit(text: &str, font: FontId) -> Inline {
+        Inline::Text {
+            text: text.into(),
+            style: TextStyle { font, size: 11.0 },
+        }
+    }
+
+    fn flat(text: &str) -> ListItem {
+        ListItem {
+            content: vec![lit(text, FontId::Regular)],
+            rest: Vec::new(),
+        }
+    }
+
     fn cell(t: &str) -> Vec<Inline> {
         vec![Inline::Text {
             text: t.into(),
@@ -1316,22 +1465,7 @@ mod tests {
             },
             Block::List {
                 ordered: true,
-                items: vec![
-                    vec![Inline::Text {
-                        text: "first".into(),
-                        style: TextStyle {
-                            font: FontId::Regular,
-                            size: 11.0,
-                        },
-                    }],
-                    vec![Inline::Text {
-                        text: "second".into(),
-                        style: TextStyle {
-                            font: FontId::Regular,
-                            size: 11.0,
-                        },
-                    }],
-                ],
+                items: vec![flat("first"), flat("second")],
             },
         ]);
         let pages = layout(&doc, &Fake);
@@ -1352,6 +1486,97 @@ mod tests {
         let m2 = items.iter().find(|i| i.2 == "2.").unwrap();
         // item 2 baseline = item1 baseline + lh
         assert!((m2.1 - m1.1 - 14.39).abs() < 1e-6);
+    }
+
+    #[test]
+    fn layout_nested_and_mixed_lists() {
+        let doc = tdoc(vec![Block::List {
+            ordered: false,
+            items: vec![ListItem {
+                content: vec![lit("parent", FontId::Regular)],
+                rest: vec![ListRest::List(Box::new(ListBody {
+                    ordered: false,
+                    items: vec![flat("child")],
+                }))],
+            }],
+        }]);
+        let pages = layout(&doc, &Fake);
+        let items = texts(&pages[0]);
+        let parent_m = items.iter().find(|i| i.2 == "\u{2022}").unwrap();
+        let parent_t = items.iter().find(|i| i.2 == "parent").unwrap();
+        assert!((parent_m.0 - 70.866).abs() < 1e-6);
+        // bullet 5.5pt + 0.5em 5.5pt
+        assert!((parent_t.0 - 70.866 - 11.0).abs() < 1e-6);
+        assert_eq!(parent_m.1, parent_t.1);
+        let child_m = items.iter().filter(|i| i.2 == "\u{2022}").nth(1).unwrap();
+        let child_t = items.iter().find(|i| i.2 == "child").unwrap();
+        assert!((child_m.0 - parent_t.0).abs() < 1e-6);
+        assert!((child_t.0 - child_m.0 - 11.0).abs() < 1e-6);
+        assert!((child_m.1 - parent_m.1 - 14.39).abs() < 1e-6);
+
+        // mixed: nested enum under a bullet. "1." is 11pt + 0.5em.
+        let doc = tdoc(vec![Block::List {
+            ordered: false,
+            items: vec![ListItem {
+                content: vec![lit("a", FontId::Regular)],
+                rest: vec![ListRest::List(Box::new(ListBody {
+                    ordered: true,
+                    items: vec![flat("b")],
+                }))],
+            }],
+        }]);
+        let pages = layout(&doc, &Fake);
+        let items = texts(&pages[0]);
+        let bullet = items.iter().find(|i| i.2 == "\u{2022}").unwrap();
+        let num = items.iter().find(|i| i.2 == "1.").unwrap();
+        let b = items.iter().find(|i| i.2 == "b").unwrap();
+        assert!((num.0 - bullet.0 - 11.0).abs() < 1e-6);
+        assert!((b.0 - num.0 - 16.5).abs() < 1e-6);
+        assert_eq!(num.1, b.1);
+    }
+
+    #[test]
+    fn layout_term_list() {
+        let term = vec![lit("Term", FontId::Bold)];
+        let desc = vec![lit(
+            &vec!["aaaa"; 20].join(" "),
+            FontId::Regular,
+        )];
+        // emphasis in the description stays italic and shares the line
+        let emph = vec![
+            lit("a ", FontId::Regular),
+            lit("b", FontId::Italic),
+        ];
+        let doc = tdoc(vec![
+            Block::Terms {
+                items: vec![TermItem {
+                    term: term.clone(),
+                    desc: emph,
+                }],
+            },
+            Block::Terms {
+                items: vec![TermItem { term, desc }],
+            },
+        ]);
+        let pages = layout(&doc, &Fake);
+        let items = texts(&pages[0]);
+        let term_i = items.iter().find(|i| i.2 == "Term").unwrap();
+        assert_eq!(term_i.3, FontId::Bold);
+        assert!((term_i.0 - 70.866).abs() < 1e-6);
+        // "Term" = 22pt, gap 0.5em = 5.5, description at +27.5
+        let a = items.iter().find(|i| i.2 == "a").unwrap();
+        assert!((a.0 - 70.866 - 27.5).abs() < 1e-3);
+        assert_eq!(a.1, term_i.1);
+        let b = items.iter().find(|i| i.2 == "b").unwrap();
+        assert_eq!(b.3, FontId::Italic);
+        assert_eq!(b.1, a.1);
+        assert!((b.0 - a.0 - 11.0).abs() < 1e-3); // "a" + space
+        // wrapped description hangs at the same x as the first desc line
+        let lines: Vec<_> = items.iter().filter(|i| i.2.contains("aaaa")).collect();
+        assert!(lines.len() >= 2, "{lines:?}");
+        assert!((lines[0].0 - 70.866 - 27.5).abs() < 1e-3);
+        assert!((lines[1].0 - lines[0].0).abs() < 1e-6);
+        assert!((lines[1].1 - lines[0].1 - 14.39).abs() < 1e-6);
     }
 
     #[test]

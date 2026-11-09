@@ -53,6 +53,13 @@ impl Diag {
 
 // ------------------------- AST (parser output) -------------------------
 
+/// One `/ term: description` entry. `term` stops at the colon.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TermEntry {
+    pub term: Vec<Node>,
+    pub desc: Vec<Node>,
+}
+
 /// A parsed markup node. Block- and inline-level nodes share one type;
 /// the evaluator resolves the distinction.
 #[derive(Debug, Clone, PartialEq)]
@@ -68,11 +75,14 @@ pub enum Node {
     Emph(Vec<Node>),
     /// `=`, `==`, ... heading with level 1..=6.
     Heading { level: u8, body: Vec<Node> },
-    /// Bullet (`-`) or enumeration (`+`) list.
+    /// Bullet (`-`) or enumeration (`+`) list. A nested list is a
+    /// `Node::List` inside an item; the item's other nodes are inline.
     List {
         ordered: bool,
         items: Vec<Vec<Node>>,
     },
+    /// `/ term: description`. Consecutive items are one node.
+    Terms { items: Vec<TermEntry> },
     /// Raw code: `` `inline` `` (block=false) or a fenced ``` block.
     Raw { text: String, block: bool },
     /// Explicit paragraph boundary (a blank line).
@@ -270,10 +280,14 @@ pub enum Block {
         level: u8,
         content: Vec<Inline>,
     },
+    /// Bullet or enumeration. `items[i].rest` is an empty vec (no heap
+    /// allocation) when the item contains no nested list.
     List {
         ordered: bool,
-        items: Vec<Vec<Inline>>,
+        items: Vec<ListItem>,
     },
+    /// `/ term: description`. Term inlines are already bold.
+    Terms { items: Vec<TermItem> },
     /// Fenced code block; text is the verbatim content.
     RawBlock {
         text: String,
@@ -291,6 +305,37 @@ pub enum Block {
         /// Draw cell borders (`#table` true, `#grid` false).
         stroke: bool,
     },
+}
+
+/// One bullet or enum item. `rest` stays empty on the flat-list path.
+#[derive(Debug, Clone)]
+pub struct ListItem {
+    pub content: Vec<Inline>,
+    /// Nested lists and inline runs that follow them, in source order.
+    pub rest: Vec<ListRest>,
+}
+
+/// What follows the leading inline run of a list item.
+#[derive(Debug, Clone)]
+pub enum ListRest {
+    /// Nested `-` / `+` list.
+    List(Box<ListBody>),
+    /// Inline continuation after a nested list.
+    Inlines(Vec<Inline>),
+}
+
+/// Nested list body. Layout walks this directly; no second pass.
+#[derive(Debug, Clone)]
+pub struct ListBody {
+    pub ordered: bool,
+    pub items: Vec<ListItem>,
+}
+
+/// One evaluated term-list entry.
+#[derive(Debug, Clone)]
+pub struct TermItem {
+    pub term: Vec<Inline>,
+    pub desc: Vec<Inline>,
 }
 
 /// Column width spec for `Block::Table`.
