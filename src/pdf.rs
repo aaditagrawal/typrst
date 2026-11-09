@@ -5,7 +5,7 @@
 //! (including CFF/`OTTO` outlines) degrade to a Times-Roman reference.
 use crate::font::{base14_name, winansi_code, winansi_inverse};
 use crate::fontdb::{self, u16be, u32be, FaceMetrics};
-use crate::ir::{DrawItem, FontId, FontUse, Page};
+use crate::ir::{DrawItem, FontId, FontUse, Image, Page};
 use std::io::Write;
 use std::path::Path;
 
@@ -457,7 +457,7 @@ fn fnum(map: &FMap, f: FontId) -> u64 {
     }
 }
 
-pub fn write_pdf(pages: &[Page], fonts: &[FontUse]) -> Vec<u8> {
+pub fn write_pdf(pages: &[Page], fonts: &[FontUse], images: &[Image]) -> Vec<u8> {
     let used = used_fonts(pages);
     let fmap = font_map(&used);
     let plans: Vec<Plan> = used.iter().map(|f| plan_for(*f, fonts)).collect();
@@ -470,6 +470,10 @@ pub fn write_pdf(pages: &[Page], fonts: &[FontUse]) -> Vec<u8> {
     for p in &plans {
         ids.push((obj, obj + 1, obj + 2));
         obj += if matches!(p, Plan::Ext { .. }) { 3 } else { 1 };
+    }
+    let image_base = obj;
+    if !images.is_empty() {
+        obj += images.len();
     }
     let nobj = obj - 1;
 
@@ -499,6 +503,13 @@ pub fn write_pdf(pages: &[Page], fonts: &[FontUse]) -> Vec<u8> {
         res.extend_from_slice(b"/Font << ");
         for (j, (fo, _, _)) in ids.iter().enumerate() {
             write!(res, "/F{} {} 0 R ", j + 1, fo).unwrap();
+        }
+        res.extend_from_slice(b">> ");
+    }
+    if !images.is_empty() {
+        res.extend_from_slice(b"/XObject << ");
+        for i in 0..images.len() {
+            write!(res, "/Im{i} {} 0 R ", image_base + i).unwrap();
         }
         res.extend_from_slice(b">> ");
     }
@@ -535,6 +546,19 @@ pub fn write_pdf(pages: &[Page], fonts: &[FontUse]) -> Vec<u8> {
                     content.push(b' ');
                     push_num(&mut content, *h);
                     content.extend_from_slice(b" re f\n");
+                }
+                DrawItem::Image { x, y, w, h, index } => {
+                    content.extend_from_slice(b"q ");
+                    push_num(&mut content, *w);
+                    content.extend_from_slice(b" 0 0 ");
+                    push_num(&mut content, *h);
+                    content.push(b' ');
+                    push_num(&mut content, *x);
+                    content.push(b' ');
+                    push_num(&mut content, page.height - y - h);
+                    content.extend_from_slice(b" cm /Im");
+                    push_uint(&mut content, *index as u64);
+                    content.extend_from_slice(b" Do Q\n");
                 }
             }
         }
@@ -610,6 +634,26 @@ pub fn write_pdf(pages: &[Page], fonts: &[FontUse]) -> Vec<u8> {
         }
     }
 
+    if !images.is_empty() {
+        for (i, im) in images.iter().enumerate() {
+            begin(&mut out, image_base + i);
+            let cs = match im.components {
+                1 => "DeviceGray",
+                4 => "DeviceCMYK",
+                _ => "DeviceRGB",
+            };
+            writeln!(
+                out,
+                "<< /Type /XObject /Subtype /Image /Width {} /Height {} /ColorSpace /{cs} /BitsPerComponent {} /Filter /DCTDecode /Length {} >>",
+                im.width, im.height, im.bits, im.bytes.len()
+            )
+            .unwrap();
+            out.extend_from_slice(b"stream\n");
+            out.extend_from_slice(&im.bytes);
+            out.extend_from_slice(b"\nendstream\nendobj\n");
+        }
+    }
+
     let xref_pos = out.len();
     writeln!(out, "xref\n0 {}", nobj + 1).unwrap();
     out.extend_from_slice(b"0000000000 65535 f \n");
@@ -660,7 +704,7 @@ mod tests {
 
     #[test]
     fn structure_and_winansi_encoding() {
-        let pdf = write_pdf(&sample_pages(), &[]);
+        let pdf = write_pdf(&sample_pages(), &[], &[]);
         assert!(pdf.starts_with(b"%PDF-1.4"));
         assert!(pdf.ends_with(b"%%EOF\n"));
         assert!(has(&pdf, b"/Type /Catalog"));
@@ -684,11 +728,13 @@ mod tests {
         ));
         assert!(has(&pdf, b"/Encoding /WinAnsiEncoding"));
         assert!(!has(&pdf, b"/ID"));
+        assert!(!has(&pdf, b"/XObject"));
+        assert!(!has(&pdf, b"/DCTDecode"));
     }
 
     #[test]
     fn xref_offsets_point_at_objects() {
-        let pdf = write_pdf(&sample_pages(), &[]);
+        let pdf = write_pdf(&sample_pages(), &[], &[]);
         let sx = pdf.windows(9).rposition(|w| w == b"startxref").unwrap();
         let tail = std::str::from_utf8(&pdf[sx + 9..]).unwrap();
         let xoff: usize = tail
@@ -724,7 +770,7 @@ mod tests {
 
     #[test]
     fn empty_and_multi_page() {
-        let pdf = write_pdf(&[], &[]);
+        let pdf = write_pdf(&[], &[], &[]);
         assert!(pdf.starts_with(b"%PDF-"));
         assert!(pdf.ends_with(b"%%EOF\n"));
         assert!(has(&pdf, b"/Count 0 /Kids []"));
@@ -747,7 +793,7 @@ mod tests {
                 }],
             },
         ];
-        let pdf = write_pdf(&pages, &[]);
+        let pdf = write_pdf(&pages, &[], &[]);
         assert!(has(&pdf, b"/Count 2"));
         assert!(has(&pdf, b"/BaseFont /Times-BoldItalic "));
         assert!(has(&pdf, b"BT /F1 12.5 Tf 1 0 0 1 10 180 Tm (x) Tj ET"));
@@ -767,7 +813,7 @@ mod tests {
                 gray: 0.5,
             }],
         }];
-        let pdf = write_pdf(&pages, &[]);
+        let pdf = write_pdf(&pages, &[], &[]);
         // y flipped: 200 - 20 - 2.5 = 177.5
         assert!(has(&pdf, b"0.5 g 10 177.5 50 2.5 re f"));
     }
@@ -803,7 +849,7 @@ mod tests {
                 text: "A".into(),
             }],
         }];
-        let pdf = write_pdf(&pages, &fonts);
+        let pdf = write_pdf(&pages, &fonts, &[]);
         assert!(has(&pdf, b"/Subtype /TrueType"));
         assert!(has(&pdf, b"/BaseFont /TestFam-Bold "));
         assert!(has(&pdf, b"/FontDescriptor"));
@@ -832,7 +878,7 @@ mod tests {
                 text: "x".into(),
             }],
         }];
-        let pdf = write_pdf(&pages, &fonts);
+        let pdf = write_pdf(&pages, &fonts, &[]);
         assert!(has(&pdf, b"/BaseFont /Times-Roman "));
         assert!(!has(&pdf, b"/FontFile2"));
     }
@@ -878,5 +924,38 @@ mod tests {
             push_num(&mut v, x);
             assert_eq!(v, want.as_bytes());
         }
+    }
+
+    #[test]
+    fn jpeg_xobject_copies_bytes() {
+        let jpeg = [
+            0xFFu8, 0xD8, 0xFF, 0xC0, 0x00, 0x08, 0x08, 0x00, 0x10, 0x00, 0x20, 0x03, 0xFF, 0xD9,
+        ];
+        let images = vec![Image {
+            bytes: jpeg.to_vec(),
+            width: 32,
+            height: 16,
+            bits: 8,
+            components: 3,
+        }];
+        let pages = vec![Page {
+            width: 200.0,
+            height: 400.0,
+            items: vec![DrawItem::Image {
+                x: 10.0,
+                y: 20.0,
+                w: 50.0,
+                h: 25.0,
+                index: 0,
+            }],
+        }];
+        let pdf = write_pdf(&pages, &[], &images);
+        assert!(has(&pdf, b"/Filter /DCTDecode"));
+        assert!(has(&pdf, b"/Width 32"));
+        assert!(has(&pdf, b"/Height 16"));
+        assert!(has(&pdf, b"/ColorSpace /DeviceRGB"));
+        assert!(has(&pdf, b"/BitsPerComponent 8"));
+        assert!(has(&pdf, b"q 50 0 0 25 10 355 cm /Im0 Do Q\n"));
+        assert!(has(&pdf, &jpeg));
     }
 }

@@ -1,6 +1,7 @@
 //! Markup parser: source text -> Vec<Node> (see ir.rs / SPEC.md).
 use crate::ir::{
-    Arg, ArithOp, Cmp, CmpOp, Diag, Expr, Length, Node, Rhs, Severity, Span, TermEntry, Value,
+    Arg, ArithOp, Cmp, CmpOp, Cond, Diag, Expr, Length, Node, Param, Rhs, RhsArg, Severity, Span,
+    TermEntry, Value,
 };
 
 /// `#name` calls the parser accepts. Anything else (bound `#let` names
@@ -17,13 +18,17 @@ const IMPLEMENTED: &[&str] = &[
     "align",
     "table",
     "grid",
+    "image",
+    "box",
+    "block",
+    "stack",
 ];
 
 /// Bare `#word` forms that are recognized but not implemented (rather
 /// than treated as variable references, which unknown `#ident`s become).
 const NOT_IMPL_BARE: &[&str] = &[
-    "show", "context", "state", "counter", "place", "figure", "link", "ref", "while", "else", "in",
-    "not", "and", "or", "return", "break", "continue",
+    "show", "context", "state", "counter", "place", "figure", "link", "ref", "else", "in", "not",
+    "and", "or", "return", "break", "continue",
 ];
 
 /// Parse Typst markup. Recovering: returns whatever nodes parsed plus
@@ -104,7 +109,7 @@ fn pad(t: &mut String, nodes: &[Node]) {
 }
 
 fn is_label(c: u8) -> bool {
-    c.is_ascii_alphanumeric() || matches!(c, b'_' | b'-' | b'.' | b':')
+    c.is_ascii_alphanumeric() || matches!(c, b'_' | b'-' | b'.')
 }
 
 fn is_ident_start(c: u8) -> bool {
@@ -144,6 +149,7 @@ fn rhs_name(r: &Rhs) -> Option<String> {
 
 /// `Rhs` -> markup `Expr` for `#(expr)`: Var/Field collapse to a dotted
 /// `Expr::Var` (eval resolves fields through dicts), Bin/Lit map over.
+/// A method call (or a field hanging off one) stays an `Expr::Rhs`.
 fn rhs_expr(r: Rhs) -> Expr {
     match r {
         Rhs::Lit(v) => Expr::Lit(v),
@@ -152,8 +158,10 @@ fn rhs_expr(r: Rhs) -> Expr {
             op,
             rhs: *rhs,
         },
-        other => Expr::Var {
-            name: rhs_name(&other).unwrap_or_default(),
+        Rhs::Var(name) => Expr::Var { name },
+        other => match rhs_name(&other) {
+            Some(name) => Expr::Var { name },
+            None => Expr::Rhs(other),
         },
     }
 }
@@ -277,7 +285,7 @@ impl<'a> P<'a> {
     /// matching `]` (consumed); `bstart` is its `[` offset for diagnostics.
     fn body(&mut self, in_bracket: bool, bstart: usize) -> Vec<Node> {
         self.depth += 1;
-        if self.depth > 250 {
+        if self.depth > 32 {
             self.depth -= 1;
             self.diag(Severity::Error, bstart, "content nested too deeply");
             self.skip_balanced(b'[', b']');
@@ -808,13 +816,13 @@ impl<'a> P<'a> {
                 b'#' => self.hash(out, text),
                 b'$' => self.math(),
                 b'<' => {
-                    if !self.label() {
+                    if !self.label(out, text) {
                         text.push('<');
                         self.pos += 1;
                     }
                 }
                 b'@' => {
-                    if !self.at_ref() {
+                    if !self.at_ref(out, text) {
                         text.push('@');
                         self.pos += 1;
                     }
@@ -1038,17 +1046,25 @@ impl<'a> P<'a> {
         self.diag(Severity::NotImplemented, a, "math is not implemented");
     }
 
-    /// `<name>` label.
-    fn label(&mut self) -> bool {
+    /// `<name>` label. Letters, digits, `_`, `-`, `.`.
+    fn label(&mut self, out: &mut Vec<Node>, text: &mut String) -> bool {
         let a = self.pos;
-        let s = self.src.as_bytes();
-        let mut i = self.pos + 1;
-        while i < s.len() && is_label(s[i]) {
-            i += 1;
-        }
-        if i > a + 1 && s.get(i) == Some(&b'>') {
-            self.pos = i + 1;
-            self.diag(Severity::NotImplemented, a, "labels are not implemented");
+        let (name, end) = {
+            let s = self.src.as_bytes();
+            let mut i = a + 1;
+            while i < s.len() && is_label(s[i]) {
+                i += 1;
+            }
+            if i > a + 1 && s.get(i) == Some(&b'>') {
+                (Some(self.src[a + 1..i].to_string()), i + 1)
+            } else {
+                (None, a)
+            }
+        };
+        if let Some(name) = name {
+            self.pos = end;
+            flush(out, text);
+            out.push(Node::Label(name));
             true
         } else {
             false
@@ -1056,20 +1072,24 @@ impl<'a> P<'a> {
     }
 
     /// `@name` reference.
-    fn at_ref(&mut self) -> bool {
+    fn at_ref(&mut self, out: &mut Vec<Node>, text: &mut String) -> bool {
         let a = self.pos;
-        let s = self.src.as_bytes();
-        let mut i = self.pos + 1;
-        while i < s.len() && is_label(s[i]) {
-            i += 1;
-        }
-        if i > a + 1 {
-            self.pos = i;
-            self.diag(
-                Severity::NotImplemented,
-                a,
-                "references are not implemented",
-            );
+        let (name, end) = {
+            let s = self.src.as_bytes();
+            let mut i = a + 1;
+            while i < s.len() && is_label(s[i]) {
+                i += 1;
+            }
+            if i > a + 1 {
+                (Some(self.src[a + 1..i].to_string()), i)
+            } else {
+                (None, a)
+            }
+        };
+        if let Some(name) = name {
+            self.pos = end;
+            flush(out, text);
+            out.push(Node::Ref(name));
             true
         } else {
             false
@@ -1090,6 +1110,7 @@ impl<'a> P<'a> {
                     "include" => self.parse_include(a, out, text),
                     "if" => self.parse_if(a, out, text),
                     "for" => self.parse_for(a, out, text),
+                    "while" => self.parse_while(a, out, text),
                     _ => self.hash_call(a, name, out, text),
                 }
             }
@@ -1146,20 +1167,60 @@ impl<'a> P<'a> {
     /// `.field` access), or a spaced binary expression `#a + b`.
     fn hash_call(&mut self, a: usize, name: String, out: &mut Vec<Node>, text: &mut String) {
         let bound = self.lets.iter().any(|l| l == &name);
+        if bound
+            && !IMPLEMENTED.contains(&name.as_str())
+            && matches!(self.peek(), Some(b'(') | Some(b'['))
+        {
+            let args = if self.peek() == Some(b'(') {
+                self.rhs_args()
+            } else {
+                Vec::new()
+            };
+            let content = self.trailing_content();
+            flush(out, text);
+            out.push(Node::Expr(Expr::Call { name, args, content }));
+            return;
+        }
         if matches!(self.peek(), Some(b'(') | Some(b'[')) {
             let implemented = IMPLEMENTED.contains(&name.as_str()) || bound;
-            let args = if self.peek() == Some(b'(') {
+            let mut args = if self.peek() == Some(b'(') {
                 self.args()
             } else {
                 Vec::new()
             };
-            let content = if self.peek() == Some(b'[') {
+            let mut content = if self.peek() == Some(b'[') {
                 let bs = self.pos;
                 self.pos += 1;
                 Some(self.body(true, bs))
             } else {
                 None
             };
+            // `#stack[a][b][c]` — every consecutive content block is a
+            // positional content arg. Other calls keep a single trailing
+            // block, so `#emph[x]`, `#if`, and `#for` are unchanged.
+            if name == "stack" {
+                if let Some(first) = content.take() {
+                    args.push(Arg {
+                        name: None,
+                        value: Value::Content(first),
+                    });
+                }
+                loop {
+                    let save = self.pos;
+                    self.skip_ws();
+                    if self.peek() == Some(b'[') {
+                        let bs = self.pos;
+                        self.pos += 1;
+                        args.push(Arg {
+                            name: None,
+                            value: Value::Content(self.body(true, bs)),
+                        });
+                    } else {
+                        self.pos = save;
+                        break;
+                    }
+                }
+            }
             if implemented {
                 flush(out, text);
                 out.push(Node::Expr(Expr::Func {
@@ -1177,21 +1238,11 @@ impl<'a> P<'a> {
         } else if bound
             || !(IMPLEMENTED.contains(&name.as_str()) || NOT_IMPL_BARE.contains(&name.as_str()))
         {
-            // `#var`, `#var.field`, `#a + b`. Unknown names still parse as
-            // `Expr::Var` — eval reports "undefined variable" (this also
-            // covers names bound via `#import "..": *`).
-            let mut dotted = name;
-            let mut lhs = Rhs::Var(dotted.clone());
-            while self.peek() == Some(b'.') && self.at(1).map_or(false, is_ident_start) {
-                self.pos += 1;
-                let f = self.ident().unwrap();
-                dotted.push('.');
-                dotted.push_str(&f);
-                lhs = Rhs::Field {
-                    base: Box::new(lhs),
-                    name: f,
-                };
-            }
+            // `#var`, `#var.field`, `#xs.len()`, `#a + b`. Unknown names
+            // still parse as `Expr::Var` — eval reports "undefined
+            // variable" (this also covers names bound via `#import "..": *`).
+            // A pure field chain stays a dotted `Var`; a method call does not.
+            let lhs = self.with_suffix(Rhs::Var(name));
             let save = self.pos;
             self.skip_hspace();
             if self.pos > save {
@@ -1208,7 +1259,7 @@ impl<'a> P<'a> {
             }
             self.pos = save;
             flush(out, text);
-            out.push(Node::Expr(Expr::Var { name: dotted }));
+            out.push(Node::Expr(rhs_expr(lhs)));
         } else if IMPLEMENTED.contains(&name.as_str()) {
             flush(out, text);
             out.push(Node::Expr(Expr::Func {
@@ -1298,7 +1349,7 @@ impl<'a> P<'a> {
         let mut arms = Vec::new();
         let mut els = None;
         loop {
-            let Some(c) = self.cmp() else {
+            let Some(c) = self.cond() else {
                 self.diag(Severity::Error, a, "expected a condition after `#if`");
                 break;
             };
@@ -1391,15 +1442,121 @@ impl<'a> P<'a> {
         out.push(Node::Expr(Expr::For { vars, iter, body }));
     }
 
-    /// A condition: `[not] rhs (cmp-op rhs)?`. Bare `#if x` desugars to
-    /// `x != none` (eval treats it as a truthiness test).
-    fn cmp(&mut self) -> Option<Cmp> {
+    /// `#while cond [body]`. Same condition language as `#if`.
+    fn parse_while(&mut self, a: usize, out: &mut Vec<Node>, text: &mut String) {
+        let Some(cond) = self.cond() else {
+            self.diag(Severity::Error, a, "expected a condition after `#while`");
+            self.skip_to_eol();
+            return;
+        };
         self.skip_ws();
-        let save = self.pos;
-        let negated = self.ident().as_deref() == Some("not");
-        if !negated {
+        if self.peek() != Some(b'[') {
+            self.diag(Severity::Error, a, "expected `[` after `#while` condition");
+            self.skip_to_eol();
+            return;
+        }
+        let bs = self.pos;
+        self.pos += 1;
+        let body = self.body(true, bs);
+        flush(out, text);
+        out.push(Node::Expr(Expr::While { cond, body }));
+    }
+
+    /// `#if` / `#while` condition. `and` binds tighter than `or`; prefix
+    /// `not` binds tighter than both. A bare value desugars to `x != none`
+    /// (eval treats that as truthiness). Parentheses group a condition,
+    /// but a parenthesized bare value stays an rhs so `(1) == 2` is still
+    /// a comparison.
+    fn cond(&mut self) -> Option<Cond> {
+        self.cond_or().map(|(c, _)| c)
+    }
+
+    fn cond_or(&mut self) -> Option<(Cond, bool)> {
+        let (mut lhs, mut bare) = self.cond_and()?;
+        loop {
+            let save = self.pos;
+            self.skip_ws();
+            if self.word("or") {
+                match self.cond_and() {
+                    Some((r, _)) => {
+                        lhs = Cond::Or(Box::new(lhs), Box::new(r));
+                        bare = false;
+                    }
+                    None => {
+                        self.diag(Severity::Error, self.pos, "expected an expression after `or`");
+                        return None;
+                    }
+                }
+            } else {
+                self.pos = save;
+                break;
+            }
+        }
+        Some((lhs, bare))
+    }
+
+    fn cond_and(&mut self) -> Option<(Cond, bool)> {
+        let (mut lhs, mut bare) = self.cond_unary()?;
+        loop {
+            let save = self.pos;
+            self.skip_ws();
+            if self.word("and") {
+                match self.cond_unary() {
+                    Some((r, _)) => {
+                        lhs = Cond::And(Box::new(lhs), Box::new(r));
+                        bare = false;
+                    }
+                    None => {
+                        self.diag(Severity::Error, self.pos, "expected an expression after `and`");
+                        return None;
+                    }
+                }
+            } else {
+                self.pos = save;
+                break;
+            }
+        }
+        Some((lhs, bare))
+    }
+
+    fn cond_unary(&mut self) -> Option<(Cond, bool)> {
+        self.skip_ws();
+        if self.word("not") {
+            let (c, _) = self.cond_unary()?;
+            return Some((Cond::Not(Box::new(c)), false));
+        }
+        self.cond_primary()
+    }
+
+    fn cond_primary(&mut self) -> Option<(Cond, bool)> {
+        self.skip_ws();
+        if self.peek() == Some(b'(') {
+            let save = self.pos;
+            self.pos += 1;
+            self.depth += 1;
+            let grouped = if self.depth > 64 {
+                self.diag(Severity::Error, save, "expression nested too deeply");
+                None
+            } else {
+                self.cond_or()
+            };
+            if let Some((c, bare)) = grouped {
+                self.skip_ws();
+                if self.peek() == Some(b')') && !bare {
+                    self.pos += 1;
+                    self.depth -= 1;
+                    return Some((c, false));
+                }
+            }
+            self.depth -= 1;
             self.pos = save;
         }
+        self.comparison()
+    }
+
+    /// `rhs (cmp-op rhs)?`. Without an operator the value is bare
+    /// (`bare == true`) and desugars to `lhs != none`.
+    fn comparison(&mut self) -> Option<(Cond, bool)> {
         let lhs = self.rhs()?;
         self.skip_ws();
         let (op, adv) = match self.peek() {
@@ -1411,18 +1568,37 @@ impl<'a> P<'a> {
             Some(b'>') => (CmpOp::Gt, 1),
             _ => (CmpOp::Ne, 0),
         };
+        if adv == 0 {
+            return Some((
+                Cond::Cmp(Cmp {
+                    lhs,
+                    op: CmpOp::Ne,
+                    rhs: Rhs::Lit(Value::None),
+                }),
+                true,
+            ));
+        }
         self.pos += adv;
-        let rhs = if adv > 0 {
-            self.rhs()?
+        let rhs = self.rhs()?;
+        Some((Cond::Cmp(Cmp { lhs, op, rhs }), false))
+    }
+
+    /// Exact identifier `kw`. Does not match a longer name (`or` / `order`).
+    fn word(&mut self, kw: &str) -> bool {
+        let s = self.pos;
+        if !self.peek().map_or(false, is_ident_start) {
+            return false;
+        }
+        let mut i = self.pos;
+        while self.bytes.get(i).copied().map_or(false, is_ident_cont) {
+            i += 1;
+        }
+        if &self.src[s..i] == kw {
+            self.pos = i;
+            true
         } else {
-            Rhs::Lit(Value::None)
-        };
-        Some(Cmp {
-            lhs,
-            op,
-            rhs,
-            negated,
-        })
+            false
+        }
     }
 
     /// Right-hand side: `mul-level` terms joined by `+`/`-`, folded left.
@@ -1491,44 +1667,119 @@ impl<'a> P<'a> {
         Some(lhs)
     }
 
-    /// One operand: literal, `var`, `var.field`, `(...)`, or `[content]`.
+    /// One operand: literal, `var`, `var.field`, `value.method(args)`,
+    /// `(...)`, or `[content]`.
     fn rhs_term(&mut self) -> Option<Rhs> {
         self.skip_ws();
-        match self.peek()? {
-            b'(' => self.paren_value().map(Rhs::Lit),
-            b'"' => Some(Rhs::Lit(Value::Str(self.string(self.pos)))),
+        let base = match self.peek()? {
+            b'(' => self.paren_value().map(Rhs::Lit)?,
+            b'"' => Rhs::Lit(Value::Str(self.string(self.pos))),
             b'[' => {
                 let bs = self.pos;
                 self.pos += 1;
-                Some(Rhs::Lit(Value::Content(self.body(true, bs))))
+                Rhs::Lit(Value::Content(self.body(true, bs)))
             }
             c if c.is_ascii_digit()
                 || (matches!(c, b'-' | b'+')
                     && self.at(1).map_or(false, |d| d.is_ascii_digit()))
                 || (c == b'.' && self.at(1).map_or(false, |d| d.is_ascii_digit())) =>
             {
-                self.number().map(Rhs::Lit)
+                self.number().map(Rhs::Lit)?
             }
             c if is_ident_start(c) => {
                 let n = self.ident().unwrap();
-                let mut r = match n.as_str() {
+                match n.as_str() {
                     "true" => Rhs::Lit(Value::Bool(true)),
                     "false" => Rhs::Lit(Value::Bool(false)),
                     "none" | "auto" => Rhs::Lit(Value::None),
                     _ => Rhs::Var(n),
-                };
-                while self.peek() == Some(b'.') && self.at(1).map_or(false, is_ident_start) {
-                    self.pos += 1;
-                    let f = self.ident().unwrap();
-                    r = Rhs::Field {
-                        base: Box::new(r),
-                        name: f,
-                    };
                 }
-                Some(r)
             }
-            _ => None,
+            _ => return None,
+        };
+        Some(self.with_suffix(base))
+    }
+
+    /// `.field` or `.name(args)` after an atom. `(` must follow the name
+    /// immediately; a bare `.name` stays a field.
+    fn with_suffix(&mut self, mut r: Rhs) -> Rhs {
+        while self.peek() == Some(b'.') && self.at(1).map_or(false, is_ident_start) {
+            self.pos += 1;
+            let name = self.ident().unwrap();
+            if self.peek() == Some(b'(') {
+                let args = self.rhs_call_args();
+                r = Rhs::Call {
+                    recv: Box::new(r),
+                    method: name,
+                    args,
+                };
+            } else {
+                r = Rhs::Field {
+                    base: Box::new(r),
+                    name,
+                };
+            }
         }
+        r
+    }
+
+    /// Argument list of a method call. The opening `(` is current.
+    fn rhs_call_args(&mut self) -> Vec<Rhs> {
+        self.pos += 1;
+        self.depth += 1;
+        if self.depth > 64 {
+            self.diag(Severity::Error, self.pos, "expression nested too deeply");
+            self.skip_balanced(b'(', b')');
+            self.depth -= 1;
+            return Vec::new();
+        }
+        let mut args = Vec::new();
+        loop {
+            self.skip_ws();
+            match self.peek() {
+                None => {
+                    self.diag(Severity::Error, self.pos, "unclosed `(`");
+                    break;
+                }
+                Some(b')') => {
+                    self.pos += 1;
+                    break;
+                }
+                _ => {}
+            }
+            match self.rhs() {
+                Some(v) => args.push(v),
+                None => {
+                    self.diag(Severity::Error, self.pos, "expected a value");
+                    break;
+                }
+            }
+            self.skip_ws();
+            match self.peek() {
+                Some(b',') => {
+                    self.pos += 1;
+                    self.skip_ws();
+                    if self.peek() == Some(b')') {
+                        self.pos += 1;
+                        break;
+                    }
+                }
+                Some(b')') => {
+                    self.pos += 1;
+                    break;
+                }
+                None => {
+                    self.diag(Severity::Error, self.pos, "unclosed `(`");
+                    break;
+                }
+                _ => {
+                    self.diag(Severity::Error, self.pos, "expected `,` or `)`");
+                    break;
+                }
+            }
+        }
+        self.depth -= 1;
+        args
     }
 
     /// Does an rhs operand start here?
@@ -1566,7 +1817,7 @@ impl<'a> P<'a> {
     }
 
     fn paren_inner(&mut self) -> Option<Value> {
-        if self.depth > 250 {
+        if self.depth > 64 {
             self.diag(Severity::Error, self.pos, "expression nested too deeply");
             self.skip_balanced(b'(', b')');
             return None;
@@ -1679,33 +1930,7 @@ impl<'a> P<'a> {
         };
         self.skip_hspace();
         if self.peek() == Some(b'(') {
-            // `#let f(..) = ..` — function definitions are out of scope.
-            self.pos += 1;
-            self.skip_balanced(b'(', b')');
-            self.skip_hspace();
-            if self.peek() == Some(b'=') {
-                self.pos += 1;
-                self.skip_hspace();
-            }
-            match self.peek() {
-                Some(b'[') => {
-                    self.pos += 1;
-                    self.skip_balanced(b'[', b']');
-                }
-                Some(b'(') => {
-                    self.pos += 1;
-                    self.skip_balanced(b'(', b')');
-                }
-                Some(b'"') => {
-                    self.string(self.pos);
-                }
-                _ => self.skip_to_eol(),
-            }
-            self.diag(
-                Severity::NotImplemented,
-                a,
-                "#let function definitions are not implemented",
-            );
+            self.parse_let_fn(a, name, out, text);
             return;
         }
         if self.peek() != Some(b'=') {
@@ -1738,6 +1963,304 @@ impl<'a> P<'a> {
                 self.diag(Severity::Error, a, "expected a value in `#let`");
                 self.skip_to_eol();
             }
+        }
+    }
+
+    /// `#let name(params) = [content] | expr`.
+    fn parse_let_fn(&mut self, a: usize, name: String, out: &mut Vec<Node>, text: &mut String) {
+        let params = self.fn_params();
+        self.skip_hspace();
+        if self.peek() != Some(b'=') {
+            self.diag(Severity::Error, a, "expected `=` in `#let`");
+            self.skip_to_eol();
+            return;
+        }
+        self.pos += 1;
+        let mark = self.lets.len();
+        self.lets.push(name.clone());
+        for p in &params {
+            self.lets.push(p.name.clone());
+        }
+        let body = self.rhs();
+        self.lets.truncate(mark);
+        let Some(body) = body else {
+            self.diag(Severity::Error, a, "expected a value in `#let`");
+            self.skip_to_eol();
+            return;
+        };
+        if !self.lets.iter().any(|n| n == &name) {
+            self.lets.push(name.clone());
+        }
+        flush(out, text);
+        out.push(Node::Expr(Expr::LetFn { name, params, body }));
+    }
+
+    /// Parameter list, including the surrounding parentheses.
+    fn fn_params(&mut self) -> Vec<Param> {
+        self.pos += 1;
+        self.depth += 1;
+        let params = self.fn_param_list();
+        self.depth -= 1;
+        params
+    }
+
+    fn fn_param_list(&mut self) -> Vec<Param> {
+        if self.depth > 64 {
+            self.diag(Severity::Error, self.pos, "parameters nested too deeply");
+            self.skip_balanced(b'(', b')');
+            return Vec::new();
+        }
+        let mut params = Vec::new();
+        loop {
+            let start = self.pos;
+            self.skip_ws();
+            match self.peek() {
+                None => {
+                    self.diag(Severity::Error, self.pos, "unclosed `(`");
+                    break;
+                }
+                Some(b')') => {
+                    self.pos += 1;
+                    break;
+                }
+                Some(b'.') if self.at(1) == Some(b'.') => {
+                    self.diag(
+                        Severity::NotImplemented,
+                        self.pos,
+                        "parameter sinks are not implemented",
+                    );
+                    self.pos += 2;
+                    while self.peek().map_or(false, is_ident_cont) {
+                        self.pos += 1;
+                    }
+                    self.skip_param_tail();
+                }
+                Some(b'(') => {
+                    self.diag(
+                        Severity::NotImplemented,
+                        self.pos,
+                        "parameter destructuring is not implemented",
+                    );
+                    self.pos += 1;
+                    self.skip_balanced(b'(', b')');
+                    self.skip_param_tail();
+                }
+                _ => {
+                    if let Some(pname) = self.ident() {
+                    self.skip_ws();
+                    let default = if self.peek() == Some(b':') {
+                        self.pos += 1;
+                        let save = self.pos;
+                        match self.literal_default() {
+                            Some(v) => Some(v),
+                            None => {
+                                self.diag(
+                                    Severity::Error,
+                                    save,
+                                    "parameter default must be a literal",
+                                );
+                                if self.pos == save {
+                                    let _ = self.rhs();
+                                }
+                                None
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                    params.push(Param {
+                        name: pname,
+                        default,
+                    });
+                    self.skip_ws();
+                    match self.peek() {
+                        Some(b',') => self.pos += 1,
+                        Some(b')') | None => {}
+                        _ => {
+                            self.diag(Severity::Error, self.pos, "expected `,` or `)`");
+                            let before = self.pos;
+                            self.recover_arg();
+                            if self.pos == before
+                                && !matches!(self.peek(), Some(b',') | Some(b')') | None)
+                            {
+                                self.pos += 1;
+                            }
+                            if self.peek() == Some(b',') {
+                                self.pos += 1;
+                            }
+                        }
+                    }
+                    } else {
+                        self.diag(Severity::Error, self.pos, "expected a parameter name");
+                        let before = self.pos;
+                        self.recover_arg();
+                        if self.pos == before
+                            && !matches!(self.peek(), Some(b',') | Some(b')') | None)
+                        {
+                            self.pos += 1;
+                        }
+                        if self.peek() == Some(b',') {
+                            self.pos += 1;
+                        }
+                    }
+                }
+            }
+            if self.pos == start {
+                if self.eof() {
+                    break;
+                }
+                self.pos += 1;
+            }
+        }
+        params
+    }
+
+    fn skip_param_tail(&mut self) {
+        self.skip_ws();
+        if self.peek() == Some(b':') {
+            self.pos += 1;
+            let _ = self.rhs();
+        }
+        self.skip_ws();
+        if self.peek() == Some(b',') {
+            self.pos += 1;
+        }
+    }
+
+    /// Literal allowed as a parameter default: int, float, string, length, bool, none.
+    fn literal_default(&mut self) -> Option<Value> {
+        self.skip_ws();
+        match self.peek()? {
+            b'"' => Some(Value::Str(self.string(self.pos))),
+            c if c.is_ascii_digit()
+                || (matches!(c, b'-' | b'+') && self.at(1).map_or(false, |d| d.is_ascii_digit()))
+                || (c == b'.' && self.at(1).map_or(false, |d| d.is_ascii_digit())) =>
+            {
+                match self.number()? {
+                    v @ (Value::Int(_) | Value::Float(_) | Value::Length(_)) => Some(v),
+                    _ => None,
+                }
+            }
+            c if is_ident_start(c) => {
+                let save = self.pos;
+                let n = self.ident()?;
+                match n.as_str() {
+                    "true" => Some(Value::Bool(true)),
+                    "false" => Some(Value::Bool(false)),
+                    "none" => Some(Value::None),
+                    _ => {
+                        self.pos = save;
+                        None
+                    }
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// `(expr, name: expr, ...)` for a user-function call.
+    fn rhs_args(&mut self) -> Vec<RhsArg> {
+        self.pos += 1;
+        self.depth += 1;
+        let args = self.rhs_arg_list();
+        self.depth -= 1;
+        args
+    }
+
+    fn rhs_arg_list(&mut self) -> Vec<RhsArg> {
+        if self.depth > 64 {
+            self.diag(Severity::Error, self.pos, "arguments nested too deeply");
+            self.skip_balanced(b'(', b')');
+            return Vec::new();
+        }
+        let mut args = Vec::new();
+        loop {
+            let start = self.pos;
+            self.skip_ws();
+            match self.peek() {
+                None => {
+                    self.diag(Severity::Error, self.pos, "unclosed `(`");
+                    break;
+                }
+                Some(b')') => {
+                    self.pos += 1;
+                    break;
+                }
+                Some(b'.') if self.at(1) == Some(b'.') => {
+                    self.diag(
+                        Severity::NotImplemented,
+                        self.pos,
+                        "spread arguments are not implemented",
+                    );
+                    self.pos += 2;
+                    self.recover_arg();
+                    if self.peek() == Some(b',') {
+                        self.pos += 1;
+                    }
+                }
+                _ => {
+                    let mut name = None;
+                    let save = self.pos;
+                    if let Some(n) = self.ident() {
+                        self.skip_hspace();
+                        if self.peek() == Some(b':') {
+                            self.pos += 1;
+                            name = Some(n);
+                        } else {
+                            self.pos = save;
+                        }
+                    }
+                    if let Some(v) = self.rhs() {
+                        args.push(RhsArg { name, value: v });
+                    } else {
+                        self.diag(Severity::Error, self.pos, "expected a value");
+                        let before = self.pos;
+                        self.recover_arg();
+                        if self.pos == before
+                            && !matches!(self.peek(), Some(b',') | Some(b')') | None)
+                        {
+                            self.pos += 1;
+                        }
+                    }
+                    self.skip_ws();
+                    if self.peek() == Some(b',') {
+                        self.pos += 1;
+                    } else if !matches!(self.peek(), Some(b')') | None) {
+                        self.diag(Severity::Error, self.pos, "expected `,` or `)`");
+                        let before = self.pos;
+                        self.recover_arg();
+                        if self.pos == before
+                            && !matches!(self.peek(), Some(b',') | Some(b')') | None)
+                        {
+                            self.pos += 1;
+                        }
+                        if self.peek() == Some(b',') {
+                            self.pos += 1;
+                        }
+                    }
+                }
+            }
+            if self.pos == start {
+                if self.eof() {
+                    break;
+                }
+                self.pos += 1;
+            }
+        }
+        args
+    }
+
+    /// Trailing `[content]`, allowing spaces before the bracket.
+    fn trailing_content(&mut self) -> Option<Vec<Node>> {
+        let save = self.pos;
+        self.skip_hspace();
+        if self.peek() == Some(b'[') {
+            let bs = self.pos;
+            self.pos += 1;
+            Some(self.body(true, bs))
+        } else {
+            self.pos = save;
+            None
         }
     }
 
@@ -1782,7 +2305,7 @@ impl<'a> P<'a> {
     /// Arg list body after `(` is consumed. Nested `(x: v, ...)` groups
     /// become `Value::Dict`/`Value::Array` via `paren_value`.
     fn arg_list(&mut self) -> Vec<Arg> {
-        if self.depth > 250 {
+        if self.depth > 64 {
             self.diag(Severity::Error, self.pos, "arguments nested too deeply");
             self.skip_balanced(b'(', b')');
             return Vec::new();
@@ -2066,6 +2589,30 @@ mod tests {
         assert_eq!(nodes("======= A"), vec![t("======= A")]);
         assert_eq!(nodes("=x"), vec![t("=x")]);
     }
+
+    #[test]
+    fn labels_and_refs_parse() {
+        assert_eq!(
+            nodes("= Intro <intro>"),
+            vec![Node::Heading {
+                level: 1,
+                body: vec![t("Intro "), Node::Label("intro".into())],
+            }]
+        );
+        let n = nodes("= Intro\n<intro>");
+        assert!(matches!(n[0], Node::Heading { level: 1, .. }));
+        assert!(matches!(&n[1], Node::Label(s) if s == "intro"));
+        assert_eq!(
+            nodes("See @intro now"),
+            vec![t("See "), Node::Ref("intro".into()), t(" now")]
+        );
+        let (n, d) = parse("<a-b_c.d> @a-b_c.d");
+        assert!(d.is_empty(), "{d:?}");
+        assert!(n.iter().any(|x| matches!(x, Node::Label(s) if s == "a-b_c.d")));
+        assert!(n.iter().any(|x| matches!(x, Node::Ref(s) if s == "a-b_c.d")));
+        assert!(!nodes("<a:b>").iter().any(|x| matches!(x, Node::Label(_))));
+    }
+
 
     #[test]
     fn strong_emph_nesting() {
@@ -2510,12 +3057,11 @@ mod tests {
             n,
             vec![Node::Expr(Expr::If {
                 arms: vec![(
-                    Cmp {
+                    Cond::Cmp(Cmp {
                         lhs: Rhs::Var("x".into()),
                         op: CmpOp::Ne,
                         rhs: Rhs::Lit(Value::None),
-                        negated: false,
-                    },
+                    }),
                     vec![t("yes")],
                 )],
                 els: None,
@@ -2528,9 +3074,12 @@ mod tests {
             panic!("{n:?}")
         };
         assert_eq!(arms.len(), 2);
-        assert_eq!(arms[0].0.op, CmpOp::Eq);
-        assert_eq!(arms[0].0.rhs, Rhs::Lit(Value::Int(1)));
-        assert!(arms[1].0.negated);
+        let Cond::Cmp(c0) = &arms[0].0 else {
+            panic!("{:?}", arms[0].0)
+        };
+        assert_eq!(c0.op, CmpOp::Eq);
+        assert_eq!(c0.rhs, Rhs::Lit(Value::Int(1)));
+        assert!(matches!(arms[1].0, Cond::Not(_)));
         assert_eq!(els.as_ref().unwrap()[0], t("z"));
 
         for (src, op) in [
@@ -2545,8 +3094,104 @@ mod tests {
             let Node::Expr(Expr::If { arms, .. }) = &n[0] else {
                 panic!("{src}")
             };
-            assert_eq!(arms[0].0.op, op, "{src}");
+            let Cond::Cmp(c) = &arms[0].0 else {
+                panic!("{src}")
+            };
+            assert_eq!(c.op, op, "{src}");
         }
+    }
+
+    #[test]
+    fn while_and_bool_combinators() {
+        let (n, d) = parse("#while n < 3 [x]");
+        assert!(d.is_empty(), "{d:?}");
+        let Node::Expr(Expr::While { cond, body }) = &n[0] else {
+            panic!("{n:?}")
+        };
+        let Cond::Cmp(c) = cond else { panic!("{cond:?}") };
+        assert_eq!(c.op, CmpOp::Lt);
+        assert_eq!(*body, vec![t("x")]);
+
+        let (n, d) = parse("#if a or b and c [x]");
+        assert!(d.is_empty(), "{d:?}");
+        let Node::Expr(Expr::If { arms, .. }) = &n[0] else {
+            panic!("{n:?}")
+        };
+        let Cond::Or(l, r) = &arms[0].0 else {
+            panic!("{:?}", arms[0].0)
+        };
+        assert!(matches!(l.as_ref(), Cond::Cmp(_)));
+        assert!(matches!(r.as_ref(), Cond::And(_, _)));
+
+        let (n, d) = parse("#if (a or b) and c [x]");
+        assert!(d.is_empty(), "{d:?}");
+        let Node::Expr(Expr::If { arms, .. }) = &n[0] else {
+            panic!("{n:?}")
+        };
+        let Cond::And(l, _) = &arms[0].0 else {
+            panic!("{:?}", arms[0].0)
+        };
+        assert!(matches!(l.as_ref(), Cond::Or(_, _)));
+
+        let (n, d) = parse("#if not a and b [x]");
+        assert!(d.is_empty(), "{d:?}");
+        let Node::Expr(Expr::If { arms, .. }) = &n[0] else {
+            panic!("{n:?}")
+        };
+        let Cond::And(l, _) = &arms[0].0 else {
+            panic!("{:?}", arms[0].0)
+        };
+        assert!(matches!(l.as_ref(), Cond::Not(_)));
+
+        let (n, d) = parse("#if (1) == 2 [x]");
+        assert!(d.is_empty(), "{d:?}");
+        let Node::Expr(Expr::If { arms, .. }) = &n[0] else {
+            panic!("{n:?}")
+        };
+        let Cond::Cmp(c) = &arms[0].0 else {
+            panic!("{:?}", arms[0].0)
+        };
+        assert_eq!(c.op, CmpOp::Eq);
+        assert_eq!(c.lhs, Rhs::Lit(Value::Int(1)));
+    }
+
+    #[test]
+    fn method_call_rhs() {
+        let (n, d) = parse("#let n = xs.len()\n#let y = xs.at(-1)\n#let z = m.x");
+        assert!(d.is_empty(), "{d:?}");
+        let lets: Vec<&Rhs> = n
+            .iter()
+            .filter_map(|n| {
+                if let Node::Expr(Expr::Let { value, .. }) = n {
+                    Some(value)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(lets.len(), 3);
+        let Rhs::Call { method, args, .. } = lets[0] else {
+            panic!("{lets:?}")
+        };
+        assert_eq!(method, "len");
+        assert!(args.is_empty());
+        let Rhs::Call { method, args, .. } = lets[1] else {
+            panic!("{lets:?}")
+        };
+        assert_eq!(method, "at");
+        assert_eq!(args, &[Rhs::Lit(Value::Int(-1))]);
+        let Rhs::Field { name, .. } = lets[2] else {
+            panic!("{lets:?}")
+        };
+        assert_eq!(name, "x");
+
+        let (n, d) = parse("#xs.at(i)");
+        assert!(d.is_empty(), "{d:?}");
+        let Node::Expr(Expr::Rhs(Rhs::Call { method, args, .. })) = &n[0] else {
+            panic!("{n:?}")
+        };
+        assert_eq!(method, "at");
+        assert_eq!(args, &[Rhs::Var("i".into())]);
     }
 
     #[test]
@@ -2640,6 +3285,105 @@ mod tests {
     }
 
     #[test]
+    fn image_args() {
+        let (n, d) = parse("#image(\"pic.jpg\", width: 100pt, height: 2cm)");
+        assert!(d.is_empty(), "{d:?}");
+        let Node::Expr(Expr::Func { name, args, content }) = &n[0] else {
+            panic!("{n:?}");
+        };
+        assert_eq!(name, "image");
+        assert!(content.is_none());
+        assert_eq!(args.len(), 3);
+        assert_eq!(args[0].name, None);
+        assert_eq!(args[0].value, Value::Str("pic.jpg".into()));
+        assert_eq!(args[1].name.as_deref(), Some("width"));
+        assert_eq!(args[1].value, Value::Length(Length::Pt(100.0)));
+        assert_eq!(args[2].name.as_deref(), Some("height"));
+        match args[2].value {
+            Value::Length(Length::Pt(p)) => assert!((p - 56.6929).abs() < 0.01, "{p}"),
+            ref other => panic!("{other:?}"),
+        }
+        let (n, d) = parse("#image(\"a.jpeg\", height: 12pt)");
+        assert!(d.is_empty(), "{d:?}");
+        let Node::Expr(Expr::Func { args, .. }) = &n[0] else {
+            panic!("{n:?}");
+        };
+        assert_eq!(args[0].value, Value::Str("a.jpeg".into()));
+        assert_eq!(args[1].name.as_deref(), Some("height"));
+    }
+
+    #[test]
+    fn let_functions() {
+        let (n, d) = parse("#let f(x) = x * 2");
+        assert!(d.is_empty(), "{d:?}");
+        assert_eq!(
+            n,
+            vec![Node::Expr(Expr::LetFn {
+                name: "f".into(),
+                params: vec![Param {
+                    name: "x".into(),
+                    default: None,
+                }],
+                body: Rhs::Bin {
+                    lhs: Box::new(Rhs::Var("x".into())),
+                    op: ArithOp::Mul,
+                    rhs: Box::new(Rhs::Lit(Value::Int(2))),
+                },
+            })]
+        );
+
+        let (n, d) = parse("#let f(name: \"Ada\") = name");
+        assert!(d.is_empty(), "{d:?}");
+        let Node::Expr(Expr::LetFn { params, .. }) = &n[0] else {
+            panic!("{n:?}")
+        };
+        assert_eq!(params[0].default, Some(Value::Str("Ada".into())));
+
+        let n = nodes("#let f(x) = x\n#f(1 + 2)");
+        let call = n.iter().find_map(|node| match node {
+            Node::Expr(Expr::Call { name, args, content }) => Some((name, args, content)),
+            _ => None,
+        });
+        let (name, args, content) = call.expect("call");
+        assert_eq!(name, "f");
+        assert!(content.is_none());
+        assert_eq!(args.len(), 1);
+        assert!(args[0].name.is_none());
+        assert_eq!(
+            args[0].value,
+            Rhs::Bin {
+                lhs: Box::new(Rhs::Lit(Value::Int(1))),
+                op: ArithOp::Add,
+                rhs: Box::new(Rhs::Lit(Value::Int(2))),
+            }
+        );
+
+        let n = nodes("#let f(x) = x\n#f[hi]");
+        let Node::Expr(Expr::Call { content, args, .. }) = n.last().unwrap() else {
+            panic!("{n:?}")
+        };
+        assert!(args.is_empty());
+        let c = content.as_ref().unwrap();
+        assert!(c.iter().any(|node| matches!(node, Node::Text(s) if s == "hi")));
+
+        let n = nodes("#let f(text) = [#text]\n#text");
+        let Node::Expr(Expr::LetFn { body, .. }) = &n[0] else {
+            panic!("{n:?}")
+        };
+        let Rhs::Lit(Value::Content(body)) = body else {
+            panic!("{body:?}")
+        };
+        assert!(body.iter().any(|node| matches!(
+            node,
+            Node::Expr(Expr::Var { name }) if name == "text"
+        )));
+        assert!(matches!(
+            n.last(),
+            Some(Node::Expr(Expr::Func { name, .. })) if name == "text"
+        ));
+    }
+
+    #[test]
     fn not_implemented() {
         let (n, d) = parse("$x^2$");
         assert!(n.is_empty());
@@ -2647,13 +3391,11 @@ mod tests {
         assert_eq!(d[0].severity, Severity::NotImplemented);
 
         for (src, what) in [
-            ("#image(\"x.png\")", "#image"),
             ("#figure[..]", "#figure"),
             ("1. item", "numbered"),
-            ("<lbl>", "labels"),
-            ("@lbl", "references"),
-            ("#let f(x) = x * 2", "function definition"),
             ("#show: it => it", "#show"),
+            ("#break", "#break"),
+            ("#continue", "#continue"),
         ] {
             let (_, d) = parse(src);
             assert!(!d.is_empty(), "{src}");
@@ -2675,6 +3417,12 @@ mod tests {
             "#let 1",
             "#let x",
             "#let x =",
+            "#let f(",
+            "#let f()",
+            "#let f() =",
+            "#let f(x: ) = 1",
+            "#let f(..) = 1",
+            "#let f((a)) = 1",
             "#set",
             "#set x",
             "\"",
@@ -2703,6 +3451,11 @@ mod tests {
             "a\\\r\nb",
             "- a\n- \n- c",
             "#strong[",
+            "#while",
+            "#while [",
+            "#if a and",
+            "#if (",
+            "#xs.len(",
             "\u{1f600} *é_ \u{4e2d}\u{6587}",
         ] {
             let _ = parse(src);

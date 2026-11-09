@@ -87,6 +87,11 @@ pub enum Node {
     Raw { text: String, block: bool },
     /// Explicit paragraph boundary (a blank line).
     Parbreak,
+    /// `<name>` label. Letters, digits, `_`, `-`, `.`. Eval attaches it
+    /// to the heading or block it follows; it is not rendered.
+    Label(String),
+    /// `@name` reference. Resolved against labels in this document.
+    Ref(String),
     /// A `#`-expression.
     Expr(Expr),
 }
@@ -106,6 +111,19 @@ pub enum Expr {
         args: Vec<Arg>,
         content: Option<Vec<Node>>,
     },
+    /// `#let name(params) = body`. A `[content]` body is stored as
+    /// `Rhs::Lit(Value::Content(..))`; anything else is an expression.
+    LetFn {
+        name: String,
+        params: Vec<Param>,
+        body: Rhs,
+    },
+    /// Call of a `#let` function. Builtin calls stay [`Expr::Func`].
+    Call {
+        name: String,
+        args: Vec<RhsArg>,
+        content: Option<Vec<Node>>,
+    },
     /// `#import "path"` / `#import "@preview/pkg:1.0.0": a, b` /
     /// `#import "x.typ": *`. `items` lists named bindings; `all` is the
     /// `*` wildcard; neither means the module binds under its file stem.
@@ -116,9 +134,11 @@ pub enum Expr {
     },
     /// `#if cond [..] else if cond [..] else [..]`.
     If {
-        arms: Vec<(Cmp, Vec<Node>)>,
+        arms: Vec<(Cond, Vec<Node>)>,
         els: Option<Vec<Node>>,
     },
+    /// `#while cond [..]` — body runs until `cond` is false.
+    While { cond: Cond, body: Vec<Node> },
     /// `#for x in expr [..]` — `vars` is 1 name, or 2 for `(k, v)` pairs.
     For {
         vars: Vec<String>,
@@ -129,6 +149,9 @@ pub enum Expr {
     Lit(Value),
     /// A simple binary expression in markup: `#a + b`, `#x * 2`.
     Bin { lhs: Rhs, op: ArithOp, rhs: Rhs },
+    /// An rhs rendered in markup that is not a name or binary
+    /// (`#xs.len()`, `#(xs.at(i))`). Field chains stay `Var`.
+    Rhs(Rhs),
 }
 
 /// Right-hand side of a binding, condition, or iteration.
@@ -147,6 +170,23 @@ pub enum Rhs {
         op: ArithOp,
         rhs: Box<Rhs>,
     },
+    /// `value.method(args)`. Field access stays `Field` (no paren).
+    Call {
+        recv: Box<Rhs>,
+        method: String,
+        args: Vec<Rhs>,
+    },
+}
+
+/// Boolean condition for `#if` / `#while` only.
+/// `not` binds tightest, then `and`, then `or`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Cond {
+    /// A comparison, or a bare value desugared to `x != none`.
+    Cmp(Cmp),
+    Not(Box<Cond>),
+    And(Box<Cond>, Box<Cond>),
+    Or(Box<Cond>, Box<Cond>),
 }
 
 /// Comparison in `#if`/`#while` conditions.
@@ -155,8 +195,6 @@ pub struct Cmp {
     pub lhs: Rhs,
     pub op: CmpOp,
     pub rhs: Rhs,
-    /// Unary `not` applied to the comparison.
-    pub negated: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -182,6 +220,20 @@ pub struct Arg {
     /// `None` for positional args, `Some(name)` for `name: value`.
     pub name: Option<String>,
     pub value: Value,
+}
+
+/// Parameter of `#let name(params)`. `default` is set for `name: literal`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Param {
+    pub name: String,
+    pub default: Option<Value>,
+}
+
+/// Argument of a user-function call. The value is an expression.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RhsArg {
+    pub name: Option<String>,
+    pub value: Rhs,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -305,6 +357,34 @@ pub enum Block {
         /// Draw cell borders (`#table` true, `#grid` false).
         stroke: bool,
     },
+    /// `#image`. `index` selects `Document::images`. `w` and `h` are the
+    /// laid-out size in pt; aspect ratio is already resolved.
+    Image { index: usize, w: f64, h: f64 },
+    /// `#box` / `#block`. The payload is boxed so a document that never
+    /// frames anything keeps the same `Block` size.
+    Framed(Box<Frame>),
+    /// `#stack`. `horizontal` is `dir: ltr`; otherwise children run down
+    /// the page (`dir: ttb`).
+    Stack {
+        horizontal: bool,
+        spacing: f64,
+        children: Vec<Block>,
+    },
+}
+
+/// Framed region shared by `Block::Framed` and inline `Inline::Frame`.
+/// `fill` is gray, 0 black .. 1 white. `stroke` is the border thickness
+/// in pt (`None` draws no border).
+#[derive(Debug, Clone)]
+pub struct Frame {
+    /// Outer width in pt. `None` shrinks to the content.
+    pub width: Option<f64>,
+    /// Stretch to the available measure. Set for `#block` without `width`.
+    pub expand: bool,
+    pub inset: f64,
+    pub fill: Option<f64>,
+    pub stroke: Option<f64>,
+    pub content: Vec<Inline>,
 }
 
 /// One bullet or enum item. `rest` stays empty on the flat-list path.
@@ -359,6 +439,11 @@ pub enum Inline {
     LineBreak,
     /// Explicit horizontal space in pt (`#h(..)`).
     HSpace(f64),
+    /// Unresolved `@name`. Eval replaces these before layout when the
+    /// document contains a reference; `name` has no `@`.
+    Ref { name: String, style: TextStyle },
+    /// Inline `#box` (no paragraph break in the content). `expand` is ignored.
+    Frame(Box<Frame>),
 }
 
 /// Font identities. The six base variants map to PDF base-14 faces;
@@ -424,6 +509,24 @@ pub struct Document {
     pub diags: Vec<Diag>,
     /// Dynamic fonts referenced by `FontId::Ext`, in registration order.
     pub fonts: Vec<FontUse>,
+    /// JPEGs referenced by `Block::Image` / `DrawItem::Image`.
+    /// Empty when the source contains no successfully loaded `#image`.
+    pub images: Vec<Image>,
+}
+
+/// JPEG file copied into the PDF as a `/DCTDecode` XObject. Pixel size
+/// comes from the SOF marker; the bytes are not decoded.
+#[derive(Debug, Clone)]
+pub struct Image {
+    pub bytes: Vec<u8>,
+    /// Intrinsic width in pixels.
+    pub width: u32,
+    /// Intrinsic height in pixels.
+    pub height: u32,
+    /// SOF sample precision (`/BitsPerComponent`).
+    pub bits: u8,
+    /// SOF component count: 1 gray, 3 RGB, 4 CMYK.
+    pub components: u8,
 }
 
 // ------------------- Display list (layout output) -------------------
@@ -571,6 +674,15 @@ pub enum DrawItem {
         w: f64,
         h: f64,
         gray: f64,
+    },
+    /// A JPEG XObject. `y` is the top edge in the same top-down space as
+    /// `Rule` (the PDF writer flips it). `index` selects `Document::images`.
+    Image {
+        x: f64,
+        y: f64,
+        w: f64,
+        h: f64,
+        index: usize,
     },
 }
 

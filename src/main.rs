@@ -127,7 +127,7 @@ fn cmd_build(args: &[String]) -> ExitCode {
     let t_layout = t.elapsed();
 
     let t = Instant::now();
-    let pdf_bytes = pdf::write_pdf(&pages, &doc.fonts);
+    let pdf_bytes = pdf::write_pdf(&pages, &doc.fonts, &doc.images);
     let t_pdf = t.elapsed();
 
     let t = Instant::now();
@@ -225,7 +225,7 @@ fn cmd_bench(args: &[String]) -> ExitCode {
         let pages = layout_doc(&doc);
         layout_ts.push(t.elapsed());
         let t = Instant::now();
-        let bytes = pdf::write_pdf(&pages, &doc.fonts);
+        let bytes = pdf::write_pdf(&pages, &doc.fonts, &doc.images);
         pdf_ts.push(t.elapsed());
         std::hint::black_box(bytes);
     }

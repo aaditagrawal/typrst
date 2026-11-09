@@ -31,10 +31,9 @@ parser recovers to the next paragraph boundary. Diagnostics from
   indented lines, and may contain inline markup. A missing colon is a
   warning and the line stays literal text. An indented `/` is literal
   (nested term lists are not supported).
-- `$..$` math, `#image`, `#figure`, `#footnote`, `#stack`, `#box`,
-  `#block`, `#show`, `#context`, numbering patterns, labels `<x>`,
-  references `@x`, `#while`, `#let f(x) = ...` function definitions →
-  `not implemented` diagnostics.
+- `$..$` math, `#figure`, `#footnote`, `#show`, `#context`,
+  numbering patterns, labels `<x>`, references `@x`, `#break`,
+  `#continue` → `not implemented` diagnostics.
 
 ## Expressions (`#expr`)
 
@@ -51,14 +50,46 @@ fractions `1fr` (table context only).
   TrueType face (`FontId::Ext`). Unknown families warn and fall back.
 - `#set par(justify: bool, leading: L, spacing: L)` — `leading` sets
   baseline-to-baseline = `size + leading` if < size else `leading`
-- `#let name = <expr>` — literal, variable, `mod.field`, or binary
-  arithmetic (`+ - * /` on numbers/lengths; `+` also concatenates
-  strings). Later `#name` substitutes the value.
+- `#let name = <expr>` — literal, variable, `mod.field`, method call,
+  or binary arithmetic (`+ - * /` on numbers/lengths; `+` also
+  concatenates strings and arrays). Later `#name` substitutes the
+  value. A later `#let` of the same name replaces the binding.
+- `#let name(params) = [content]` and `#let name(params) = expr` —
+  user functions. A parameter is `name` or `name: literal` (int, float,
+  string, length, bool, `none`). Calls are `#name(args)`,
+  `#name(args)[content]`, and `#name[content]`. Arguments are
+  expressions (literals, variables, fields, arithmetic, method calls).
+  Trailing content is the last positional argument, or binds to a
+  parameter named `body` when there is one. Positional arguments are
+  applied, then named; a missing required parameter or an unknown named
+  argument is an error, and defaults fill the rest. Content bodies
+  evaluate like `#for` bodies with the parameters in scope; expression
+  bodies use the `#let` arithmetic/field language. Calls recurse to
+  depth 64, then error. A call inside a paragraph flattens the body's
+  paragraph inlines into that paragraph; at block position, headings,
+  lists, tables, page breaks, and vertical space are spliced in; those
+  same block-level pieces are skipped with a diagnostic when the call
+  is inline. Builtin names (`#lorem`, `#text`, …) stay builtins. No
+  destructuring, sinks, spreads, or closures.
 - `#var` — bound variable; arrays/dicts render as `1, 2` / `(k: v)`.
 - `#a.b` — field access on dictionaries / imported modules.
-- `#if <cmp> [..] else if <cmp> [..] else [..]` — comparisons
-  `== != < <= > >=` on values, optional `not` prefix; bare `#if x`
-  tests truthiness (`x != none`, non-false, non-zero).
+- Method calls (`value.method(args)`; `value.field` is still a field):
+  - `len()` on array, dict, and string (string length in characters)
+  - `at(i)` on array and string. `i` is an integer literal or a
+    variable; negative indexes count from the end. Out of range is an
+    error and the value is `none`
+  - `first()` and `last()` on array
+  - `contains(v)` on array (element equality) and string (substring)
+  - any other method is an error and the value is `none`
+- `#if <cond> [..] else if <cond> [..] else [..]` — a condition is a
+  comparison (`== != < <= > >=`), a bare value (truthiness: not `none`,
+  not `false`, not zero), or those joined by `and`, `or`, and prefix
+  `not`. `and` binds tighter than `or`; `not` binds tighter than both.
+  Parentheses group a condition. This is not a general expression
+  language.
+- `#while <cond> [..]` — same conditions as `#if`. The body is
+  evaluated until the condition is false, at most 10000 times.
+  Exceeding the cap is an error and the loop stops.
 - `#for x in <array> [..]`, `#for (i, x) in <array> [..]` (index+elem),
   `#for (k, v) in <dict> [..]` (key+value) — body evaluated per item.
 - `#import "spec" [: a, b | : *]` — see Packages below.
@@ -72,6 +103,30 @@ fractions `1fr` (table context only).
   `#grid(columns: .., ..cells)` — column spec `auto`, length, or `Nfr`;
   cells are row-major positional args. Row/column spans are not
   supported.
+- `#image("path.jpg" | "path.jpeg", width: L, height: L)` — JPEG only.
+  The path is relative to the file. `width` and `height` are optional
+  lengths; setting one preserves aspect ratio, setting neither uses the
+  intrinsic pixel size as points (1 px = 1 pt). Other formats error.
+  The image is a block that occupies its height.
+- `#box(width: L, inset: L, fill: luma, stroke: L, outset: none)[content]`
+  — inline framed run. `width` defaults to the content width (capped at
+  the line); `inset` defaults to `0pt`. `fill` is a luma: float `0.0`
+  (black) ..= `1.0` (white), or an integer `0..=255` (0 black, 255
+  white). Omitted `fill` draws no background. `stroke` is the border
+  thickness in pt; omitted or `none` draws no border. `outset` accepts
+  only `none`. Content is inline markup. A heading, list, or table
+  inside the content is a `not implemented` diagnostic; the inline text
+  is still shown. A blank line inside the content promotes the box to
+  a block (still shrink-to-fit unless `width` is set).
+- `#block(...)[content]` — block-level frame with the same arguments.
+  It breaks the surrounding paragraph. `width` defaults to the full
+  text width. Blank lines inside the content become line breaks.
+- `#stack(dir: ttb|ltr, spacing: L)[a][b][c]` — `ttb` (default) stacks
+  children vertically with `spacing` between them (`0pt` default).
+  `ltr` places children in one row; each child's width is the available
+  width divided by the child count, unless that child is a box with an
+  explicit `width`. Children are the trailing content blocks and any
+  positional content arguments, in source order.
 - Unknown `#foo` → `not implemented` diagnostic, recover at end of the
   expression.
 
@@ -137,6 +192,10 @@ fractions `1fr` (table context only).
   internal line breaks, surrounded by block spacing.
 - Tables: cell inset 5pt/4pt, atomic-row pagination, 0.5pt borders when
   `stroke` is on (`#grid` defaults off).
+- Frames (`#box` / `#block`): content is flowed in the inner width
+  (`width - 2*inset`). A fill is a `Rule` inserted behind the text;
+  a stroke is four thin rules on the edges. `#stack(dir: ttb)` inserts
+  `spacing` between children; `dir: ltr` places them on one row.
 - Greedy line breaking at spaces; `justify` distributes slack across
   space widths.
 

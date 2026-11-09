@@ -349,7 +349,17 @@ impl<'a, M: FontMetrics> Lx<'a, M> {
                             for (k, l) in lines.iter().enumerate() {
                                 let (size, asc, _) = self.extents(&toks, *l, None);
                                 base += if k == 0 { asc } else { self.lh(size) };
-                                emit_line(&mut self.items, &toks, *l, cx + IX, base, 0.0, size);
+                                emit_line(
+                                    &mut self.items,
+                                    self.m,
+                                    self.st,
+                                    &toks,
+                                    *l,
+                                    cx + IX,
+                                    base,
+                                    0.0,
+                                    size,
+                                );
                             }
                         }
                         cx += widths[c];
@@ -373,6 +383,31 @@ impl<'a, M: FontMetrics> Lx<'a, M> {
                 self.after = 0.0;
             }
             Block::PageBreak => self.finish_page(),
+            Block::Image { index, w, h } => {
+                self.gap(0.0);
+                let limit = self.st.page_height - self.st.margin_bottom;
+                let mut top = if self.fresh {
+                    self.st.margin_top
+                } else {
+                    self.y + self.pending_gap
+                };
+                self.pending_gap = 0.0;
+                if !self.items.is_empty() && top + *h > limit {
+                    self.finish_page();
+                    top = self.st.margin_top;
+                }
+                self.items.push(DrawItem::Image {
+                    x: ml,
+                    y: top,
+                    w: *w,
+                    h: *h,
+                    index: *index,
+                });
+                self.y = top + *h;
+                self.fresh = false;
+                self.after = self.st.par_spacing;
+            }
+            Block::Framed(_) | Block::Stack { .. } => {}
         }
     }
 
@@ -475,7 +510,14 @@ impl<'a, M: FontMetrics> Lx<'a, M> {
                     w += self.m.str_width(style.font, style.size, text);
                 }
                 Inline::HSpace(g) => w += *g,
+                Inline::Ref { name, style } => {
+                    if name.as_bytes().contains(&b'\n') {
+                        return None;
+                    }
+                    w += self.m.str_width(style.font, style.size, name);
+                }
                 Inline::LineBreak => return None,
+                Inline::Frame(_) => {}
             }
         }
         Some(w)
@@ -484,7 +526,7 @@ impl<'a, M: FontMetrics> Lx<'a, M> {
     fn inline_size(&self, inl: &[Inline]) -> f64 {
         let mut s = self.st.font_size;
         for i in inl {
-            if let Inline::Text { style, .. } = i {
+            if let Inline::Text { style, .. } | Inline::Ref { style, .. } = i {
                 s = s.max(style.size);
             }
         }
@@ -509,7 +551,22 @@ impl<'a, M: FontMetrics> Lx<'a, M> {
                     x += w;
                 }
                 Inline::HSpace(g) => x += *g,
+                Inline::Ref { name, style } => {
+                    if name.is_empty() {
+                        continue;
+                    }
+                    let w = self.m.str_width(style.font, style.size, name);
+                    self.items.push(DrawItem::Text {
+                        x,
+                        y: baseline,
+                        font: style.font,
+                        size: style.size,
+                        text: InlineStr::from(name.as_str()),
+                    });
+                    x += w;
+                }
                 Inline::LineBreak => {}
+                Inline::Frame(_) => {}
             }
         }
     }
@@ -563,6 +620,18 @@ impl<'a, M: FontMetrics> Lx<'a, M> {
                         &mut marker,
                     );
                 }
+                Inline::Ref { name, style } => {
+                    self.feed_text(
+                        name,
+                        xf(*style),
+                        &mut cur,
+                        &mut held,
+                        &mut st,
+                        &mut meta,
+                        &g,
+                        &mut marker,
+                    );
+                }
                 Inline::LineBreak => {
                     self.park(
                         true,
@@ -577,6 +646,7 @@ impl<'a, M: FontMetrics> Lx<'a, M> {
                 Inline::HSpace(w) => {
                     self.push_gap(*w, &mut cur, &mut held, &mut st, &mut meta, &g, &mut marker);
                 }
+                Inline::Frame(_) => {}
             }
         }
         if st.has {
@@ -896,8 +966,14 @@ impl<'a, M: FontMetrics> Lx<'a, M> {
                         w = w.max(self.m.str_width(style.font, style.size, wd));
                     }
                 }
+                Inline::Ref { name, style } => {
+                    for wd in name.split_whitespace() {
+                        w = w.max(self.m.str_width(style.font, style.size, wd));
+                    }
+                }
                 Inline::HSpace(g) => w = w.max(*g),
                 Inline::LineBreak => {}
+                Inline::Frame(_) => {}
             }
         }
         w
@@ -1026,8 +1102,10 @@ fn take_run(
 /// Emit merged draw runs for one line of tokens starting at x on `baseline`.
 /// Adjacent same-style words merge into a single `DrawItem::Text`; `extra`
 /// is per-space justification stretch (0 for ragged-right).
-fn emit_line(
+fn emit_line<M: FontMetrics>(
     items: &mut Vec<DrawItem>,
+    _m: &M,
+    _styles: &Styles,
     toks: &[Tok],
     l: Line,
     mut x: f64,
@@ -1224,8 +1302,17 @@ fn tokenize<'a, M: FontMetrics, F: Fn(TextStyle) -> TextStyle>(
                     push_text_slow(toks, text, st, m);
                 }
             }
+            Inline::Ref { name, style } => {
+                let st = xf(*style);
+                if let Some(lut) = m.ascii_units(st.font) {
+                    push_text_lut(toks, name, st, lut, m);
+                } else {
+                    push_text_slow(toks, name, st, m);
+                }
+            }
             Inline::LineBreak => toks.push(Tok::B),
             Inline::HSpace(w) => toks.push(Tok::G(*w)),
+            Inline::Frame(_) => {}
         }
     }
 }
@@ -1343,6 +1430,7 @@ mod tests {
             blocks,
             diags: vec![],
             fonts: vec![],
+            images: vec![],
         }
     }
 
