@@ -22,12 +22,15 @@ const IMPLEMENTED: &[&str] = &[
     "box",
     "block",
     "stack",
+    "figure",
+    "outline",
+    "link",
 ];
 
 /// Bare `#word` forms that are recognized but not implemented (rather
 /// than treated as variable references, which unknown `#ident`s become).
 const NOT_IMPL_BARE: &[&str] = &[
-    "show", "context", "state", "counter", "place", "figure", "link", "ref", "else", "in", "not",
+    "show", "context", "state", "counter", "place", "ref", "else", "in", "not",
     "and", "or", "return", "break", "continue",
 ];
 
@@ -1071,7 +1074,9 @@ impl<'a> P<'a> {
         }
     }
 
-    /// `@name` reference.
+    /// `@name` reference. A `.` stays in the name only when another label
+    /// character follows it (`@fig.1`, `@a.b`, `@a..b`). Dots before
+    /// space, punctuation, or end of input stay in the text (`@intro.`).
     fn at_ref(&mut self, out: &mut Vec<Node>, text: &mut String) -> bool {
         let a = self.pos;
         let (name, end) = {
@@ -1079,6 +1084,11 @@ impl<'a> P<'a> {
             let mut i = a + 1;
             while i < s.len() && is_label(s[i]) {
                 i += 1;
+            }
+            // Typst uneats trailing `.` after the label scan, so `@intro..`
+            // is `intro` and both dots remain text.
+            while i > a + 1 && s[i - 1] == b'.' {
+                i -= 1;
             }
             if i > a + 1 {
                 (Some(self.src[a + 1..i].to_string()), i)
@@ -2611,6 +2621,29 @@ mod tests {
         assert!(n.iter().any(|x| matches!(x, Node::Label(s) if s == "a-b_c.d")));
         assert!(n.iter().any(|x| matches!(x, Node::Ref(s) if s == "a-b_c.d")));
         assert!(!nodes("<a:b>").iter().any(|x| matches!(x, Node::Label(_))));
+        // A dot is part of the name only when a label character follows it.
+        assert_eq!(
+            nodes("Dot @intro."),
+            vec![t("Dot "), Node::Ref("intro".into()), t(".")]
+        );
+        assert_eq!(
+            nodes("@intro.."),
+            vec![Node::Ref("intro".into()), t("..")]
+        );
+        assert_eq!(
+            nodes("@fig.1 @a.b. @a..b"),
+            vec![
+                Node::Ref("fig.1".into()),
+                t(" "),
+                Node::Ref("a.b".into()),
+                t(". "),
+                Node::Ref("a..b".into()),
+            ]
+        );
+        assert_eq!(
+            nodes("@details!"),
+            vec![Node::Ref("details".into()), t("!")]
+        );
     }
 
 
@@ -3418,7 +3451,7 @@ mod tests {
         assert_eq!(d[0].severity, Severity::NotImplemented);
 
         for (src, what) in [
-            ("#figure[..]", "#figure"),
+            ("#footnote[..]", "#footnote"),
             ("1. item", "numbered"),
             ("#show: it => it", "#show"),
             ("#break", "#break"),

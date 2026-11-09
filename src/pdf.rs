@@ -394,31 +394,57 @@ fn plan_for(font: FontId, fonts: &[FontUse]) -> Plan {
 
 /// All faces referenced by the display list: base-14 first (in
 /// `FontId::ALL` order), then Ext indices ascending.
-fn used_fonts(pages: &[Page]) -> Vec<FontId> {
+fn push_pdf_literal(out: &mut Vec<u8>, s: &str) {
+    out.push(b'(');
+    for b in s.bytes() {
+        match b {
+            b'\\' | b'(' | b')' => {
+                out.push(b'\\');
+                out.push(b);
+            }
+            c if (0x20..0x7f).contains(&c) => out.push(c),
+            c => {
+                out.push(b'\\');
+                out.push(b'0' + (c >> 6));
+                out.push(b'0' + ((c >> 3) & 7));
+                out.push(b'0' + (c & 7));
+            }
+        }
+    }
+    out.push(b')');
+}
+
+/// Faces referenced by the display list, plus how many link annotations
+/// each page has. The link count is a side tally of the same item walk.
+fn used_fonts(pages: &[Page]) -> (Vec<FontId>, Vec<u32>) {
     let mut base = [false; 6];
     let mut exts: Vec<u16> = Vec::new();
-    for p in pages {
+    let mut links = vec![0u32; pages.len()];
+    for (pi, p) in pages.iter().enumerate() {
         for i in &p.items {
-            if let DrawItem::Text { font, .. } = i {
-                match font {
+            match i {
+                DrawItem::Text { font, .. } => match font {
                     FontId::Ext(e) => exts.push(*e),
                     f => {
                         if let Some(k) = FontId::ALL.iter().position(|x| x == f) {
                             base[k] = true;
                         }
                     }
-                }
+                },
+                DrawItem::Link { .. } => links[pi] += 1,
+                DrawItem::Rule { .. } | DrawItem::Image { .. } => {}
             }
         }
     }
     exts.sort_unstable();
     exts.dedup();
-    FontId::ALL
+    let fonts = FontId::ALL
         .iter()
         .zip(base)
         .filter_map(|(&f, u)| u.then_some(f))
         .chain(exts.into_iter().map(FontId::Ext))
-        .collect()
+        .collect();
+    (fonts, links)
 }
 
 struct FMap {
@@ -458,7 +484,8 @@ fn fnum(map: &FMap, f: FontId) -> u64 {
 }
 
 pub fn write_pdf(pages: &[Page], fonts: &[FontUse], images: &[Image]) -> Vec<u8> {
-    let used = used_fonts(pages);
+    let (used, link_n) = used_fonts(pages);
+    let link_total: u32 = link_n.iter().copied().sum();
     let fmap = font_map(&used);
     let plans: Vec<Plan> = used.iter().map(|f| plan_for(*f, fonts)).collect();
 
@@ -474,6 +501,20 @@ pub fn write_pdf(pages: &[Page], fonts: &[FontUse], images: &[Image]) -> Vec<u8>
     let image_base = obj;
     if !images.is_empty() {
         obj += images.len();
+    }
+    // Annotation objects come last, and only when a page actually has one.
+    // An empty `/Annots` array is never written.
+    let mut annot_ids: Vec<Vec<u32>> = Vec::new();
+    if link_total > 0 {
+        annot_ids.resize(pages.len(), Vec::new());
+        for (pi, page) in pages.iter().enumerate() {
+            for item in &page.items {
+                if let DrawItem::Link { .. } = item {
+                    annot_ids[pi].push(obj as u32);
+                    obj += 1;
+                }
+            }
+        }
     }
     let nobj = obj - 1;
 
@@ -560,6 +601,7 @@ pub fn write_pdf(pages: &[Page], fonts: &[FontUse], images: &[Image]) -> Vec<u8>
                     push_uint(&mut content, *index as u64);
                     content.extend_from_slice(b" Do Q\n");
                 }
+                DrawItem::Link { .. } => {}
             }
         }
         begin(&mut out, 3 + 2 * i);
@@ -569,6 +611,17 @@ pub fn write_pdf(pages: &[Page], fonts: &[FontUse], images: &[Image]) -> Vec<u8>
         push_num(&mut out, page.height);
         out.push(b']');
         out.extend_from_slice(&res);
+        if link_total > 0 && !annot_ids[i].is_empty() {
+            out.extend_from_slice(b" /Annots [");
+            for (k, id) in annot_ids[i].iter().enumerate() {
+                if k > 0 {
+                    out.push(b' ');
+                }
+                push_uint(&mut out, *id as u64);
+                out.extend_from_slice(b" 0 R");
+            }
+            out.push(b']');
+        }
         writeln!(out, " /Contents {} 0 R >>", 4 + 2 * i).unwrap();
         out.extend_from_slice(b"endobj\n");
 
@@ -651,6 +704,29 @@ pub fn write_pdf(pages: &[Page], fonts: &[FontUse], images: &[Image]) -> Vec<u8>
             out.extend_from_slice(b"stream\n");
             out.extend_from_slice(&im.bytes);
             out.extend_from_slice(b"\nendstream\nendobj\n");
+        }
+    }
+
+    if link_total > 0 {
+        for (page, ids) in pages.iter().zip(annot_ids.iter()) {
+            let mut n = 0usize;
+            for item in &page.items {
+                if let DrawItem::Link { x, y, w, h, url } = item {
+                    begin(&mut out, ids[n] as usize);
+                    n += 1;
+                    out.extend_from_slice(b"<< /Type /Annot /Subtype /Link /Rect [");
+                    push_num(&mut out, *x);
+                    out.push(b' ');
+                    push_num(&mut out, page.height - *y - *h);
+                    out.push(b' ');
+                    push_num(&mut out, *x + *w);
+                    out.push(b' ');
+                    push_num(&mut out, page.height - *y);
+                    out.extend_from_slice(b"] /Border [0 0 0] /A << /S /URI /URI ");
+                    push_pdf_literal(&mut out, url.as_str());
+                    out.extend_from_slice(b" >> >>\nendobj\n");
+                }
+            }
         }
     }
 
@@ -957,5 +1033,35 @@ mod tests {
         assert!(has(&pdf, b"/BitsPerComponent 8"));
         assert!(has(&pdf, b"q 50 0 0 25 10 355 cm /Im0 Do Q\n"));
         assert!(has(&pdf, &jpeg));
+    }
+
+    #[test]
+    fn link_uri_and_plain_document_has_no_annot() {
+        let pages = vec![Page {
+            width: 200.0,
+            height: 200.0,
+            items: vec![
+                DrawItem::Text {
+                    x: 10.0,
+                    y: 30.0,
+                    font: FontId::Regular,
+                    size: 11.0,
+                    text: "docs".into(),
+                },
+                DrawItem::Link {
+                    x: 10.0,
+                    y: 20.0,
+                    w: 22.0,
+                    h: 12.0,
+                    url: "https://example.com".into(),
+                },
+            ],
+        }];
+        let pdf = write_pdf(&pages, &[], &[]);
+        assert!(has(&pdf, b"/URI"));
+        assert!(has(&pdf, b"https://example.com"));
+        assert!(has(&pdf, b"/Annots ["));
+        let plain = write_pdf(&sample_pages(), &[], &[]);
+        assert!(!has(&plain, b"/Annot"));
     }
 }

@@ -31,17 +31,22 @@ parser recovers to the next paragraph boundary. Diagnostics from
   indented lines, and may contain inline markup. A missing colon is a
   warning and the line stays literal text. An indented `/` is literal
   (nested term lists are not supported).
-- `$..$` math, `#figure`, `#footnote`, `#show`, `#context`,
+- `$..$` math, `#footnote`, `#show`, `#context`,
   `#break`, `#continue` → `not implemented` diagnostics.
 - `<ident>` labels (letters, digits, `_`, `-`, `.`). A label on the same
   line as a heading, or the next non-empty construct before another block,
   attaches to that heading. A label elsewhere attaches to the previous
   block. With no previous block it is an error. Labels do not cross
   `#import`.
-- `@ident` in inline text resolves to a label in the same document. It
-  renders as the heading number plus the heading's plain text when
-  numbering is on (`1.2 Introduction`), otherwise just the plain text.
-  An unknown label is a warning and renders the literal `@ident`.
+- `@ident` in inline text resolves to a label in the same document. A
+  `.` is part of the name only when another label character follows it
+  (`@fig.1`, `@a.b`); a dot before space, punctuation, or end of input
+  stays in the text (`@intro.` is the label `intro`). A numbered
+  heading renders as `Section` plus its number (`Section 1`,
+  `Section 1.1`) and not the title. A heading with no numbering is an
+  error (`cannot reference heading without numbering`) and contributes
+  no text. Any other label renders its stored text. An unknown label
+  is a warning and renders the literal `@ident`.
 
 ## Expressions (`#expr`)
 
@@ -51,6 +56,7 @@ comma required for 1-element), dictionaries `(a: 1, b: "x")`, column
 fractions `1fr` (table context only).
 
 - `#set page(paper: "a4" | "a5" | "us-letter", margin: L | (x: L, y: L) | (top: .., right: .., bottom: .., left: ..) | (rest: L), flipped: bool)`
+- `#set page(width: L, height: L)` — `pt`/`mm`/`cm`/`in`/`em` (`em` is the current font size). Setting one side leaves the other. `paper` still sets both. `flipped` swaps the final size. Unknown paper stays a warning.
 - `#set text(size: L, font: "..")` — `font` resolves through the font
   database: base-14 aliases (`times`, `courier`, `serif`, `mono`, `sans`,
   …) map to the built-in Times/Courier faces; any other family is looked
@@ -68,7 +74,13 @@ fractions `1fr` (table context only).
 - `#let name = <expr>` — literal, variable, `mod.field`, method call,
   or binary arithmetic (`+ - * /` on numbers/lengths; `+` also
   concatenates strings and arrays). Later `#name` substitutes the
-  value. A later `#let` of the same name replaces the binding.
+  value. Lookup walks from the innermost scope outward, and `#let`
+  binds in the current scope (a later `#let` of the same name in that
+  same scope replaces it). A content block (`#if` / `#while` / `#for`
+  body, function body, or bracket content passed as an argument) is a
+  nested scope, popped when the block finishes even if a diagnostic
+  fires, so a `#let` inside it shadows outer names and does not update
+  them, and `#for` loop variables are bindings in that body scope.
 - `#let name(params) = [content]` and `#let name(params) = expr` —
   user functions. A parameter is `name` or `name: literal` (int, float,
   string, length, bool, `none`). Calls are `#name(args)`,
@@ -78,8 +90,9 @@ fractions `1fr` (table context only).
   parameter named `body` when there is one. Positional arguments are
   applied, then named; a missing required parameter or an unknown named
   argument is an error, and defaults fill the rest. Content bodies
-  evaluate like `#for` bodies with the parameters in scope; expression
-  bodies use the `#let` arithmetic/field language. Calls recurse to
+  evaluate like `#for` bodies with the parameters in a scope frame
+  local to that call; expression bodies use the `#let`
+  arithmetic/field language. Calls recurse to
   depth 64, then error. A call inside a paragraph flattens the body's
   paragraph inlines into that paragraph; at block position, headings,
   lists, tables, page breaks, and vertical space are spliced in; those
@@ -104,9 +117,13 @@ fractions `1fr` (table context only).
   language.
 - `#while <cond> [..]` — same conditions as `#if`. The body is
   evaluated until the condition is false, at most 10000 times.
-  Exceeding the cap is an error and the loop stops.
+  Exceeding the cap is an error and the loop stops. The body is a
+  nested scope, so `#let n = n + 1` inside it does not change the `n`
+  the condition reads.
 - `#for x in <array> [..]`, `#for (i, x) in <array> [..]` (index+elem),
   `#for (k, v) in <dict> [..]` (key+value) — body evaluated per item.
+  Loop variables are bindings in that body scope; an outer name is
+  unchanged after the loop.
 - `#import "spec" [: a, b | : *]` — see Packages below.
 - `#include "file.typ"` — parses and evaluates the file inline.
 - `#lorem(n)` — n words of lorem ipsum text
@@ -142,6 +159,18 @@ fractions `1fr` (table context only).
   width divided by the child count, unless that child is a box with an
   explicit `width`. Children are the trailing content blocks and any
   positional content arguments, in source order.
+- `#figure(caption: [..])[body]` and `#figure([body], caption: [..])`.
+  The body is inline content or one block (paragraph, image, or table).
+  A caption line follows the body: `Figure N: ` plus the caption, at
+  0.9em and not bold, with a 4pt gap. N is a document counter starting
+  at 1. A `<label>` on the figure stores `Figure N` (no caption text).
+- `#link("url")[text]` and `#link("url", [text])` — inline content, drawn with a thin black underline. The PDF adds a URI annotation over that rectangle. No url is an error and the content is plain text. SVG underlines and skips the annotation.
+- `#outline()` takes no arguments. It emits one paragraph per heading
+  in the document, including headings that appear after the call and
+  headings inside figures. Each entry is the heading's laid-out text,
+  with the number prefix when numbering is on. Entries indent 12pt per
+  level below 1, with no dot leaders. An outline with no headings emits
+  nothing.
 - Unknown `#foo` → `not implemented` diagnostic, recover at end of the
   expression.
 

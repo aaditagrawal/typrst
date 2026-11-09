@@ -370,6 +370,23 @@ pub enum Block {
         spacing: f64,
         children: Vec<Block>,
     },
+    /// `#figure`. Boxed so a document that never calls `#figure` keeps
+    /// the same `Block` size. `caption` includes the `Figure N: ` prefix
+    /// when a caption was supplied.
+    Figure(Box<Fig>),
+    /// `#outline()` placeholder. Replaced with one paragraph per heading
+    /// before layout, and only when the document contains an outline.
+    Outline { style: TextStyle },
+}
+
+/// Body, caption, and counter for `Block::Figure`.
+#[derive(Debug, Clone)]
+pub struct Fig {
+    pub body: Vec<Block>,
+    pub caption: Vec<Inline>,
+    /// Document counter, starting at 1. A label on the figure stores
+    /// `Figure {number}` and nothing else.
+    pub number: u32,
 }
 
 /// Framed region shared by `Block::Framed` and inline `Inline::Frame`.
@@ -444,6 +461,15 @@ pub enum Inline {
     Ref { name: String, style: TextStyle },
     /// Inline `#box` (no paragraph break in the content). `expand` is ignored.
     Frame(Box<Frame>),
+    /// `#link`. Boxed so a document with no links keeps `Inline`'s size.
+    Link(Box<LinkRun>),
+}
+
+/// Visible text of a `#link`. `content` is inline only.
+#[derive(Debug, Clone)]
+pub struct LinkRun {
+    pub url: String,
+    pub content: Vec<Inline>,
 }
 
 /// Font identities. The six base variants map to PDF base-14 faces;
@@ -683,6 +709,17 @@ pub enum DrawItem {
         w: f64,
         h: f64,
         index: usize,
+    },
+    /// URI annotation. `y` is the top edge in the same top-down space as
+    /// `Rule`. The text and its underline are separate items; this one is
+    /// not painted. SVG ignores it. `url` reuses the short-string store so
+    /// the variant does not grow `DrawItem`.
+    Link {
+        x: f64,
+        y: f64,
+        w: f64,
+        h: f64,
+        url: InlineStr,
     },
 }
 

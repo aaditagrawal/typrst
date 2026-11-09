@@ -134,6 +134,7 @@ pub fn render(pages: &[Page], fonts: &[FontUse]) -> String {
                     )
                     .unwrap();
                 }
+                DrawItem::Link { .. } => {}
                 DrawItem::Image { x, y, w, h, .. } => {
                     writeln!(
                         s,

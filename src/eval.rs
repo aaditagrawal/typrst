@@ -103,6 +103,12 @@ pub fn eval(nodes: Vec<Node>, diags: &mut Vec<Diag>, env: &mut EvalEnv) -> Docum
     if ev.saw_ref {
         ev.resolve();
     }
+    // Headings after `#outline()` are included, so the entries are filled
+    // in a second walk. Documents that never call it pay for this check
+    // and nothing else. `#figure` only bumps a counter while it is called.
+    if ev.saw_outline {
+        fill_outlines(&mut ev.blocks);
+    }
     Document {
         styles: ev.st,
         blocks: ev.blocks,
@@ -133,16 +139,30 @@ pub fn eval_plain(nodes: Vec<Node>, diags: &mut Vec<Diag>, base_dir: &Path) -> D
     eval(nodes, diags, &mut env)
 }
 
-/// A `#let` function. The body is evaluated in the caller's scope with
-/// parameters bound over it.
+/// A `#let` function. Each call binds parameters in a fresh scope frame.
+/// A content body pushes another frame inside that one.
 struct UserFn {
     params: Vec<Param>,
     body: Rhs,
 }
 
+/// What `@name` renders. Non-heading labels keep a display string
+/// (a paragraph, or `Figure N`). A heading stores its section number,
+/// or `Unnumbered` when numbering is off.
+#[derive(Clone, Debug)]
+enum LabelTarget {
+    Text(String),
+    /// `1`, `1.1`, … without a pattern's decorative trailing dot.
+    Section(String),
+    Unnumbered,
+}
+
 struct Ev<'e, 'a> {
     st: Styles,
-    scope: HashMap<String, Value>,
+    /// Scope stack. Index 0 is the root document. Nested frames exist
+    /// only while a content block (`#if` / `#while` / `#for` body,
+    /// function body, bracket argument) is being evaluated.
+    scopes: Vec<HashMap<String, Value>>,
     diags: &'e mut Vec<Diag>,
     blocks: Vec<Block>,
     env: &'e mut EvalEnv<'a>,
@@ -157,13 +177,21 @@ struct Ev<'e, 'a> {
     numbering: Option<NumPat>,
     /// Per-level counters. Index 0 is heading level 1.
     hcount: [u32; 6],
-    /// Label name to the plain text of the block it attaches to.
-    /// Allocated only when a label is defined.
-    labels: Option<HashMap<String, String>>,
+    /// Label name to what `@name` renders. Allocated only when a label
+    /// is defined.
+    labels: Option<HashMap<String, LabelTarget>>,
     /// Labels seen inside the block currently being built.
     pending_labels: Vec<String>,
+    /// Section number of the heading just finished (`1`, `1.1`).
+    /// `None` when that heading has no numbering. Read only while the
+    /// last block is that heading.
+    heading_number: Option<String>,
     /// An `@ref` was emitted. Gates the single resolve walk.
     saw_ref: bool,
+    /// `#outline()` was evaluated. Gates the heading-collection walk.
+    saw_outline: bool,
+    /// `#figure` counter. Incremented only inside `do_figure`.
+    figures: u32,
     /// JPEGs loaded by `#image`, in document order.
     images: Vec<Image>,
     /// Directory stack for the file being evaluated. Empty means
@@ -178,9 +206,11 @@ struct Ev<'e, 'a> {
 
 impl<'e, 'a> Ev<'e, 'a> {
     fn new(diags: &'e mut Vec<Diag>, env: &'e mut EvalEnv<'a>) -> Self {
+        let mut scopes = Vec::with_capacity(2);
+        scopes.push(HashMap::new());
         Self {
             st: Styles::default(),
-            scope: HashMap::new(),
+            scopes,
             diags,
             blocks: Vec::new(),
             env,
@@ -191,7 +221,10 @@ impl<'e, 'a> Ev<'e, 'a> {
             hcount: [0; 6],
             labels: None,
             pending_labels: Vec::new(),
+            heading_number: None,
             saw_ref: false,
+            saw_outline: false,
+            figures: 0,
             images: Vec::new(),
             include_dirs: Vec::new(),
             fns: HashMap::new(),
@@ -255,18 +288,27 @@ impl<'e, 'a> Ev<'e, 'a> {
             }
             return;
         }
-        let text = plain_block(self.blocks.last().unwrap());
+        let target = self.label_target_of_last();
         let names = std::mem::take(&mut self.pending_labels);
         for name in names {
-            self.insert_label(name, text.clone());
+            self.insert_label(name, target.clone());
         }
     }
 
     /// A label node outside the block currently being built.
-    fn on_label(&mut self, name: String, out_empty: bool) {
-        if !out_empty {
+    ///
+    /// A run of only spaces is the padding the parser inserts around a
+    /// block-level call. When that run sits on a figure, the label
+    /// attaches to the figure (stored text `Figure N`), the same way a
+    /// label on the next line attaches to a heading.
+    fn on_label(&mut self, name: String, out: &mut Vec<Inline>) {
+        let onto_figure = pad_only(out) && matches!(self.blocks.last(), Some(Block::Figure(_)));
+        if !out.is_empty() && !onto_figure {
             self.pending_labels.push(name);
             return;
+        }
+        if onto_figure {
+            out.clear();
         }
         if self.blocks.is_empty() {
             self.diag(
@@ -275,15 +317,28 @@ impl<'e, 'a> Ev<'e, 'a> {
             );
             return;
         }
-        let text = plain_block(self.blocks.last().unwrap());
-        self.insert_label(name, text);
+        self.insert_label(name, self.label_target_of_last());
     }
 
-    fn insert_label(&mut self, name: String, text: String) {
+    /// Supplement for a label attached to the block just pushed.
+    /// Headings do not use their plain text: a numbered heading is
+    /// `Section {number}`, and an unnumbered one errors at the reference.
+    fn label_target_of_last(&self) -> LabelTarget {
+        match self.blocks.last() {
+            Some(Block::Heading { .. }) => match &self.heading_number {
+                Some(n) => LabelTarget::Section(n.clone()),
+                None => LabelTarget::Unnumbered,
+            },
+            Some(b) => LabelTarget::Text(plain_block(b)),
+            None => LabelTarget::Text(String::new()),
+        }
+    }
+
+    fn insert_label(&mut self, name: String, target: LabelTarget) {
         let dup = {
             let map = self.labels.get_or_insert_with(HashMap::new);
             let dup = map.contains_key(&name);
-            map.insert(name.clone(), text);
+            map.insert(name.clone(), target);
             dup
         };
         if dup {
@@ -297,10 +352,17 @@ impl<'e, 'a> Ev<'e, 'a> {
     }
 
     fn finish_heading(&mut self, level: u8, mut content: Vec<Inline>, st: TextStyle) {
-        if self.numbering.is_some() {
+        // Set before `push_block`: sealing a `<label>` in the heading
+        // body reads this. `None` must overwrite a previous heading so an
+        // unnumbered heading is not given the last number.
+        self.heading_number = if let Some(pat) = self.numbering {
             let prefix = self.heading_prefix(level);
+            let number = section_number(&prefix, pat.trailing_dot);
             content.insert(0, Inline::Text { text: prefix, style: st });
-        }
+            Some(number)
+        } else {
+            None
+        };
         self.push_block(Block::Heading { level, content });
     }
 
@@ -456,7 +518,7 @@ impl<'e, 'a> Ev<'e, 'a> {
                 self.flush(out);
                 self.push_block(Block::RawBlock { text });
             }
-            Node::Label(name) => self.on_label(name, out.is_empty()),
+            Node::Label(name) => self.on_label(name, out),
             Node::Ref(name) => {
                 let st = self.cur();
                 self.push_ref(name, st, out);
@@ -670,7 +732,7 @@ impl<'e, 'a> Ev<'e, 'a> {
                 self.flush(out);
                 self.push_block(Block::RawBlock { text: text.clone() });
             }
-            Node::Label(name) => self.on_label(name.clone(), out.is_empty()),
+            Node::Label(name) => self.on_label(name.clone(), out),
             Node::Ref(name) => {
                 let st = self.cur();
                 self.push_ref(name.clone(), st, out);
@@ -692,12 +754,49 @@ impl<'e, 'a> Ev<'e, 'a> {
         }
     }
 
+    /// Push a scope, run `f`, and pop it. Pop runs when `f` returns,
+    /// including after a diagnostic.
+    fn with_scope<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
+        self.scopes.push(HashMap::new());
+        let result = f(self);
+        self.scopes.pop();
+        debug_assert!(!self.scopes.is_empty());
+        result
+    }
+
+    /// `#let` / `#import` / loop-variable binding in the innermost scope.
+    /// A second bind of the same name in that scope replaces the slot.
+    #[inline]
+    fn bind(&mut self, name: String, value: Value) {
+        self.scopes.last_mut().expect("scope").insert(name, value);
+    }
+
+    /// Walk scopes from the innermost outward.
+    #[inline]
+    fn lookup(&self, name: &str) -> Option<&Value> {
+        for scope in self.scopes.iter().rev() {
+            if let Some(v) = scope.get(name) {
+                return Some(v);
+            }
+        }
+        None
+    }
+
+    /// Bracket content passed as an argument: its own scope.
+    fn scoped_inlines(&mut self, nodes: &[Node], st: TextStyle, out: &mut Vec<Inline>) {
+        self.with_scope(|this| inlines(nodes, st, out, this));
+    }
+
+    fn scoped_frame(&mut self, nodes: &[Node], st: TextStyle, out: &mut Vec<Inline>) -> bool {
+        self.with_scope(|this| this.frame_body(nodes, st, out))
+    }
+
     fn expr(&mut self, e: &Expr, out: &mut Vec<Inline>) {
         match e {
             Expr::Set { target, args } => self.do_set(target, args),
             Expr::Let { name, value } => {
                 if let Some(v) = self.rhs_val(value) {
-                    self.scope.insert(name.clone(), v);
+                    self.bind(name.clone(), v);
                 }
             }
             Expr::LetFn { name, params, body } => self.def_fn(name, params, body),
@@ -745,11 +844,11 @@ impl<'e, 'a> Ev<'e, 'a> {
 
     /// Resolve a variable name, walking `.field` segments through dicts.
     fn resolve_var(&mut self, name: &str) -> Option<Value> {
-        if let Some(v) = self.scope.get(name) {
+        if let Some(v) = self.lookup(name) {
             return Some(v.clone());
         }
         let mut parts = name.split('.');
-        let mut v = self.scope.get(parts.next()?)?.clone();
+        let mut v = self.lookup(parts.next()?)?.clone();
         for p in parts {
             match v {
                 Value::Dict(ps) => {
@@ -1093,12 +1192,12 @@ impl<'e, 'a> Ev<'e, 'a> {
     ) {
         for (c, body) in arms {
             if self.cond_val(c) {
-                self.run_body(body, st, out);
+                self.with_scope(|this| this.run_body(body, st, out));
                 return;
             }
         }
         if let Some(b) = els {
-            self.run_body(b, st, out);
+            self.with_scope(|this| this.run_body(b, st, out));
         }
     }
 
@@ -1118,7 +1217,7 @@ impl<'e, 'a> Ev<'e, 'a> {
                 return;
             }
             n += 1;
-            self.run_body(body, st, out);
+            self.with_scope(|this| this.run_body(body, st, out));
         }
     }
 
@@ -1165,28 +1264,21 @@ impl<'e, 'a> Ev<'e, 'a> {
         if vars.len() > 2 {
             self.diag(Severity::Warning, "#for accepts at most two variables");
         }
-        let saved: Vec<Option<Value>> = vars.iter().map(|v| self.scope.get(v).cloned()).collect();
+        // Loop variables live in the body scope. They do not write the
+        // outer binding of the same name.
         for item in items {
-            match item {
-                It::One(v) => {
-                    self.scope.insert(vars[0].clone(), v);
+            self.with_scope(|this| {
+                match item {
+                    It::One(v) => {
+                        this.bind(vars[0].clone(), v);
+                    }
+                    It::Two(k, v) => {
+                        this.bind(vars[0].clone(), k);
+                        this.bind(vars[1].clone(), v);
+                    }
                 }
-                It::Two(k, v) => {
-                    self.scope.insert(vars[0].clone(), k);
-                    self.scope.insert(vars[1].clone(), v);
-                }
-            }
-            self.run_body(body, st, out);
-        }
-        for (v, s) in vars.iter().zip(saved) {
-            match s {
-                Some(x) => {
-                    self.scope.insert(v.clone(), x);
-                }
-                None => {
-                    self.scope.remove(v);
-                }
-            }
+                this.run_body(body, st, out);
+            });
         }
     }
 
@@ -1254,7 +1346,10 @@ impl<'e, 'a> Ev<'e, 'a> {
                 sub.node(n, &mut o);
             }
             sub.flush(&mut o);
-            let mut entries: Vec<(String, Value)> = sub.scope.into_iter().collect();
+            // Only the module's root frame is exported. Bindings from
+            // content blocks inside the file stay in the frames that
+            // were popped around those blocks.
+            let mut entries: Vec<(String, Value)> = sub.scopes.swap_remove(0).into_iter().collect();
             entries.sort_by(|a, b| a.0.cmp(&b.0));
             Value::Dict(entries)
         };
@@ -1262,13 +1357,13 @@ impl<'e, 'a> Ev<'e, 'a> {
         let Value::Dict(entries) = dict else { return };
         if all {
             for (k, v) in entries {
-                self.scope.insert(k, v);
+                self.bind(k, v);
             }
         } else if !items.is_empty() {
             for it in items {
                 match entries.iter().find(|(k, _)| k == it) {
                     Some((_, v)) => {
-                        self.scope.insert(it.clone(), v.clone());
+                        self.bind(it.clone(), v.clone());
                     }
                     None => self.diag(
                         Severity::Warning,
@@ -1277,7 +1372,7 @@ impl<'e, 'a> Ev<'e, 'a> {
                 }
             }
         } else {
-            self.scope.insert(module_stem(spec), Value::Dict(entries));
+            self.bind(module_stem(spec), Value::Dict(entries));
         }
     }
 
@@ -1352,21 +1447,21 @@ impl<'e, 'a> Ev<'e, 'a> {
                 if let Some(c) = content {
                     let st = self.cur();
                     let f = self.vary(st.font, Some(true), None, None);
-                    inlines(c, with_font(st, f), out, self);
+                    self.scoped_inlines(c, with_font(st, f), out);
                 }
             }
             "emph" => {
                 if let Some(c) = content {
                     let st = self.cur();
                     let f = self.vary(st.font, None, Some(true), None);
-                    inlines(c, with_font(st, f), out, self);
+                    self.scoped_inlines(c, with_font(st, f), out);
                 }
             }
             "text" => {
                 let st = self.cur();
                 let st = text_style(args, st, self);
                 if let Some(c) = content {
-                    inlines(c, st, out, self);
+                    self.scoped_inlines(c, st, out);
                 }
             }
             "align" => {
@@ -1400,7 +1495,7 @@ impl<'e, 'a> Ev<'e, 'a> {
                 if let Some(c) = content {
                     let mut v = Vec::new();
                     let st = self.cur();
-                    inlines(c, st, &mut v, self);
+                    self.scoped_inlines(c, st, &mut v);
                     self.push_block(Block::Paragraph {
                         content: v,
                         align: al,
@@ -1428,10 +1523,58 @@ impl<'e, 'a> Ev<'e, 'a> {
             "image" => self.image(args, out),
             "box" | "block" => self.do_frame(name, args, content, out),
             "stack" => self.do_stack(args, content, out),
+            "figure" => self.do_figure(args, content, out),
+            "outline" => self.do_outline(args, content, out),
+            "link" => {
+                let st = self.cur();
+                self.do_link(args, content, st, out);
+            }
             _ => self.diag(
                 Severity::NotImplemented,
                 format!("function '#{name}' is not implemented"),
             ),
+        }
+    }
+
+    /// `#link(url)[text]` / `#link(url, [text])`. No url is an error and
+    /// the content is emitted as plain inline text.
+    fn do_link(
+        &mut self,
+        args: &[Arg],
+        content: Option<&[Node]>,
+        st: TextStyle,
+        out: &mut Vec<Inline>,
+    ) {
+        let mut url: Option<String> = None;
+        let mut body = Vec::new();
+        for a in args {
+            match a.name.as_deref() {
+                None => match &a.value {
+                    Value::Str(s) if url.is_none() => url = Some(s.clone()),
+                    Value::Content(ns) => self.scoped_inlines(ns, st, &mut body),
+                    Value::Str(_) => self.diag(Severity::Warning, "extra link url ignored"),
+                    _ => self.diag(Severity::Warning, "link argument ignored"),
+                },
+                Some("dest") | Some("url") => match &a.value {
+                    Value::Str(s) => url = Some(s.clone()),
+                    _ => self.diag(Severity::Warning, "link url expects a string"),
+                },
+                Some(other) => {
+                    self.diag(Severity::Warning, format!("link argument '{other}' ignored"))
+                }
+            }
+        }
+        if let Some(c) = content {
+            self.scoped_inlines(c, st, &mut body);
+        }
+        match url {
+            Some(u) if !u.is_empty() => {
+                out.push(Inline::Link(Box::new(LinkRun { url: u, content: body })))
+            }
+            _ => {
+                self.diag(Severity::Error, "#link expects a url");
+                out.append(&mut body);
+            }
         }
     }
 
@@ -1512,17 +1655,86 @@ impl<'e, 'a> Ev<'e, 'a> {
         });
     }
 
-    /// Evaluate `nodes` into blocks without mixing them into the parent list.
-    fn capture_blocks(&mut self, nodes: &[Node]) -> Vec<Block> {
-        let saved = std::mem::take(&mut self.blocks);
-        let mut inline = Vec::new();
-        for n in nodes {
-            self.node(n, &mut inline);
+    /// `#figure(caption: [..])[body]` and `#figure([body], caption: [..])`.
+    /// The counter advances only here. Body blocks are captured with the
+    /// normal walk so a heading inside the figure stays a heading.
+    fn do_figure(&mut self, args: &[Arg], content: Option<&[Node]>, out: &mut Vec<Inline>) {
+        self.flush(out);
+        let mut caption: Option<&[Node]> = None;
+        let mut bodies: Vec<&[Node]> = Vec::new();
+        for a in args {
+            match a.name.as_deref() {
+                Some("caption") => match &a.value {
+                    Value::Content(ns) => caption = Some(ns),
+                    Value::None => {}
+                    _ => self.diag(Severity::Warning, "figure caption expects content"),
+                },
+                Some(other) => {
+                    self.diag(Severity::Warning, format!("figure argument '{other}' ignored"))
+                }
+                None => match &a.value {
+                    Value::Content(ns) => bodies.push(ns),
+                    _ => self.diag(Severity::Warning, "figure positional argument ignored"),
+                },
+            }
         }
-        self.flush(&mut inline);
-        let produced = std::mem::take(&mut self.blocks);
-        self.blocks = saved;
-        produced
+        if let Some(c) = content {
+            bodies.push(c);
+        }
+        let mut body = Vec::new();
+        for g in bodies {
+            body.extend(self.capture_blocks(g));
+        }
+        self.figures = self.figures.saturating_add(1);
+        let number = self.figures;
+        let mut cap_inl = Vec::new();
+        if let Some(ns) = caption {
+            let st = self.cur();
+            let cap = TextStyle {
+                font: st.font,
+                size: self.st.font_size * 0.9,
+            };
+            cap_inl.push(Inline::Text {
+                text: format!("Figure {number}: "),
+                style: cap,
+            });
+            self.scoped_inlines(ns, cap, &mut cap_inl);
+        }
+        self.push_block(Block::Figure(Box::new(Fig {
+            body,
+            caption: cap_inl,
+            number,
+        })));
+    }
+
+    /// `#outline()`. Entries are filled after the document is evaluated
+    /// so headings that follow the call are included.
+    fn do_outline(&mut self, args: &[Arg], content: Option<&[Node]>, out: &mut Vec<Inline>) {
+        self.flush(out);
+        if !args.is_empty() || content.is_some() {
+            self.diag(Severity::Warning, "outline arguments are ignored");
+        }
+        self.saw_outline = true;
+        let style = self.cur();
+        self.push_block(Block::Outline { style });
+    }
+
+    /// Evaluate `nodes` into blocks without mixing them into the parent list.
+    /// Each stack child is bracket content, so it gets its own scope.
+    fn capture_blocks(&mut self, nodes: &[Node]) -> Vec<Block> {
+        self.with_scope(|this| {
+            let saved = std::mem::take(&mut this.blocks);
+            let saved_num = this.heading_number.take();
+            let mut inline = Vec::new();
+            for n in nodes {
+                this.node(n, &mut inline);
+            }
+            this.flush(&mut inline);
+            let produced = std::mem::take(&mut this.blocks);
+            this.blocks = saved;
+            this.heading_number = saved_num;
+            produced
+        })
     }
 
     fn read_frame(
@@ -1575,7 +1787,7 @@ impl<'e, 'a> Ev<'e, 'a> {
                 }
                 None => match &a.value {
                     Value::Content(ns) => {
-                        if self.frame_body(ns, st, &mut inl) {
+                        if self.scoped_frame(ns, st, &mut inl) {
                             blocky = true;
                         }
                     }
@@ -1584,7 +1796,7 @@ impl<'e, 'a> Ev<'e, 'a> {
             }
         }
         if let Some(c) = content {
-            if self.frame_body(c, st, &mut inl) {
+            if self.scoped_frame(c, st, &mut inl) {
                 blocky = true;
             }
         }
@@ -1726,7 +1938,7 @@ impl<'e, 'a> Ev<'e, 'a> {
                     for a in args {
                         if a.name.is_none() {
                             if let Value::Content(ns) = &a.value {
-                                let _ = self.frame_body(ns, st, out);
+                                let _ = self.scoped_frame(ns, st, out);
                                 out.push(Inline::LineBreak);
                             }
                         }
@@ -1739,12 +1951,12 @@ impl<'e, 'a> Ev<'e, 'a> {
                         format!("#{name} inside a frame is not implemented"),
                     );
                     if let Some(c) = content {
-                        let _ = self.frame_body(c, st, out);
+                        let _ = self.scoped_frame(c, st, out);
                     }
                     for a in args {
                         if a.name.is_none() {
                             if let Value::Content(ns) = &a.value {
-                                let _ = self.frame_body(ns, st, out);
+                                let _ = self.scoped_frame(ns, st, out);
                             }
                         }
                     }
@@ -1944,6 +2156,14 @@ impl<'e, 'a> Ev<'e, 'a> {
                     _ => self.diag(Severity::Warning, "flipped expects a boolean"),
                 },
                 Some("margin") => self.set_margin(&a.value),
+                Some("width") => match val_pt(&a.value, self.st.font_size) {
+                    Some(p) => self.st.page_width = p,
+                    None => self.diag(Severity::Warning, "page width expects a length"),
+                },
+                Some("height") => match val_pt(&a.value, self.st.font_size) {
+                    Some(p) => self.st.page_height = p,
+                    None => self.diag(Severity::Warning, "page height expects a length"),
+                },
                 Some(other) => self.diag(
                     Severity::Warning,
                     format!("page argument '{other}' ignored"),
@@ -2162,24 +2382,14 @@ impl<'e, 'a> Ev<'e, 'a> {
             return;
         }
         self.fn_depth += 1;
-        let saved: Vec<(String, Option<Value>)> = bound
-            .iter()
-            .map(|(k, _)| (k.clone(), self.scope.get(k).cloned()))
-            .collect();
-        for (k, v) in &bound {
-            self.scope.insert(k.clone(), v.clone());
-        }
-        self.exec_user_body(&func.body, st, out);
-        for (k, prev) in saved {
-            match prev {
-                Some(v) => {
-                    self.scope.insert(k, v);
-                }
-                None => {
-                    self.scope.remove(&k);
-                }
+        // Parameters live in this frame only. The manual save/restore
+        // is gone so a body `#let` cannot write through it into the caller.
+        self.with_scope(|this| {
+            for (k, v) in bound {
+                this.bind(k, v);
             }
-        }
+            this.exec_user_body(&func.body, st, out);
+        });
         self.fn_depth -= 1;
     }
 
@@ -2210,17 +2420,20 @@ impl<'e, 'a> Ev<'e, 'a> {
     /// (the pending paragraph is only newline padding). Otherwise flatten
     /// paragraph inlines into the surrounding paragraph.
     fn place_nodes(&mut self, nodes: &[Node], st: Option<TextStyle>, out: &mut Vec<Inline>) {
-        if let Some(st) = st {
-            inlines(nodes, st, out, self);
-            return;
-        }
-        if pad_only(out) {
-            out.clear();
-            self.run_body(nodes, None, out);
-        } else {
-            let st = self.cur();
-            inlines(nodes, st, out, self);
-        }
+        // Function body (content) is a nested scope inside the parameter frame.
+        self.with_scope(|this| {
+            if let Some(st) = st {
+                inlines(nodes, st, out, this);
+                return;
+            }
+            if pad_only(out) {
+                out.clear();
+                this.run_body(nodes, None, out);
+            } else {
+                let st = this.cur();
+                inlines(nodes, st, out, this);
+            }
+        });
     }
     fn set_heading(&mut self, args: &[Arg]) {
         for a in args {
@@ -2290,11 +2503,24 @@ fn parse_numpat(s: &str) -> Option<NumPat> {
     }
 }
 
+/// Counter chain from `heading_prefix`, without the separating space
+/// and without a numbering pattern's decorative trailing dot.
+/// `"1.1 "` → `"1.1"`, `"1. "` → `"1"`.
+fn section_number(prefix: &str, trailing_dot: bool) -> String {
+    let n = prefix.strip_suffix(' ').unwrap_or(prefix);
+    if trailing_dot {
+        n.strip_suffix('.').unwrap_or(n).to_string()
+    } else {
+        n.to_string()
+    }
+}
+
 fn plain_inlines(v: &[Inline], s: &mut String) {
     for i in v {
         match i {
             Inline::Text { text, .. } => s.push_str(text),
             Inline::Frame(f) => plain_inlines(&f.content, s),
+            Inline::Link(link) => plain_inlines(&link.content, s),
             _ => {}
         }
     }
@@ -2350,6 +2576,7 @@ fn plain_block(b: &Block) -> String {
         }
         Block::RawBlock { text } => s.push_str(text),
         Block::Framed(f) => plain_inlines(&f.content, &mut s),
+        Block::Figure(f) => return format!("Figure {}", f.number),
         Block::Stack { children, .. } => {
             for c in children {
                 if !s.is_empty() && !s.ends_with(' ') {
@@ -2365,12 +2592,16 @@ fn plain_block(b: &Block) -> String {
 
 fn resolve_inlines(
     v: &mut [Inline],
-    labels: Option<&HashMap<String, String>>,
+    labels: Option<&HashMap<String, LabelTarget>>,
     diags: &mut Vec<Diag>,
 ) {
     for i in v.iter_mut() {
         if let Inline::Frame(f) = i {
             resolve_inlines(&mut f.content, labels, diags);
+            continue;
+        }
+        if let Inline::Link(link) = i {
+            resolve_inlines(&mut link.content, labels, diags);
             continue;
         }
         if !matches!(i, Inline::Ref { .. }) {
@@ -2380,7 +2611,16 @@ fn resolve_inlines(
             continue;
         };
         let text = match labels.and_then(|m| m.get(&name)) {
-            Some(t) => t.clone(),
+            Some(LabelTarget::Text(t)) => t.clone(),
+            Some(LabelTarget::Section(n)) => format!("Section {n}"),
+            Some(LabelTarget::Unnumbered) => {
+                diags.push(Diag::new(
+                    Severity::Error,
+                    None,
+                    "cannot reference heading without numbering",
+                ));
+                String::new()
+            }
             None => {
                 diags.push(Diag::new(
                     Severity::Warning,
@@ -2396,7 +2636,7 @@ fn resolve_inlines(
 
 fn resolve_item(
     it: &mut ListItem,
-    labels: Option<&HashMap<String, String>>,
+    labels: Option<&HashMap<String, LabelTarget>>,
     diags: &mut Vec<Diag>,
 ) {
     resolve_inlines(&mut it.content, labels, diags);
@@ -2414,7 +2654,7 @@ fn resolve_item(
 
 fn resolve_refs(
     blocks: &mut [Block],
-    labels: Option<&HashMap<String, String>>,
+    labels: Option<&HashMap<String, LabelTarget>>,
     diags: &mut Vec<Diag>,
 ) {
     for b in blocks {
@@ -2440,9 +2680,85 @@ fn resolve_refs(
             }
             Block::Framed(f) => resolve_inlines(&mut f.content, labels, diags),
             Block::Stack { children, .. } => resolve_refs(children, labels, diags),
+            Block::Figure(f) => {
+                resolve_refs(&mut f.body, labels, diags);
+                resolve_inlines(&mut f.caption, labels, diags);
+            }
             _ => {}
         }
     }
+}
+
+/// Second walk for `#outline()`. Collects every heading (including ones
+/// inside figures and stacks), then replaces each placeholder. Not called
+/// unless the document evaluated an outline.
+fn fill_outlines(blocks: &mut Vec<Block>) {
+    let mut heads = Vec::new();
+    collect_headings(blocks, &mut heads);
+    expand_outlines(blocks, &heads);
+}
+
+fn collect_headings(blocks: &[Block], out: &mut Vec<(u8, String)>) {
+    for b in blocks {
+        match b {
+            Block::Heading { level, content } => {
+                let mut s = String::new();
+                plain_inlines(content, &mut s);
+                out.push((*level, s.trim().to_string()));
+            }
+            Block::Figure(f) => collect_headings(&f.body, out),
+            Block::Stack { children, .. } => collect_headings(children, out),
+            _ => {}
+        }
+    }
+}
+
+fn expand_outlines(blocks: &mut Vec<Block>, heads: &[(u8, String)]) {
+    let mut i = 0;
+    while i < blocks.len() {
+        let style = match &blocks[i] {
+            Block::Outline { style } => Some(*style),
+            Block::Figure(_) | Block::Stack { .. } => None,
+            _ => {
+                i += 1;
+                continue;
+            }
+        };
+        if let Some(style) = style {
+            let paras = outline_paras(heads, style);
+            let n = paras.len();
+            blocks.splice(i..i + 1, paras);
+            i += n;
+            continue;
+        }
+        match &mut blocks[i] {
+            Block::Figure(f) => expand_outlines(&mut f.body, heads),
+            Block::Stack { children, .. } => expand_outlines(children, heads),
+            _ => {}
+        }
+        i += 1;
+    }
+}
+
+fn outline_paras(heads: &[(u8, String)], style: TextStyle) -> Vec<Block> {
+    heads
+        .iter()
+        .map(|(level, text)| {
+            let mut content = Vec::with_capacity(2);
+            let indent = 12.0 * (*level as f64 - 1.0);
+            if indent > 0.0 {
+                content.push(Inline::HSpace(indent));
+            }
+            content.push(Inline::Text {
+                text: text.clone(),
+                style,
+            });
+            Block::Paragraph {
+                content,
+                align: HAlign::Left,
+            }
+        })
+        .collect()
 }
 
 
@@ -2764,7 +3080,7 @@ fn inline_expr(e: &Expr, st: TextStyle, out: &mut Vec<Inline>, cx: &mut Ev) {
         Expr::Set { target, args } => cx.do_set(target, args),
         Expr::Let { name, value } => {
             if let Some(v) = cx.rhs_val(value) {
-                cx.scope.insert(name.clone(), v);
+                cx.bind(name.clone(), v);
             }
         }
         Expr::LetFn { name, params, body } => cx.def_fn(name, params, body),
@@ -2805,19 +3121,19 @@ fn inline_expr(e: &Expr, st: TextStyle, out: &mut Vec<Inline>, cx: &mut Ev) {
             "strong" => {
                 if let Some(c) = content {
                     let f = cx.vary(st.font, Some(true), None, None);
-                    inlines(c, with_font(st, f), out, cx);
+                    cx.scoped_inlines(c, with_font(st, f), out);
                 }
             }
             "emph" => {
                 if let Some(c) = content {
                     let f = cx.vary(st.font, None, Some(true), None);
-                    inlines(c, with_font(st, f), out, cx);
+                    cx.scoped_inlines(c, with_font(st, f), out);
                 }
             }
             "text" => {
                 let st2 = text_style(args, st, cx);
                 if let Some(c) = content {
-                    inlines(c, st2, out, cx);
+                    cx.scoped_inlines(c, st2, out);
                 }
             }
             "include" => {
@@ -2837,6 +3153,7 @@ fn inline_expr(e: &Expr, st: TextStyle, out: &mut Vec<Inline>, cx: &mut Ev) {
                     None => cx.diag(Severity::Error, "#include expects a string path"),
                 }
             }
+            "link" => cx.do_link(args, content.as_deref(), st, out),
             "box" => {
                 let (spec, inl, _) = cx.read_frame(name, args, content.as_deref(), st);
                 out.push(Inline::Frame(Box::new(Frame {
@@ -2849,7 +3166,7 @@ fn inline_expr(e: &Expr, st: TextStyle, out: &mut Vec<Inline>, cx: &mut Ev) {
                 })));
             }
             "lorem" | "pagebreak" | "v" | "align" | "table" | "grid" | "image" | "block"
-            | "stack" => cx.diag(
+            | "stack" | "figure" | "outline" => cx.diag(
                 Severity::NotImplemented,
                 format!("'#{name}' is block-level; ignored inside inline content"),
             ),
@@ -2875,7 +3192,7 @@ fn value_inline(v: &Value, st: TextStyle, out: &mut Vec<Inline>, cx: &mut Ev) {
                 style: st,
             });
         }
-        Value::Content(ns) => inlines(ns, st, out, cx),
+        Value::Content(ns) => cx.scoped_inlines(ns, st, out),
         Value::Bool(_) | Value::None => {}
     }
 }
@@ -2962,6 +3279,7 @@ mod tests {
                 match i {
                     Inline::Text { text, .. } => s.push_str(text),
                     Inline::Frame(f) => walk(&f.content, s),
+                    Inline::Link(link) => walk(&link.content, s),
                     _ => {}
                 }
             }
@@ -2990,6 +3308,10 @@ mod tests {
                 Block::Table { cells, .. } => cells.iter().for_each(|c| walk(c, s)),
                 Block::Framed(f) => walk(&f.content, s),
                 Block::Stack { children, .. } => children.iter().for_each(|c| walk_block(c, s)),
+                Block::Figure(f) => {
+                    f.body.iter().for_each(|c| walk_block(c, s));
+                    walk(&f.caption, s);
+                }
                 _ => {}
             }
         }
@@ -3238,6 +3560,123 @@ mod tests {
     }
 
     #[test]
+    fn page_width_and_height() {
+        let (doc, d) = run_src("#set page(width: 200pt, height: 100pt)", Path::new("."));
+        assert!(d.is_empty(), "{d:?}");
+        assert_eq!(doc.styles.page_width, 200.0);
+        assert_eq!(doc.styles.page_height, 100.0);
+
+        let (doc, d) = run_src("#set page(width: 180pt)", Path::new("."));
+        assert!(d.is_empty(), "{d:?}");
+        assert_eq!(doc.styles.page_width, 180.0);
+        assert_eq!(doc.styles.page_height, 841.890);
+
+        let (doc, _) = run_src("#set page(height: 400pt)", Path::new("."));
+        assert_eq!(doc.styles.page_width, 595.276);
+        assert_eq!(doc.styles.page_height, 400.0);
+
+        // flipped runs after width and height, so it swaps the result.
+        let (doc, d) = run_src(
+            "#set page(width: 200pt, height: 100pt, flipped: true)",
+            Path::new("."),
+        );
+        assert!(d.is_empty(), "{d:?}");
+        assert_eq!(doc.styles.page_width, 100.0);
+        assert_eq!(doc.styles.page_height, 200.0);
+
+        let (doc, _) = run_src("#set page(width: 200pt, flipped: true)", Path::new("."));
+        assert_eq!(doc.styles.page_width, 841.890);
+        assert_eq!(doc.styles.page_height, 200.0);
+
+        let (doc, _) = run_src(
+            "#set text(size: 10pt)\n#set page(width: 12em, height: 20em)",
+            Path::new("."),
+        );
+        assert_eq!(doc.styles.page_width, 120.0);
+        assert_eq!(doc.styles.page_height, 200.0);
+
+        let (doc, _) = run_src("#set page(width: 100mm)", Path::new("."));
+        assert!((doc.styles.page_width - 283.465).abs() < 1e-6);
+        assert_eq!(doc.styles.page_height, 841.890);
+
+        let (doc, d) = run_src("#set page(width: 100pt, paper: \"tabloid\")", Path::new("."));
+        assert!(d.iter().any(|x| x.severity == Severity::Warning && x.message.contains("tabloid")));
+        assert_eq!(doc.styles.page_width, 100.0);
+        assert_eq!(doc.styles.page_height, 841.890);
+
+        let (doc, _) = run_src("#set page(paper: \"a5\", width: 100pt)", Path::new("."));
+        assert_eq!(doc.styles.page_width, 100.0);
+        assert_eq!(doc.styles.page_height, 595.28);
+    }
+
+    #[test]
+    fn link_text_and_missing_url() {
+        let (doc, d) = run_src("#link(\"https://example.com\")[docs]", Path::new("."));
+        assert!(d.is_empty(), "{d:?}");
+        let Block::Paragraph { content, .. } = &doc.blocks[0] else {
+            panic!("{:?}", doc.blocks)
+        };
+        let Inline::Link(link) = &content[0] else {
+            panic!("{content:?}")
+        };
+        assert_eq!(link.url, "https://example.com");
+        assert_eq!(all_text(&doc), "docs");
+
+        let (doc, d) = run_src("#link(\"https://example.com\", [more])", Path::new("."));
+        assert!(d.is_empty(), "{d:?}");
+        assert_eq!(all_text(&doc), "more");
+        let Block::Paragraph { content, .. } = &doc.blocks[0] else {
+            panic!("{:?}", doc.blocks)
+        };
+        assert!(matches!(&content[0], Inline::Link(link) if link.url == "https://example.com"));
+
+        let (doc, d) = run_src("#link[plain]", Path::new("."));
+        assert!(d.iter().any(|x| x.severity == Severity::Error && x.message.contains("url")));
+        assert!(matches!(
+            doc.blocks.first(),
+            Some(Block::Paragraph { content, .. })
+                if matches!(content.first(), Some(Inline::Text { text, .. }) if text == "plain")
+        ));
+
+        let (doc, d) = run_src("See #link(\"https://example.com\")[docs] now", Path::new("."));
+        assert!(d.is_empty(), "{d:?}");
+        let pages = crate::layout::layout(&doc, &crate::font::Afm);
+        let link = pages[0].items.iter().find_map(|i| match i {
+            DrawItem::Link { url, w, .. } => Some((url.as_str(), *w)),
+            _ => None,
+        });
+        let Some((url, w)) = link else {
+            panic!("no annotation: {:?}", pages[0].items)
+        };
+        assert_eq!(url, "https://example.com");
+        assert!(w > 0.0);
+        assert!(pages[0].items.iter().any(|i| matches!(
+            i,
+            DrawItem::Rule { gray, w: rw, .. } if *gray == 0.0 && *rw > 0.0
+        )));
+        let pdf = crate::pdf::write_pdf(&pages, &[], &[]);
+        let bytes = pdf.as_slice();
+        assert!(bytes.windows(4).any(|c| c == b"/URI"));
+        assert!(bytes.windows(19).any(|c| c == b"https://example.com"));
+        let plain = crate::pdf::write_pdf(
+            &[crate::ir::Page {
+                width: doc.styles.page_width,
+                height: doc.styles.page_height,
+                items: vec![DrawItem::Text {
+                    x: 10.0,
+                    y: 20.0,
+                    font: FontId::Regular,
+                    size: 11.0,
+                    text: "hi".into(),
+                }],
+            }],
+            &[],
+            &[],
+        );
+        assert!(!plain.windows(6).any(|c| c == b"/Annot"));
+    }
+
+    #[test]
     fn eval_let_and_var() {
         let (doc, d) = run(vec![
             letv("x", Rhs::Lit(Value::Str("hi".into()))),
@@ -3404,18 +3843,38 @@ mod tests {
 
     #[test]
     fn eval_while_accumulates() {
+        // A `#let` in the body shadows `n` and `s`. The condition keeps
+        // reading the outer zeros, so the loop hits the iteration cap
+        // and the outer bindings stay put.
         let (doc, d) = run_src(
             "#let n = 0\n#let s = \"\"\n#while n < 3 [\n#let s = s + \"z\"\n#let n = n + 1\n]\n#s#n",
             Path::new("."),
         );
-        assert!(d.is_empty(), "{d:?}");
-        assert_eq!(all_text(&doc).trim(), "zzz3");
+        assert!(
+            d.iter()
+                .any(|x| x.severity == Severity::Error && x.message.contains("10000")),
+            "{d:?}"
+        );
+        assert_eq!(all_text(&doc).trim(), "0");
+        assert!(!all_text(&doc).contains('z'), "{}", all_text(&doc));
     }
 
     #[test]
     fn eval_while_paragraphs() {
+        // A counted loop cannot advance a `#while` condition with `#let`.
+        // Paragraph breaks inside a repeating body are covered by `#for`,
+        // which uses the same body walk. A false `#while` emits nothing.
+        let (doc, d) = run_src("#while false [\nP\n\n]\n", Path::new("."));
+        assert!(d.is_empty(), "{d:?}");
+        assert!(
+            !doc.blocks.iter().any(|b| matches!(b, Block::Paragraph { .. })),
+            "{:?}",
+            doc.blocks
+        );
+        // The blank line is followed by a `#let` so the parser keeps the
+        // paragraph break (a `]` immediately after the gap would swallow it).
         let (doc, d) = run_src(
-            "#let n = 0\n#while n < 3 [\nP\n\n#let n = n + 1\n]",
+            "#for n in (1, 2, 3) [\nP\n\n#let x = n\n]",
             Path::new("."),
         );
         assert!(d.is_empty(), "{d:?}");
@@ -3435,10 +3894,25 @@ mod tests {
 
     #[test]
     fn eval_while_cap() {
-        // 10001 would-be iterations: the body runs 10000 times (n ends
-        // at 10000) and the next true condition is an error.
+        let (_doc, d) = run_src("#while true [ ]", Path::new("."));
+        assert!(
+            d.iter()
+                .any(|x| x.severity == Severity::Error && x.message.contains("10000")),
+            "{d:?}"
+        );
+        assert_eq!(
+            d.iter().filter(|x| x.severity == Severity::Error).count(),
+            1,
+            "{d:?}"
+        );
+    }
+
+    #[test]
+    fn eval_while_let_shadows() {
+        // Typst rejects this as an infinite loop: the inner `#let`
+        // shadows `n` and the condition keeps seeing 0.
         let (doc, d) = run_src(
-            "#let n = 0\n#while n < 10001 [\n#let n = n + 1\n]\n#n",
+            "#let n = 0\n#while n < 3 [\n  #let n = n + 1\n  tick #n\n]\n",
             Path::new("."),
         );
         assert!(
@@ -3446,7 +3920,83 @@ mod tests {
                 .any(|x| x.severity == Severity::Error && x.message.contains("10000")),
             "{d:?}"
         );
-        assert_eq!(all_text(&doc).trim(), "10000");
+        let text = all_text(&doc);
+        assert_eq!(text.matches("tick").count(), 10000, "{text}");
+        assert!(text.contains("tick 1"), "{text}");
+        assert!(!text.contains("tick 2"), "{text}");
+        assert!(!text.contains("tick 3"), "{text}");
+    }
+
+    #[test]
+    fn eval_if_let_does_not_leak() {
+        let (doc, d) = run_src(
+            concat!(
+                "#let n = 10\n",
+                "#if true [#let n = 1 #let n = n + 1 #n]\n",
+                "|#n|\n",
+                "#if false [no] else [#let n = 4 #n]\n",
+                "|#n|\n",
+                "#let n = n + 1\n",
+                "|#n|\n",
+            ),
+            Path::new("."),
+        );
+        assert!(d.is_empty(), "{d:?}");
+        assert_eq!(
+            all_text(&doc).split_whitespace().collect::<Vec<_>>(),
+            ["2", "|10|", "4", "|10|", "|11|"]
+        );
+
+        // A diagnostic inside the body still pops the frame.
+        let (doc, d) = run_src(
+            "#let n = 1\n#if true [#let n = 9 #missing]\n#n",
+            Path::new("."),
+        );
+        assert!(
+            d.iter().any(|x| x.severity == Severity::Warning && x.message.contains("missing")),
+            "{d:?}"
+        );
+        assert_eq!(all_text(&doc).trim(), "1");
+
+        // Bracket content passed as an argument is its own scope.
+        let (doc, d) = run_src(
+            "#let n = 1\n#strong[#let n = 8 #n]\n|#n|\n#box[#let n = 6 #n]\n|#n|",
+            Path::new("."),
+        );
+        assert!(d.is_empty(), "{d:?}");
+        assert_eq!(
+            all_text(&doc).split_whitespace().collect::<Vec<_>>(),
+            ["8", "|1|", "6", "|1|"]
+        );
+    }
+
+    #[test]
+    fn eval_for_binding_is_local() {
+        let (doc, d) = run_src(
+            concat!(
+                "#let x = 7\n",
+                "#for x in (1, 2, 3) [#x]\n",
+                "|#x|\n",
+                "#for x in (1, 2) [#let x = x + 10 #x]\n",
+                "|#x|\n",
+            ),
+            Path::new("."),
+        );
+        assert!(d.is_empty(), "{d:?}");
+        assert_eq!(
+            all_text(&doc).split_whitespace().collect::<Vec<_>>(),
+            ["123", "|7|", "11", "12", "|7|"]
+        );
+    }
+
+    #[test]
+    fn eval_fn_param_is_local() {
+        let (doc, d) = run_src(
+            "#let n = 1\n#let f(n) = [#let n = n + 10 #n]\n#f(3)|#n|",
+            Path::new("."),
+        );
+        assert!(d.is_empty(), "{d:?}");
+        assert_eq!(all_text(&doc).split_whitespace().collect::<Vec<_>>(), ["13|1|"]);
     }
 
     #[test]
@@ -3474,12 +4024,24 @@ mod tests {
             ["Y", "N", "Y", "N", "N", "Y", "N", "Y", "Y", "Y", "N"]
         );
 
+        // A combinator that is already false never enters the body.
+        // One that stays true hits the iteration cap (`#let` cannot
+        // update the binding the condition reads).
         let (doc, d) = run_src(
-            "#let n = 0\n#let s = \"\"\n#while n < 5 and not n == 3 [\n#let s = s + \"x\"\n#let n = n + 1\n]\n#s#n",
+            "#let n = 0\n#while n < 5 and not n == 0 [nope]",
             Path::new("."),
         );
         assert!(d.is_empty(), "{d:?}");
-        assert_eq!(all_text(&doc).trim(), "xxx3");
+        assert!(!all_text(&doc).contains("nope"), "{}", all_text(&doc));
+        let (_doc, d) = run_src(
+            "#let n = 0\n#while n < 5 and not n == 3 []",
+            Path::new("."),
+        );
+        assert!(
+            d.iter()
+                .any(|x| x.severity == Severity::Error && x.message.contains("10000")),
+            "{d:?}"
+        );
     }
 
     #[test]
@@ -3628,6 +4190,41 @@ mod tests {
         std::fs::write(dir.join("b.typ"), "#import \"a.typ\"\n#let y = 2").unwrap();
         let (_doc, d) = run_src("#import \"a.typ\"", &dir);
         assert!(d.iter().any(|x| x.message.contains("cyclic")), "{d:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn eval_import_stays_in_scope() {
+        let dir = std::env::temp_dir().join(format!("typrst-impscope-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("lib.typ"), "#let greeting = \"hello\"\n").unwrap();
+        std::fs::write(
+            dir.join("nested.typ"),
+            "#let shown = 1\n#if true [#let hidden = 2]\n",
+        )
+        .unwrap();
+
+        // An import inside a content block binds in that frame.
+        let (doc, d) = run_src(
+            "#if true [\n#import \"lib.typ\": greeting\n#greeting\n]\n#greeting",
+            &dir,
+        );
+        assert!(
+            d.iter().any(|x| x.severity == Severity::Warning && x.message.contains("greeting")),
+            "{d:?}"
+        );
+        assert!(all_text(&doc).contains("hello"), "{}", all_text(&doc));
+        assert_eq!(all_text(&doc).matches("hello").count(), 1, "{}", all_text(&doc));
+
+        // A `#let` inside a content block is not a module-level binding.
+        let (doc, d) = run_src("#import \"nested.typ\": *\n#shown #hidden", &dir);
+        assert!(
+            d.iter().any(|x| x.severity == Severity::Warning && x.message.contains("hidden")),
+            "{d:?}"
+        );
+        assert!(all_text(&doc).contains('1'), "{}", all_text(&doc));
+        assert!(!all_text(&doc).contains('2'), "{}", all_text(&doc));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3935,11 +4532,69 @@ mod tests {
             "See @intro before\n= Introduction <intro>\n\n= Next\n<next>\nAlso @next here\n",
             Path::new("."),
         );
-        assert!(d.is_empty(), "{d:?}");
+        let errs = d
+            .iter()
+            .filter(|x| {
+                x.severity == Severity::Error
+                    && x.message.contains("cannot reference heading without numbering")
+            })
+            .count();
+        assert_eq!(errs, 2, "{d:?}");
         assert_eq!(heading_words(&doc), vec!["Introduction", "Next"]);
         let text = all_text(&doc);
-        assert!(text.contains("See Introduction before"), "{text}");
-        assert!(text.contains("Also Next here"), "{text}");
+        // The headings stay; the references contribute no text.
+        assert!(text.contains("See "), "{text}");
+        assert!(text.contains(" before"), "{text}");
+        assert!(!text.contains("See Introduction"), "{text}");
+        assert!(text.contains("Also "), "{text}");
+        assert!(!text.contains("Also Next"), "{text}");
+        assert!(!text.contains("@intro") && !text.contains("@next"), "{text}");
+    }
+
+    #[test]
+    fn heading_ref_is_section_number() {
+        let (doc, d) = run_src(
+            "#set heading(numbering: \"1.1\")\n= Introduction <intro>\n== Details <details>\nSpace @intro next\nBang @details!\nDot @intro.\n",
+            Path::new("."),
+        );
+        assert!(d.is_empty(), "{d:?}");
+        assert_eq!(
+            heading_words(&doc),
+            vec!["1 Introduction", "1.1 Details"]
+        );
+        let text = all_text(&doc);
+        assert!(text.contains("Space Section 1 next"), "{text}");
+        assert!(text.contains("Bang Section 1.1!"), "{text}");
+        assert!(text.contains("Dot Section 1."), "{text}");
+        assert!(!text.contains("Section 1 Introduction"), "{text}");
+        assert!(!text.contains("Section 1.1 Details"), "{text}");
+        assert!(!text.contains("@intro"), "{text}");
+
+        // A pattern's trailing dot stays on the heading, not the reference.
+        let (doc, d) = run_src(
+            "#set heading(numbering: \"1.\")\n= Introduction <intro>\n== Details <details>\n@intro / @details\n",
+            Path::new("."),
+        );
+        assert!(d.is_empty(), "{d:?}");
+        assert_eq!(heading_words(&doc), vec!["1. Introduction", "1.1. Details"]);
+        let see = doc
+            .blocks
+            .iter()
+            .rev()
+            .find_map(|b| match b {
+                Block::Paragraph { content, .. } => Some(text_of(content)),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(see.trim(), "Section 1 / Section 1.1");
+
+        // A label that is not a heading keeps the stored display string.
+        // The blank line ends the paragraph so `<note>` attaches to it.
+        let (doc, d) = run_src("Hello there.\n\n<note>\nSee @note end\n", Path::new("."));
+        assert!(d.is_empty(), "{d:?}");
+        let text = all_text(&doc);
+        assert!(text.contains("See Hello there. end"), "{text}");
+        assert!(!text.contains("@note"), "{text}");
     }
 
     #[test]
@@ -3965,6 +4620,10 @@ mod tests {
         );
         let text = all_text(&doc);
         assert!(text.contains("1 One 1.1 Two 1.1.1 Three"), "{text}");
+        assert!(
+            text.contains("Section 1 Section 1.1 Section 1.1.1"),
+            "{text}"
+        );
 
         let (doc, d) = run_src(
             "#set heading(numbering: \"1.\")\n= A\n== B\n#set heading(numbering: \"1.1.1\")\n= C\n",
@@ -4014,8 +4673,17 @@ mod tests {
         );
         assert!(all_text(&doc).contains("@secret"), "{}", all_text(&doc));
         let (doc, d) = run_src("#include \"part.typ\"\nSee @ch\n", &dir);
-        assert!(d.is_empty(), "{d:?}");
-        assert!(all_text(&doc).contains("Chapter"), "{}", all_text(&doc));
+        assert!(
+            d.iter().any(|x| {
+                x.severity == Severity::Error
+                    && x.message.contains("cannot reference heading without numbering")
+            }),
+            "{d:?}"
+        );
+        let text = all_text(&doc);
+        assert!(text.contains("Chapter"), "{text}");
+        assert!(!text.contains("See Chapter"), "{text}");
+        assert!(!text.contains("@ch"), "{text}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -4068,6 +4736,179 @@ mod tests {
             d.iter().all(|x| !x.message.contains("fill")),
             "{d:?}"
         );
+    }
+
+    fn figures_of(doc: &Document) -> Vec<&Fig> {
+        doc.blocks
+            .iter()
+            .filter_map(|b| match b {
+                Block::Figure(f) => Some(f.as_ref()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn figure_counter_caption_and_label() {
+        let (doc, d) = run_src(
+            "#figure(caption: [First])[Alpha] <fig>\n#figure([Beta], caption: [Second])\n#figure(caption: [Grid])[#table(columns: 1, [cell])]\nSee @fig here\n",
+            Path::new("."),
+        );
+        assert!(d.is_empty(), "{d:?}");
+        let figs = figures_of(&doc);
+        assert_eq!(figs.len(), 3, "{:?}", doc.blocks);
+        assert_eq!(figs[0].number, 1);
+        assert_eq!(figs[1].number, 2);
+        assert_eq!(figs[2].number, 3);
+        assert_eq!(text_of(&figs[0].caption), "Figure 1: First");
+        assert_eq!(text_of(&figs[1].caption), "Figure 2: Second");
+        let Block::Paragraph { content, .. } = &figs[0].body[0] else {
+            panic!("{:?}", figs[0].body);
+        };
+        assert_eq!(text_of(content).trim(), "Alpha");
+        let Block::Paragraph { content, .. } = &figs[1].body[0] else {
+            panic!("{:?}", figs[1].body);
+        };
+        assert_eq!(text_of(content).trim(), "Beta");
+        assert!(matches!(figs[2].body.last(), Some(Block::Table { .. })));
+        assert!(all_text(&doc).contains("cell"));
+
+        let Inline::Text { text, style } = &figs[0].caption[0] else {
+            panic!("{:?}", figs[0].caption);
+        };
+        assert_eq!(text, "Figure 1: ");
+        assert_eq!(style.font, FontId::Regular);
+        assert!((style.size - 11.0 * 0.9).abs() < 1e-9, "{}", style.size);
+        let Inline::Text { style, .. } = &figs[0].caption[1] else {
+            panic!("{:?}", figs[0].caption);
+        };
+        assert_eq!(style.font, FontId::Regular);
+        assert!((style.size - 11.0 * 0.9).abs() < 1e-9);
+
+        let see = doc
+            .blocks
+            .iter()
+            .rev()
+            .find_map(|b| match b {
+                Block::Paragraph { content, .. } => Some(text_of(content)),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(see.trim(), "See Figure 1 here");
+
+        let pages = crate::layout::layout(&doc, &crate::font::Afm);
+        let mut body_y = None;
+        let mut cap_y = None;
+        let mut cap_size = None;
+        let mut cap_font = None;
+        for it in &pages[0].items {
+            if let DrawItem::Text { y, font, size, text, .. } = it {
+                if text.as_str().contains("Alpha") {
+                    body_y = Some(*y);
+                }
+                if text.as_str().contains("Figure 1:") {
+                    cap_y = Some(*y);
+                    cap_size = Some(*size);
+                    cap_font = Some(*font);
+                }
+            }
+        }
+        let body_y = body_y.expect("body");
+        let cap_y = cap_y.expect("caption");
+        let size = cap_size.unwrap();
+        assert_eq!(cap_font, Some(FontId::Regular));
+        assert!((size - 11.0 * 0.9).abs() < 1e-6, "{size}");
+        let lh = size * doc.styles.line_height / doc.styles.font_size;
+        assert!(
+            (cap_y - body_y - lh - 4.0).abs() < 1e-6,
+            "body {body_y} caption {cap_y} lh {lh}"
+        );
+
+        let (doc, d) = run_src(
+            "#figure(caption: [Cap])[Body]\n<fig>\nSee @fig here\n",
+            Path::new("."),
+        );
+        assert!(d.is_empty(), "{d:?}");
+        let see = doc
+            .blocks
+            .iter()
+            .rev()
+            .find_map(|b| match b {
+                Block::Paragraph { content, .. } => Some(text_of(content)),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(see.trim(), "See Figure 1 here");
+    }
+
+    #[test]
+    fn figure_image_body() {
+        let dir = std::env::temp_dir().join(format!("typrst-fig-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.jpg"), tiny_jpeg(0xC0, 32, 16, 3)).unwrap();
+        let (doc, d) = run_src(
+            "#figure(caption: [Pic])[#image(\"a.jpg\")]\n",
+            &dir,
+        );
+        assert!(d.is_empty(), "{d:?}");
+        let figs = figures_of(&doc);
+        assert_eq!(figs.len(), 1);
+        assert!(matches!(
+            figs[0].body.last(),
+            Some(Block::Image { w, h, .. }) if (*w - 32.0).abs() < 1e-9 && (*h - 16.0).abs() < 1e-9
+        ));
+        assert_eq!(text_of(&figs[0].caption), "Figure 1: Pic");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn outline_numbers_indent_and_later_headings() {
+        let (doc, d) = run_src(
+            "#set heading(numbering: \"1.1\")\n= Alpha\n#outline()\n== Beta\n#figure(caption: [Pic])[\n= Inside\n]\n",
+            Path::new("."),
+        );
+        assert!(d.is_empty(), "{d:?}");
+        let paras: Vec<_> = doc
+            .blocks
+            .iter()
+            .filter_map(|b| match b {
+                Block::Paragraph { content, .. } => Some(content),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(paras.len(), 3, "{:?}", doc.blocks);
+        assert_eq!(text_of(paras[0]).trim(), "1 Alpha");
+        assert_eq!(text_of(paras[1]).trim(), "1.1 Beta");
+        assert_eq!(text_of(paras[2]).trim(), "2 Inside");
+        assert!(
+            !paras.iter().any(|c| text_of(c).contains("....")),
+            "dot leaders"
+        );
+        assert!(matches!(paras[1][0], Inline::HSpace(w) if (w - 12.0).abs() < 1e-9));
+        assert!(!matches!(paras[0][0], Inline::HSpace(_)));
+
+        let pages = crate::layout::layout(&doc, &crate::font::Afm);
+        let mut x1 = None;
+        let mut x2 = None;
+        for it in &pages[0].items {
+            if let DrawItem::Text { x, font, size, text, .. } = it {
+                if *font == FontId::Regular && (*size - 11.0).abs() < 1e-6 {
+                    if text.as_str().contains("Alpha") {
+                        x1 = Some(*x);
+                    }
+                    if text.as_str().contains("Beta") {
+                        x2 = Some(*x);
+                    }
+                }
+            }
+        }
+        let x1 = x1.expect("level 1");
+        let x2 = x2.expect("level 2");
+        assert!((x2 - x1 - 12.0).abs() < 1e-6, "x1 {x1} x2 {x2}");
+
+        let (empty, d) = run_src("#outline()\n", Path::new("."));
+        assert!(d.is_empty(), "{d:?}");
+        assert!(empty.blocks.is_empty(), "{:?}", empty.blocks);
     }
 
 

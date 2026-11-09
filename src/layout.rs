@@ -13,6 +13,10 @@ enum Tok<'a> {
     B,
     /// Unbreakable framed run. Width is the outer width in pt.
     F(&'a Inline, f64),
+    /// Start of a `#link`. Zero width; the url borrows the document.
+    Ls(&'a str),
+    /// End of a `#link`. Zero width.
+    Le,
 }
 
 /// One token of the line being filled. A word records its parent string
@@ -25,6 +29,10 @@ enum Atom<'a> {
     /// words still matches by copy and a document with no frames never
     /// touches the frame list.
     F(u32),
+    /// Start of a `#link`. Zero width, so the character loop is unchanged.
+    Ls(&'a str),
+    /// End of a `#link`.
+    Le,
 }
 
 struct St {
@@ -119,6 +127,7 @@ pub fn layout<M: FontMetrics>(doc: &Document, metrics: &M) -> Vec<Page> {
         held: Vec::new(),
         frames: Vec::new(),
         term_prefix: None,
+        link_carry: None,
     };
     for b in &doc.blocks {
         lx.block(b);
@@ -148,6 +157,9 @@ struct Lx<'a, M: FontMetrics> {
     /// Term-list label drawn with the first line's marker slot. Paragraphs
     /// and bullet lists leave it `None`; the check lives in that slot.
     term_prefix: Option<&'a [Inline]>,
+    /// URL still open from the previous line of this paragraph. `None`
+    /// unless a link wrapped, so a document with no links never walks it.
+    link_carry: Option<&'a str>,
 }
 
 impl<'a, M: FontMetrics> Lx<'a, M> {
@@ -379,6 +391,7 @@ impl<'a, M: FontMetrics> Lx<'a, M> {
                             let (toks, lines) =
                                 self.cell_lines(&cells[i], (widths[c] - 2.0 * IX).max(0.0));
                             let mut base = top + IY;
+                            let mut carry = None;
                             for (k, l) in lines.iter().enumerate() {
                                 let (size, asc, _) = self.extents(&toks, *l, None);
                                 base += if k == 0 { asc } else { self.lh(size) };
@@ -392,6 +405,7 @@ impl<'a, M: FontMetrics> Lx<'a, M> {
                                     base,
                                     0.0,
                                     size,
+                                    &mut carry,
                                 );
                             }
                         }
@@ -462,7 +476,30 @@ impl<'a, M: FontMetrics> Lx<'a, M> {
                     }
                 }
             }
+            Block::Figure(f) => self.lay_figure(f, ml, avail),
+            // Filled before layout when the document has an outline.
+            Block::Outline { .. } => {}
         }
+    }
+
+    /// Body, then the caption line 4pt below it. The caption inlines
+    /// already carry the 0.9em face.
+    fn lay_figure(&mut self, f: &'a Fig, ml: f64, avail: f64) {
+        let had_body = !f.body.is_empty();
+        for c in &f.body {
+            self.place(c, ml, avail);
+        }
+        if f.caption.is_empty() {
+            return;
+        }
+        if had_body && !self.fresh {
+            self.after = 0.0;
+            self.pending_gap = 4.0;
+        } else if !self.fresh {
+            self.gap(0.0);
+        }
+        self.flow(&f.caption, ml, avail, HAlign::Left, false, None, &ident);
+        self.after = self.st.par_spacing;
     }
 
     fn lay_frame(&mut self, f: &'a Frame, x: f64, avail: f64) {
@@ -645,6 +682,7 @@ impl<'a, M: FontMetrics> Lx<'a, M> {
                     w += self.m.str_width(style.font, style.size, name);
                 }
                 Inline::LineBreak => return None,
+                Inline::Link(link) => w += self.inline_width(&link.content)?,
                 Inline::Frame(f) => {
                     if let Some(fw) = f.width {
                         w += fw;
@@ -664,13 +702,14 @@ impl<'a, M: FontMetrics> Lx<'a, M> {
             match i {
                 Inline::Text { style, .. } | Inline::Ref { style, .. } => s = s.max(style.size),
                 Inline::Frame(f) => s = s.max(self.inline_size(&f.content)),
+                Inline::Link(link) => s = s.max(self.inline_size(&link.content)),
                 _ => {}
             }
         }
         s
     }
 
-    fn paint_prefix(&mut self, runs: &[Inline], mut x: f64, baseline: f64) {
+    fn paint_prefix(&mut self, runs: &[Inline], mut x: f64, baseline: f64) -> f64 {
         for r in runs {
             match r {
                 Inline::Text { text, style } => {
@@ -710,8 +749,24 @@ impl<'a, M: FontMetrics> Lx<'a, M> {
                     self.paint_prefix(&f.content, x + f.inset, baseline);
                     x += adv;
                 }
+                Inline::Link(link) => {
+                    let x0 = x;
+                    let at = self.items.len();
+                    let url = link.url.as_str();
+                    x = self.paint_prefix(&link.content, x, baseline);
+                    if x > x0 {
+                        close_link(
+                            &mut self.items,
+                            self.m,
+                            LinkMark { url, x0, at },
+                            x,
+                            baseline,
+                        );
+                    }
+                }
             }
         }
+        x
     }
 
     /// Lay out inline content one line at a time. The finished line is held
@@ -749,80 +804,19 @@ impl<'a, M: FontMetrics> Lx<'a, M> {
             spaces: 0,
             hard: false,
         };
+        // A link does not cross a block. Drop a carry left by the last one.
+        self.link_carry = None;
         for inl in content {
-            match inl {
-                Inline::Text { text, style } => {
-                    self.feed_text(
-                        text,
-                        xf(*style),
-                        &mut cur,
-                        &mut held,
-                        &mut st,
-                        &mut meta,
-                        &g,
-                        &mut marker,
-                    );
-                }
-                Inline::Ref { name, style } => {
-                    self.feed_text(
-                        name,
-                        xf(*style),
-                        &mut cur,
-                        &mut held,
-                        &mut st,
-                        &mut meta,
-                        &g,
-                        &mut marker,
-                    );
-                }
-                Inline::LineBreak => {
-                    self.park(
-                        true,
-                        &mut cur,
-                        &mut held,
-                        &mut st,
-                        &mut meta,
-                        &g,
-                        &mut marker,
-                    );
-                }
-                Inline::HSpace(w) => {
-                    self.push_gap(*w, &mut cur, &mut held, &mut st, &mut meta, &g, &mut marker);
-                }
-                Inline::Frame(f) => {
-                    let prep = prepare_frame(
-                        self.m,
-                        self.st,
-                        &f.content,
-                        f.width,
-                        false,
-                        f.inset,
-                        g.width,
-                    );
-                    let outer = prep.outer_w;
-                    if st.has && st.w + st.pend_w + outer > g.width {
-                        st.pend_w = 0.0;
-                        st.pend_n = 0;
-                        self.park(false, &mut cur, &mut held, &mut st, &mut meta, &g, &mut marker);
-                    }
-                    if st.has && st.pend_n > 0 {
-                        cur.push(Atom::S(st.pend_w));
-                        st.w += st.pend_w;
-                        st.spaces += 1;
-                    }
-                    let idx = self.frames.len() as u32;
-                    self.frames.push(Paint {
-                        prep,
-                        fill: f.fill,
-                        stroke: f.stroke,
-                    });
-                    cur.push(Atom::F(idx));
-                    st.w += outer;
-                    st.has = true;
-                    st.pend_w = 0.0;
-                    st.pend_n = 0;
-                }
-            }
+            self.feed_inline(
+                inl,
+                &mut cur,
+                &mut held,
+                &mut st,
+                &mut meta,
+                &g,
+                &mut marker,
+                xf,
+            );
         }
         if st.has {
             self.park(
@@ -834,6 +828,10 @@ impl<'a, M: FontMetrics> Lx<'a, M> {
                 &g,
                 &mut marker,
             );
+        } else if meta.on && cur.iter().any(|a| matches!(a, Atom::Ls(_) | Atom::Le)) {
+            // A closer after a hard break sits on an empty line. Attach it
+            // to the line being placed so the link does not stay open.
+            held.extend(cur.drain(..));
         }
         if meta.on {
             self.place_atoms(&held, meta.w, meta.spaces, meta.hard, &g, true, &mut marker);
@@ -842,6 +840,90 @@ impl<'a, M: FontMetrics> Lx<'a, M> {
         }
         self.cur = cur;
         self.held = held;
+    }
+
+    fn feed_inline<F: Fn(TextStyle) -> TextStyle>(
+        &mut self,
+        inl: &'a Inline,
+        cur: &mut Vec<Atom<'a>>,
+        held: &mut Vec<Atom<'a>>,
+        st: &mut St,
+        meta: &mut Meta,
+        g: &Geom,
+        marker: &mut Option<(String, TextStyle, f64)>,
+        xf: &F,
+    ) {
+        match inl {
+            Inline::Text { text, style } => {
+                self.feed_text(text, xf(*style), cur, held, st, meta, g, marker);
+            }
+            Inline::Ref { name, style } => {
+                self.feed_text(name, xf(*style), cur, held, st, meta, g, marker);
+            }
+            Inline::LineBreak => {
+                self.park(true, cur, held, st, meta, g, marker);
+            }
+            Inline::HSpace(w) => {
+                self.push_gap(*w, cur, held, st, meta, g, marker);
+            }
+            Inline::Frame(f) => {
+                let prep = prepare_frame(
+                    self.m,
+                    self.st,
+                    &f.content,
+                    f.width,
+                    false,
+                    f.inset,
+                    g.width,
+                );
+                let outer = prep.outer_w;
+                if st.has && st.w + st.pend_w + outer > g.width {
+                    st.pend_w = 0.0;
+                    st.pend_n = 0;
+                    self.park(false, cur, held, st, meta, g, marker);
+                }
+                if st.has && st.pend_n > 0 {
+                    cur.push(Atom::S(st.pend_w));
+                    st.w += st.pend_w;
+                    st.spaces += 1;
+                }
+                let idx = self.frames.len() as u32;
+                self.frames.push(Paint {
+                    prep,
+                    fill: f.fill,
+                    stroke: f.stroke,
+                });
+                cur.push(Atom::F(idx));
+                st.w += outer;
+                st.has = true;
+                st.pend_w = 0.0;
+                st.pend_n = 0;
+            }
+            Inline::Link(link) => {
+                // Markers only. The character loop in `feed_text` is unchanged,
+                // and `link_carry` stays `None` when this arm never runs.
+                // A pending space belongs to the text before the link.
+                if st.has && st.pend_n > 0 {
+                    cur.push(Atom::S(st.pend_w));
+                    st.w += st.pend_w;
+                    st.spaces += 1;
+                    st.pend_w = 0.0;
+                    st.pend_n = 0;
+                }
+                cur.push(Atom::Ls(link.url.as_str()));
+                for c in &link.content {
+                    self.feed_inline(c, cur, held, st, meta, g, marker, xf);
+                }
+                if st.has && st.pend_n > 0 {
+                    cur.push(Atom::S(st.pend_w));
+                    st.w += st.pend_w;
+                    st.spaces += 1;
+                    st.pend_w = 0.0;
+                    st.pend_n = 0;
+                }
+                cur.push(Atom::Le);
+            }
+        }
     }
 
     fn feed_text(
@@ -1014,7 +1096,7 @@ impl<'a, M: FontMetrics> Lx<'a, M> {
 
     fn place_atoms(
         &mut self,
-        atoms: &[Atom],
+        atoms: &[Atom<'a>],
         line_w: f64,
         spaces: u32,
         hard: bool,
@@ -1074,6 +1156,7 @@ impl<'a, M: FontMetrics> Lx<'a, M> {
             self.m,
             self.st,
             &self.frames,
+            &mut self.link_carry,
         );
         self.y = baseline;
         if below > 0.0 {
@@ -1181,6 +1264,7 @@ impl<'a, M: FontMetrics> Lx<'a, M> {
                         w = w.max(self.cell_word_w(&f.content) + 2.0 * f.inset.max(0.0));
                     }
                 }
+                Inline::Link(link) => w = w.max(self.cell_word_w(&link.content)),
             }
         }
         w
@@ -1212,17 +1296,70 @@ fn ws_run(text: &str, i: usize) -> usize {
     j - i
 }
 
+/// A link open on this line. Closed at `Le` or at the line end.
+struct LinkMark<'a> {
+    url: &'a str,
+    x0: f64,
+    at: usize,
+}
+
+/// Underline (gray 0) plus a URI annotation over the span. No-op when the
+/// span has no width, so a marker that merely wraps does not emit.
+fn close_link<M: FontMetrics>(
+    items: &mut Vec<DrawItem>,
+    m: &M,
+    mark: LinkMark,
+    x1: f64,
+    baseline: f64,
+) {
+    let w = x1 - mark.x0;
+    if w <= 0.0 {
+        return;
+    }
+    let mut asc: f64 = 0.0;
+    let mut desc: f64 = 0.0;
+    for it in &items[mark.at..] {
+        if let DrawItem::Text { font, size, .. } = it {
+            asc = asc.max(m.ascent(*font) * *size / 1000.0);
+            desc = desc.max(m.descent(*font) * *size / 1000.0);
+        }
+    }
+    if asc == 0.0 {
+        asc = m.ascent(FontId::Regular) * 11.0 / 1000.0;
+        desc = m.descent(FontId::Regular) * 11.0 / 1000.0;
+    }
+    let uh = 0.5;
+    let uy = baseline + 1.0;
+    items.push(DrawItem::Rule {
+        x: mark.x0,
+        y: uy,
+        w,
+        h: uh,
+        gray: 0.0,
+    });
+    let top = baseline - asc;
+    let bot = (uy + uh).max(baseline + desc);
+    items.push(DrawItem::Link {
+        x: mark.x0,
+        y: top,
+        w,
+        h: bot - top,
+        url: InlineStr::from(mark.url),
+    });
+}
+
 /// Emit one line of atoms. Same-style words separated by a single source
 /// space become one draw item copied from that parent slice.
-fn emit_atoms<M: FontMetrics>(
+fn emit_atoms<'a, M: FontMetrics>(
     items: &mut Vec<DrawItem>,
-    atoms: &[Atom],
+    atoms: &[Atom<'a>],
     mut x: f64,
     baseline: f64,
     extra: f64,
     m: &M,
     styles: &Styles,
     frames: &[Paint],
+    carry: &mut Option<&'a str>,
 ) -> f64 {
     let mut sep = Sep::Brk;
     let mut buf = InlineStr::new();
@@ -1237,9 +1374,53 @@ fn emit_atoms<M: FontMetrics>(
     let mut span_b = 0usize;
     let mut span_ok = false;
     let mut depth = 0.0f64;
+    let mut open: Option<LinkMark<'a>> = carry.take().map(|url| LinkMark {
+        url,
+        x0: x,
+        at: items.len(),
+    });
 
     for t in atoms {
         match *t {
+            Atom::Ls(url) => {
+                if has {
+                    items.push(DrawItem::Text {
+                        x: bx,
+                        y: baseline,
+                        font: bs.font,
+                        size: bs.size,
+                        text: take_run(&mut buf, span_ok, span_src, span_a, span_b),
+                    });
+                    has = false;
+                    span_ok = false;
+                }
+                if let Some(mark) = open.take() {
+                    close_link(items, m, mark, x, baseline);
+                }
+                open = Some(LinkMark {
+                    url,
+                    x0: x,
+                    at: items.len(),
+                });
+                sep = Sep::Brk;
+            }
+            Atom::Le => {
+                if has {
+                    items.push(DrawItem::Text {
+                        x: bx,
+                        y: baseline,
+                        font: bs.font,
+                        size: bs.size,
+                        text: take_run(&mut buf, span_ok, span_src, span_a, span_b),
+                    });
+                    has = false;
+                    span_ok = false;
+                }
+                if let Some(mark) = open.take() {
+                    close_link(items, m, mark, x, baseline);
+                }
+                sep = Sep::Brk;
+            }
             Atom::F(i) => {
                 let fr = &frames[i as usize];
                 if has {
@@ -1319,6 +1500,11 @@ fn emit_atoms<M: FontMetrics>(
             text: take_run(&mut buf, span_ok, span_src, span_a, span_b),
         });
     }
+    if let Some(mark) = open.take() {
+        let url = mark.url;
+        close_link(items, m, mark, x, baseline);
+        *carry = Some(url);
+    }
     depth
 }
 
@@ -1339,16 +1525,17 @@ fn take_run(
 /// Emit merged draw runs for one line of tokens starting at x on `baseline`.
 /// Adjacent same-style words merge into a single `DrawItem::Text`; `extra`
 /// is per-space justification stretch (0 for ragged-right).
-fn emit_line<M: FontMetrics>(
+fn emit_line<'a, M: FontMetrics>(
     items: &mut Vec<DrawItem>,
     m: &M,
     styles: &Styles,
-    toks: &[Tok],
+    toks: &[Tok<'a>],
     l: Line,
     mut x: f64,
     baseline: f64,
     extra: f64,
     size: f64,
+    carry: &mut Option<&'a str>,
 ) {
     let mut sep = Sep::Brk;
     let mut buf = InlineStr::new();
@@ -1358,8 +1545,50 @@ fn emit_line<M: FontMetrics>(
         size,
     };
     let mut has = false;
+    let mut open: Option<LinkMark<'a>> = carry.take().map(|url| LinkMark {
+        url,
+        x0: x,
+        at: items.len(),
+    });
     for t in &toks[l.start..l.end] {
         match *t {
+            Tok::Ls(url) => {
+                if has {
+                    items.push(DrawItem::Text {
+                        x: bx,
+                        y: baseline,
+                        font: bs.font,
+                        size: bs.size,
+                        text: std::mem::take(&mut buf),
+                    });
+                    has = false;
+                }
+                if let Some(mark) = open.take() {
+                    close_link(items, m, mark, x, baseline);
+                }
+                open = Some(LinkMark {
+                    url,
+                    x0: x,
+                    at: items.len(),
+                });
+                sep = Sep::Brk;
+            }
+            Tok::Le => {
+                if has {
+                    items.push(DrawItem::Text {
+                        x: bx,
+                        y: baseline,
+                        font: bs.font,
+                        size: bs.size,
+                        text: std::mem::take(&mut buf),
+                    });
+                    has = false;
+                }
+                if let Some(mark) = open.take() {
+                    close_link(items, m, mark, x, baseline);
+                }
+                sep = Sep::Brk;
+            }
             Tok::W(w, st, wid) => {
                 if has && bs == st && sep != Sep::Brk {
                     if sep == Sep::Sp {
@@ -1422,6 +1651,11 @@ fn emit_line<M: FontMetrics>(
             size: bs.size,
             text: buf,
         });
+    }
+    if let Some(mark) = open.take() {
+        let url = mark.url;
+        close_link(items, m, mark, x, baseline);
+        *carry = Some(url);
     }
 }
 
@@ -1569,8 +1803,59 @@ fn tokenize<'a, M: FontMetrics, F: Fn(TextStyle) -> TextStyle>(
             Inline::LineBreak => toks.push(Tok::B),
             Inline::HSpace(w) => toks.push(Tok::G(*w)),
             Inline::Frame(f) => toks.push(Tok::F(i, frame_outer(m, f))),
+            Inline::Link(link) => {
+                toks.push(Tok::Ls(&link.url));
+                tokenize(toks, &link.content, m, xf);
+                toks.push(Tok::Le);
+            }
         }
     }
+}
+
+fn is_link_tok(t: &Tok) -> bool {
+    matches!(t, Tok::Ls(_) | Tok::Le)
+}
+
+/// Markers in `[end, stop)` stay on the line being closed. A space between
+/// the last word and a marker is included with that marker. No marker
+/// leaves `end` unchanged.
+fn absorb_markers(toks: &[Tok], end: usize, stop: usize) -> usize {
+    let mut i = end;
+    let mut last = end;
+    while i < stop {
+        match &toks[i] {
+            Tok::Ls(_) | Tok::Le => {
+                i += 1;
+                last = i;
+            }
+            Tok::S(_) | Tok::G(_) => i += 1,
+            _ => break,
+        }
+    }
+    last
+}
+
+/// On a wrap, markers glued to the previous word stay behind. Markers
+/// after the pending space start the next line. No markers returns
+/// `(end, at)`, the split the breaker used before links existed.
+fn split_markers(toks: &[Tok], end: usize, at: usize) -> (usize, usize) {
+    if end >= at || !toks[end..at].iter().any(is_link_tok) {
+        return (end, at);
+    }
+    let mut line_end = end;
+    while line_end < at && is_link_tok(&toks[line_end]) {
+        line_end += 1;
+    }
+    let mut next = line_end;
+    while next < at && matches!(toks[next], Tok::S(_) | Tok::G(_)) {
+        next += 1;
+    }
+    let restart = if next < at && is_link_tok(&toks[next]) {
+        next
+    } else {
+        at
+    };
+    (line_end, restart)
 }
 
 /// Greedy line breaking at space tokens; `LineBreak` forces a break.
@@ -1586,14 +1871,15 @@ fn break_lines(toks: &[Tok], width: f64, lines: &mut Vec<Line>) {
         match toks[i] {
             Tok::W(_, _, ww) | Tok::F(_, ww) => {
                 if end > start && w + pend_w + ww > width {
+                    let (line_end, restart) = split_markers(toks, end, i);
                     lines.push(Line {
                         start,
-                        end,
+                        end: line_end,
                         w,
                         spaces: sp,
                         hard: false,
                     });
-                    start = i;
+                    start = restart;
                     end = i + 1;
                     w = ww;
                     sp = 0;
@@ -1616,9 +1902,14 @@ fn break_lines(toks: &[Tok], width: f64, lines: &mut Vec<Line>) {
             }
             Tok::G(gw) => {
                 if end > start && w + pend_w + gw > width {
+                    let line_end = if end < i && toks[end..i].iter().any(is_link_tok) {
+                        absorb_markers(toks, end, i)
+                    } else {
+                        end
+                    };
                     lines.push(Line {
                         start,
-                        end,
+                        end: line_end,
                         w,
                         spaces: sp,
                         hard: false,
@@ -1640,10 +1931,16 @@ fn break_lines(toks: &[Tok], width: f64, lines: &mut Vec<Line>) {
                 pend_w = 0.0;
                 pend_n = 0;
             }
+            Tok::Ls(_) | Tok::Le => i += 1,
             Tok::B => {
+                let line_end = if end < i && toks[end..i].iter().any(is_link_tok) {
+                    absorb_markers(toks, end, i)
+                } else {
+                    end
+                };
                 lines.push(Line {
                     start,
-                    end,
+                    end: line_end,
                     w,
                     spaces: sp,
                     hard: true,
@@ -1659,6 +1956,11 @@ fn break_lines(toks: &[Tok], width: f64, lines: &mut Vec<Line>) {
         }
     }
     if end > start {
+        let end = if end < toks.len() && toks[end..].iter().any(is_link_tok) {
+            absorb_markers(toks, end, toks.len())
+        } else {
+            end
+        };
         lines.push(Line {
             start,
             end,
@@ -1697,6 +1999,7 @@ fn natural_inner<M: FontMetrics>(m: &M, content: &[Inline]) -> f64 {
         match t {
             Tok::W(_, _, w) | Tok::F(_, w) => line += *w,
             Tok::S(w) | Tok::G(w) => line += *w,
+            Tok::Ls(_) | Tok::Le => {}
             Tok::B => {
                 best = best.max(line);
                 line = 0.0;
@@ -1813,6 +2116,7 @@ fn paint_prepared<M: FontMetrics>(
         });
     }
     let mut base = top + prep.above;
+    let mut carry = None;
     for (i, l) in prep.lines.iter().enumerate() {
         emit_line(
             items,
@@ -1824,6 +2128,7 @@ fn paint_prepared<M: FontMetrics>(
             base,
             0.0,
             prep.font_size,
+            &mut carry,
         );
         if i + 1 < prep.lines.len() {
             let (sz, _, _) = line_box(m, st, &prep.toks, &prep.lines[i + 1]);
@@ -2456,6 +2761,48 @@ mod tests {
         let texts = text_items(&fixed[0]);
         let b = texts.iter().find(|t| t.2.contains("bbbb")).unwrap();
         assert!((b.0 - (70.866 + 40.0 + 10.0)).abs() < 1e-2, "{b:?}");
+    }
+
+    #[test]
+    fn link_layout_emits_annotation() {
+        let style = TextStyle {
+            font: FontId::Regular,
+            size: 11.0,
+        };
+        let doc = tdoc(vec![Block::Paragraph {
+            align: HAlign::Left,
+            content: vec![
+                Inline::Text {
+                    text: "See ".into(),
+                    style,
+                },
+                Inline::Link(Box::new(LinkRun {
+                    url: "https://example.com".into(),
+                    content: vec![Inline::Text {
+                        text: "docs".into(),
+                        style,
+                    }],
+                })),
+            ],
+        }]);
+        let pages = layout(&doc, &Fake);
+        let link = pages[0].items.iter().find_map(|i| match i {
+            DrawItem::Link { x, w, url, .. } => Some((*x, *w, url.as_str().to_string())),
+            _ => None,
+        });
+        let Some((x, w, url)) = link else {
+            panic!("no annotation: {:?}", pages[0].items)
+        };
+        assert_eq!(url, "https://example.com");
+        // Fake metrics: 500 units, 11pt -> 5.5pt per char. "docs" is 22pt.
+        assert!((w - 22.0).abs() < 1e-6, "{w}");
+        assert!((x - (70.866 + 22.0)).abs() < 1e-3, "{x}");
+        assert!(pages[0].items.iter().any(|i| matches!(
+            i,
+            DrawItem::Rule { x: rx, w: rw, h, gray, .. }
+                if (*rx - x).abs() < 1e-6 && (*rw - w).abs() < 1e-6 && *h > 0.0 && *gray == 0.0
+        )));
+        assert!(text_items(&pages[0]).iter().any(|t| t.2 == "docs"));
     }
 
 }
