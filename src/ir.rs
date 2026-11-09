@@ -236,6 +236,14 @@ pub struct RhsArg {
     pub value: Rhs,
 }
 
+/// `#let` function. Boxed inside [`Value::Func`] so it can live in a scope
+/// (and survive `#import`) without growing `Value`: [`Rhs`] contains `Value`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Func {
+    pub params: Vec<Param>,
+    pub body: Rhs,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
     None,
@@ -251,6 +259,8 @@ pub enum Value {
     Array(Vec<Value>),
     /// `(a: 1, b: 2)` dictionary literal.
     Dict(Vec<(String, Value)>),
+    /// `#let` function. Boxed so `Value` does not grow (`Rhs` contains `Value`).
+    Func(Box<Func>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]

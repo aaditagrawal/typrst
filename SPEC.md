@@ -189,7 +189,8 @@ fractions `1fr` (table context only).
   importing file's directory.
 - Imported modules evaluate to a dictionary of their `#let` bindings:
   `#import "lib.typ": a, b` binds names, `: *` binds all, bare
-  `#import "lib.typ"` binds `lib` to the dict.
+  `#import "lib.typ"` binds `lib` to the dict. Imported `#let` functions
+  are included and callable.
 - Cyclic imports and depth > 64 are `error` diagnostics; the cycle is
   cut and compilation continues.
 

@@ -139,13 +139,6 @@ pub fn eval_plain(nodes: Vec<Node>, diags: &mut Vec<Diag>, base_dir: &Path) -> D
     eval(nodes, diags, &mut env)
 }
 
-/// A `#let` function. Each call binds parameters in a fresh scope frame.
-/// A content body pushes another frame inside that one.
-struct UserFn {
-    params: Vec<Param>,
-    body: Rhs,
-}
-
 /// What `@name` renders. Non-heading labels keep a display string
 /// (a paragraph, or `Figure N`). A heading stores its section number,
 /// or `Unnumbered` when numbering is off.
@@ -198,9 +191,7 @@ struct Ev<'e, 'a> {
     /// `env.base_dir`. `#include` pushes the included file's directory
     /// so image paths resolve next to that file.
     include_dirs: Vec<PathBuf>,
-    /// `#let` functions. Empty until the first definition; consulted
-    /// only from `Expr::Call`.
-    fns: HashMap<String, Rc<UserFn>>,
+    /// User-function recursion depth. Calls error at 64.
     fn_depth: u32,
 }
 
@@ -227,7 +218,6 @@ impl<'e, 'a> Ev<'e, 'a> {
             figures: 0,
             images: Vec::new(),
             include_dirs: Vec::new(),
-            fns: HashMap::new(),
             fn_depth: 0,
         }
     }
@@ -826,12 +816,7 @@ impl<'e, 'a> Ev<'e, 'a> {
                 let st = self.cur();
                 value_inline(v, st, out, self);
             }
-            Expr::Rhs(r) => {
-                if let Some(v) = self.rhs_val(r) {
-                    let st = self.cur();
-                    value_inline(&v, st, out, self);
-                }
-            }
+            Expr::Rhs(r) => self.show_rhs(r, None, out),
             Expr::Func {
                 name,
                 args,
@@ -892,6 +877,54 @@ impl<'e, 'a> Ev<'e, 'a> {
             Rhs::Bin { lhs, op, rhs } => self.bin_val(lhs, *op, rhs),
             Rhs::Call { recv, method, args } => Some(self.call_method(recv, method, args)),
         }
+    }
+
+    /// Render an rhs. A `.name(` call whose field is a function uses the
+    /// same argument rules as `#name(...)`; other calls stay method calls.
+    fn show_rhs(&mut self, r: &Rhs, st: Option<TextStyle>, out: &mut Vec<Inline>) {
+        if let Rhs::Call { recv, method, args } = r {
+            if self.try_field_fn(recv, method, args, st, out) {
+                return;
+            }
+        }
+        if let Some(v) = self.rhs_val(r) {
+            let style = match st {
+                Some(s) => s,
+                None => self.cur(),
+            };
+            value_inline(&v, style, out, self);
+        }
+    }
+
+    /// Invoke `recv.method(...)` when that field is a `#let` function.
+    /// `true` means the call was handled (including a failed receiver).
+    fn try_field_fn(
+        &mut self,
+        recv: &Rhs,
+        method: &str,
+        args: &[Rhs],
+        st: Option<TextStyle>,
+        out: &mut Vec<Inline>,
+    ) -> bool {
+        let Some(v) = self.rhs_val(recv) else {
+            return true;
+        };
+        let Value::Dict(ps) = v else {
+            return false;
+        };
+        let Some(Value::Func(func)) = ps.into_iter().find(|(k, _)| k == method).map(|(_, v)| v)
+        else {
+            return false;
+        };
+        let args: Vec<RhsArg> = args
+            .iter()
+            .map(|value| RhsArg {
+                name: None,
+                value: value.clone(),
+            })
+            .collect();
+        self.invoke(method, func, &args, None, st, out);
+        true
     }
 
     /// `value.method(args)`. Unknown methods and bad indexes are errors
@@ -2276,12 +2309,12 @@ impl<'e, 'a> Ev<'e, 'a> {
     }
 
     fn def_fn(&mut self, name: &str, params: &[Param], body: &Rhs) {
-        self.fns.insert(
+        self.bind(
             name.to_string(),
-            Rc::new(UserFn {
+            Value::Func(Box::new(Func {
                 params: params.to_vec(),
                 body: body.clone(),
-            }),
+            })),
         );
     }
 
@@ -2295,13 +2328,25 @@ impl<'e, 'a> Ev<'e, 'a> {
         st: Option<TextStyle>,
         out: &mut Vec<Inline>,
     ) {
-        let Some(func) = self.fns.get(name).cloned() else {
+        let Some(Value::Func(func)) = self.lookup(name).cloned() else {
             self.diag(
                 Severity::NotImplemented,
                 format!("function '#{name}' is not implemented"),
             );
             return;
         };
+        self.invoke(name, func, args, content, st, out);
+    }
+
+    fn invoke(
+        &mut self,
+        name: &str,
+        func: Box<Func>,
+        args: &[RhsArg],
+        content: Option<&[Node]>,
+        st: Option<TextStyle>,
+        out: &mut Vec<Inline>,
+    ) {
         if self.fn_depth >= 64 {
             self.diag(
                 Severity::Error,
@@ -2957,6 +3002,7 @@ fn kind(v: &Value) -> &'static str {
         Value::Content(_) => "content",
         Value::Array(_) => "array",
         Value::Dict(_) => "dict",
+        Value::Func(_) => "function",
     }
 }
 
@@ -3103,11 +3149,7 @@ fn inline_expr(e: &Expr, st: TextStyle, out: &mut Vec<Inline>, cx: &mut Ev) {
         Expr::If { arms, els } => cx.do_if(arms, els.as_deref(), Some(st), out),
         Expr::While { cond, body } => cx.do_while(cond, body, Some(st), out),
         Expr::For { vars, iter, body } => cx.do_for(vars, iter, body, Some(st), out),
-        Expr::Rhs(r) => {
-            if let Some(v) = cx.rhs_val(r) {
-                value_inline(&v, st, out, cx);
-            }
-        }
+        Expr::Rhs(r) => cx.show_rhs(r, Some(st), out),
         Expr::Func {
             name,
             args,
@@ -3193,7 +3235,7 @@ fn value_inline(v: &Value, st: TextStyle, out: &mut Vec<Inline>, cx: &mut Ev) {
             });
         }
         Value::Content(ns) => cx.scoped_inlines(ns, st, out),
-        Value::Bool(_) | Value::None => {}
+        Value::Bool(_) | Value::None | Value::Func(_) => {}
     }
 }
 
@@ -3226,6 +3268,7 @@ fn value_str(v: &Value) -> String {
             })
             .collect(),
         Value::None => "none".into(),
+        Value::Func(_) => "function".into(),
     }
 }
 
@@ -4174,6 +4217,50 @@ mod tests {
         let (_doc, d) = run_src("#include \"missing.typ\"", &dir);
         assert!(d.iter().any(|x| x.severity == Severity::Error));
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn import_let_fn() {
+        let dir = std::env::temp_dir().join(format!("typrst-fnimp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("lib.typ"), "#let greet(name) = [Hello #name]\n").unwrap();
+        let (doc, d) = run_src("#import \"lib.typ\": greet\n#greet(\"Ada\")", &dir);
+        assert!(d.is_empty(), "{d:?}");
+        assert!(all_text(&doc).contains("Hello Ada"), "{}", all_text(&doc));
+        let (doc, d) = run_src("#import \"lib.typ\": *\n#greet(\"Ada\")", &dir);
+        assert!(d.is_empty(), "{d:?}");
+        assert!(all_text(&doc).contains("Hello Ada"), "{}", all_text(&doc));
+        let (doc, d) = run_src("#import \"lib.typ\": greet\n#let f = greet\n#f(\"Ada\")", &dir);
+        assert!(d.is_empty(), "{d:?}");
+        assert!(all_text(&doc).contains("Hello Ada"), "{}", all_text(&doc));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn import_let_fn_bare() {
+        let dir = std::env::temp_dir().join(format!("typrst-fnbare-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("lib.typ"), "#let greet(name) = [Hello #name]\n").unwrap();
+        let (doc, d) = run_src("#import \"lib.typ\"\n#lib.greet(\"Ada\")", &dir);
+        assert!(d.is_empty(), "{d:?}");
+        assert!(all_text(&doc).contains("Hello Ada"), "{}", all_text(&doc));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn import_missing_fn_warns() {
+        let dir = std::env::temp_dir().join(format!("typrst-fnmiss-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("lib.typ"), "#let greet(name) = [Hello #name]\n").unwrap();
+        let (_doc, d) = run_src("#import \"lib.typ\": missing", &dir);
+        assert!(
+            d.iter().any(|x| x.severity == Severity::Warning && x.message.contains("has no member")),
+            "{d:?}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

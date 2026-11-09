@@ -43,6 +43,7 @@ pub fn parse(src: &str) -> (Vec<Node>, Vec<Diag>) {
         pos: 0,
         diags: Vec::new(),
         lets: Vec::new(),
+        star: false,
         depth: 0,
     };
     let nodes = p.body(false, 0);
@@ -55,6 +56,9 @@ struct P<'a> {
     pos: usize,
     diags: Vec<Diag>,
     lets: Vec<String>,
+    /// `#import "...": *` was seen. Later `#name(...)` may be a user
+    /// function; the imported names are not known at parse time.
+    star: bool,
     depth: u32,
 }
 
@@ -1177,7 +1181,8 @@ impl<'a> P<'a> {
     /// `.field` access), or a spaced binary expression `#a + b`.
     fn hash_call(&mut self, a: usize, name: String, out: &mut Vec<Node>, text: &mut String) {
         let bound = self.lets.iter().any(|l| l == &name);
-        if bound
+        // `import *` does not list names. Those calls resolve in eval.
+        if (bound || self.star)
             && !IMPLEMENTED.contains(&name.as_str())
             && matches!(self.peek(), Some(b'(') | Some(b'['))
         {
@@ -1325,6 +1330,7 @@ impl<'a> P<'a> {
         // variable. With `*` the names are unknown at parse time; the
         // generic `#ident` -> Var fallback in hash_call covers them.
         if all {
+            self.star = true;
         } else if items.is_empty() {
             self.lets.push(spec_stem(&path));
         } else {
