@@ -32,8 +32,11 @@ parser recovers to the next paragraph boundary. Diagnostics from
   indented lines, and may contain inline markup. A missing colon is a
   warning and the line stays literal text. An indented `/` is literal
   (nested term lists are not supported).
-- `$..$` math, `#footnote`, `#show`, `#context`,
+- `$..$` math, `#footnote`, `#context`,
   `#break`, `#continue` → `not implemented` diagnostics.
+  `#show` with no target, a `where` selector, a `set` transform, or any
+  target other than `heading`, `strong`, `emph`, `link`, and `figure`
+  is `not implemented` and is not printed.
 - `<ident>` labels (letters, digits, `_`, `-`, `.`). A label on the same
   line as a heading, or the next non-empty construct before another block,
   attaches to that heading. A label elsewhere attaches to the previous
@@ -172,6 +175,16 @@ fractions `1fr` (table context only).
   with the number prefix when numbering is on. Entries indent 12pt per
   level below 1, with no dot leaders. An outline with no headings emits
   nothing.
+- `#show heading|strong|emph|link|figure: name => body` — one rule per
+  target. A later rule for the same target replaces it; rules do not
+  chain. `name` is any identifier. `body` is `[content]` or an
+  expression. The parameter is bound to that element's body
+  (`Value::Content`): the heading's inline body before its number
+  prefix, the inner content of strong or emph, the link's visible
+  content, or the figure body (the caption stays the caption). The body
+  is evaluated in a nested scope and replaces that element body. Heading
+  numbering and style, the strong/emph face, the link underline and
+  annotation, and the `Figure N:` caption still apply.
 - Unknown `#foo` → `not implemented` diagnostic, recover at end of the
   expression.
 

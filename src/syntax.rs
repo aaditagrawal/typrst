@@ -1125,6 +1125,7 @@ impl<'a> P<'a> {
                     "if" => self.parse_if(a, out, text),
                     "for" => self.parse_for(a, out, text),
                     "while" => self.parse_while(a, out, text),
+                    "show" => self.parse_show(a, out, text),
                     _ => self.hash_call(a, name, out, text),
                 }
             }
@@ -1617,6 +1618,82 @@ impl<'a> P<'a> {
         }
     }
 
+    /// `word`, but does not consume. A longer ident (`set` vs `setting`) misses.
+    fn at_word(&self, kw: &str) -> bool {
+        let b = kw.as_bytes();
+        let s = self.pos;
+        if s + b.len() > self.bytes.len() || &self.bytes[s..s + b.len()] != b {
+            return false;
+        }
+        !self.bytes.get(s + b.len()).copied().map_or(false, is_ident_cont)
+    }
+
+    /// Show-rule body. Same expression language as `rhs`, but a line
+    /// break ends it, so the next line's `*strong*` stays markup.
+    fn show_rhs(&mut self) -> Option<Rhs> {
+        let mut lhs = self.show_rhs_mul()?;
+        loop {
+            let save = self.pos;
+            self.skip_hspace();
+            let op = match self.peek() {
+                Some(b'+') => ArithOp::Add,
+                Some(b'-') => ArithOp::Sub,
+                _ => {
+                    self.pos = save;
+                    break;
+                }
+            };
+            self.pos += 1;
+            self.skip_hspace();
+            match self.show_rhs_mul() {
+                Some(r) => {
+                    lhs = Rhs::Bin {
+                        lhs: Box::new(lhs),
+                        op,
+                        rhs: Box::new(r),
+                    }
+                }
+                None => {
+                    self.pos = save;
+                    break;
+                }
+            }
+        }
+        Some(lhs)
+    }
+
+    fn show_rhs_mul(&mut self) -> Option<Rhs> {
+        let mut lhs = self.rhs_term()?;
+        loop {
+            let save = self.pos;
+            self.skip_hspace();
+            let op = match self.peek() {
+                Some(b'*') => ArithOp::Mul,
+                Some(b'/') if !matches!(self.at(1), Some(b'/') | Some(b'*')) => ArithOp::Div,
+                _ => {
+                    self.pos = save;
+                    break;
+                }
+            };
+            self.pos += 1;
+            self.skip_hspace();
+            match self.rhs_term() {
+                Some(r) => {
+                    lhs = Rhs::Bin {
+                        lhs: Box::new(lhs),
+                        op,
+                        rhs: Box::new(r),
+                    }
+                }
+                None => {
+                    self.pos = save;
+                    break;
+                }
+            }
+        }
+        Some(lhs)
+    }
+
     /// Right-hand side: `mul-level` terms joined by `+`/`-`, folded left.
     fn rhs(&mut self) -> Option<Rhs> {
         let mut lhs = self.rhs_mul()?;
@@ -1963,6 +2040,134 @@ impl<'a> P<'a> {
                 _ => self.pos += 1,
             }
         }
+    }
+
+    /// `#show target: param => body` for the five element targets.
+    /// Anything else is `not implemented` and is consumed so it is not
+    /// printed as page text.
+    fn parse_show(&mut self, a: usize, out: &mut Vec<Node>, text: &mut String) {
+        let start = self.pos;
+        self.skip_hspace();
+        let Some(target) = self.ident() else {
+            self.reject_show(a, start);
+            return;
+        };
+        if !matches!(
+            target.as_str(),
+            "heading" | "strong" | "emph" | "link" | "figure"
+        ) {
+            self.reject_show(a, start);
+            return;
+        }
+        self.skip_hspace();
+        if self.peek() != Some(b':') {
+            self.reject_show(a, start);
+            return;
+        }
+        self.pos += 1;
+        self.skip_ws();
+        if self.at_word("set") {
+            self.reject_show(a, start);
+            return;
+        }
+        let Some(param) = self.ident() else {
+            self.reject_show(a, start);
+            return;
+        };
+        self.skip_ws();
+        if self.peek() != Some(b'=') || self.at(1) != Some(b'>') {
+            self.reject_show(a, start);
+            return;
+        }
+        self.pos += 2;
+        let mark = self.lets.len();
+        self.lets.push(param.clone());
+        let body = self.show_rhs();
+        if self.lets.get(mark).map(|n| n == &param).unwrap_or(false) {
+            self.lets.remove(mark);
+        } else {
+            self.lets.truncate(mark);
+        }
+        let Some(body) = body else {
+            self.diag(Severity::Error, a, "expected a body in `#show`");
+            self.skip_colon_tail();
+            return;
+        };
+        flush(out, text);
+        out.push(Node::Expr(Expr::Show {
+            target,
+            param,
+            body,
+        }));
+    }
+
+    fn reject_show(&mut self, a: usize, start: usize) {
+        self.pos = start;
+        self.diag(Severity::NotImplemented, a, "#show is not implemented");
+        self.skip_show_rest();
+    }
+
+    /// Consume an unimplemented `#show` selector and transform. `self.pos`
+    /// is just after the `show` keyword. The following paragraph stays.
+    fn skip_show_rest(&mut self) {
+        self.skip_hspace();
+        if self.peek() == Some(b'"') {
+            self.string(self.pos);
+        } else if self.peek().map_or(false, is_ident_start) {
+            let _ = self.ident();
+            loop {
+                self.skip_hspace();
+                if self.peek() != Some(b'.') {
+                    break;
+                }
+                self.pos += 1;
+                let _ = self.ident();
+                self.skip_hspace();
+                if self.peek() == Some(b'(') {
+                    self.pos += 1;
+                    self.skip_balanced(b'(', b')');
+                }
+            }
+        }
+        self.skip_hspace();
+        if self.peek() == Some(b':') {
+            self.pos += 1;
+            self.skip_show_transform();
+        }
+    }
+
+    /// After the colon of an unimplemented show rule. A `set` rule, an
+    /// `ident => rhs` transform (body may span lines), or the rest of
+    /// this line.
+    fn skip_show_transform(&mut self) {
+        let line = self.pos;
+        self.skip_ws();
+        if self.at_word("set") {
+            self.word("set");
+            self.skip_ws();
+            let _ = self.ident();
+            self.skip_ws();
+            if self.peek() == Some(b'(') {
+                self.pos += 1;
+                self.skip_balanced(b'(', b')');
+            }
+            return;
+        }
+        if self.ident().is_some() {
+            self.skip_ws();
+            if self.peek() == Some(b'=') && self.at(1) == Some(b'>') {
+                self.pos += 2;
+                let mark = self.lets.len();
+                if self.show_rhs().is_none() {
+                    self.pos = line;
+                    self.skip_colon_tail();
+                }
+                self.lets.truncate(mark);
+                return;
+            }
+        }
+        self.pos = line;
+        self.skip_colon_tail();
     }
 
     fn parse_let(&mut self, a: usize, out: &mut Vec<Node>, text: &mut String) {
@@ -3511,8 +3716,52 @@ mod tests {
     }
 
     #[test]
+    fn show_rule_parses() {
+        let (n, d) = parse("#show heading: it => [Chapter #it]");
+        assert!(d.is_empty(), "{d:?}");
+        let Node::Expr(Expr::Show { target, param, body }) = &n[0] else {
+            panic!("{n:?}")
+        };
+        assert_eq!(target, "heading");
+        assert_eq!(param, "it");
+        let Rhs::Lit(Value::Content(body)) = body else {
+            panic!("{body:?}")
+        };
+        assert!(body.iter().any(|node| matches!(node, Node::Text(s) if s.contains("Chapter"))));
+        assert!(body.iter().any(|node| matches!(
+            node,
+            Node::Expr(Expr::Var { name }) if name == "it"
+        )));
+
+        let (n, d) = parse("#show emph: body => body");
+        assert!(d.is_empty(), "{d:?}");
+        let Node::Expr(Expr::Show { target, param, body }) = &n[0] else {
+            panic!("{n:?}")
+        };
+        assert_eq!(target, "emph");
+        assert_eq!(param, "body");
+        assert_eq!(body, &Rhs::Var("body".into()));
+
+        for target in ["strong", "link", "figure"] {
+            let (n, d) = parse(&format!("#show {target}: el => el"));
+            assert!(d.is_empty(), "{target} {d:?}");
+            assert!(matches!(
+                &n[0],
+                Node::Expr(Expr::Show { target: t, .. }) if t == target
+            ));
+        }
+
+        // The rule itself is not page text.
+        let (n, d) = parse("#show heading: it => it\nHello");
+        assert!(d.is_empty(), "{d:?}");
+        assert!(!contains_text(&n, "heading"), "{n:?}");
+        assert!(!contains_text(&n, "it"), "{n:?}");
+        assert!(contains_text(&n, "Hello"), "{n:?}");
+    }
+
+    #[test]
     fn not_implemented_is_not_printed() {
-        let src = "#show heading: it => it";
+        let src = "#show quote: it => it";
         let (n, d) = parse(src);
         assert!(
             d.iter().any(|x| {
@@ -3521,23 +3770,38 @@ mod tests {
             }),
             "{d:?}"
         );
-        assert!(!contains_text(&n, "heading"), "{n:?}");
+        assert!(!contains_text(&n, "quote"), "{n:?}");
         assert!(!contains_text(&n, "it"), "{n:?}");
 
-        let src = "#show heading: it => it\nHello";
+        let src = "#show quote: it => it\nHello";
         let (n, d) = parse(src);
         assert!(d.iter().any(|x| {
             x.severity == Severity::NotImplemented && x.span.is_some()
         }));
-        assert!(!contains_text(&n, "heading"), "{n:?}");
+        assert!(!contains_text(&n, "quote"), "{n:?}");
         assert!(contains_text(&n, "Hello"), "{n:?}");
 
-        let src = "#show heading: it => [\nsecret\n]\nNext";
+        let src = "#show quote: it => [\nsecret\n]\nNext";
         let (n, d) = parse(src);
         assert!(d.iter().any(|x| x.severity == Severity::NotImplemented && x.span.is_some()));
         assert!(!contains_text(&n, "secret"), "{n:?}");
-        assert!(!contains_text(&n, "heading"), "{n:?}");
+        assert!(!contains_text(&n, "quote"), "{n:?}");
         assert!(contains_text(&n, "Next"), "{n:?}");
+
+        let src = "#show heading.where(level: 1): it => it\nHello";
+        let (n, d) = parse(src);
+        assert!(d.iter().any(|x| x.severity == Severity::NotImplemented && x.span.is_some()));
+        assert!(!contains_text(&n, "heading"), "{n:?}");
+        assert!(!contains_text(&n, "where"), "{n:?}");
+        assert!(!contains_text(&n, "it"), "{n:?}");
+        assert!(contains_text(&n, "Hello"), "{n:?}");
+
+        let src = "#show heading: set text(size: 12pt)\nHello";
+        let (n, d) = parse(src);
+        assert!(d.iter().any(|x| x.severity == Severity::NotImplemented && x.span.is_some()));
+        assert!(!contains_text(&n, "heading"), "{n:?}");
+        assert!(!contains_text(&n, "text"), "{n:?}");
+        assert!(contains_text(&n, "Hello"), "{n:?}");
 
         let (n, d) = parse("$x$");
         assert!(d.iter().any(|x| x.severity == Severity::NotImplemented && x.span.is_some()));
@@ -3596,6 +3860,13 @@ mod tests {
             "a\\\r\nb",
             "- a\n- \n- c",
             "#strong[",
+            "#show",
+            "#show:",
+            "#show heading",
+            "#show heading:",
+            "#show heading: it",
+            "#show heading: it =>",
+            "#show quote: it => it",
             "#while",
             "#while [",
             "#if a and",

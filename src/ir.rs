@@ -152,6 +152,13 @@ pub enum Expr {
     /// An rhs rendered in markup that is not a name or binary
     /// (`#xs.len()`, `#(xs.at(i))`). Field chains stay `Var`.
     Rhs(Rhs),
+    /// `#show heading|strong|emph|link|figure: param => body`.
+    /// Other `#show` forms are diagnostics, not this node.
+    Show {
+        target: String,
+        param: String,
+        body: Rhs,
+    },
 }
 
 /// Right-hand side of a binding, condition, or iteration.
