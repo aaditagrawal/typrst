@@ -113,7 +113,6 @@ struct BuildResult {
     written: Option<Vec<u8>>,
 }
 
-/// `true` when `next` differs from the PDF bytes last written.
 fn should_write_pdf(previous: Option<&[u8]>, next: &[u8]) -> bool {
     previous != Some(next)
 }
@@ -272,43 +271,34 @@ fn watch_seen(input: &Path, deps: &[PathBuf]) -> Vec<(u64, Option<std::time::Sys
     std::iter::once(stamp(input)).chain(deps.iter().map(|p| stamp(p))).collect()
 }
 
-/// `#import` / `#include` quoted paths, relative to the file that names them.
-/// One level past the input is enough.
+/// `#import` / `#include` paths quoted in `input`, resolved next to that file.
 fn watch_deps(input: &Path) -> Vec<PathBuf> {
-    fn paths_in(src: &str) -> Vec<&str> {
-        let mut out = Vec::new();
-        for (i, _) in src.match_indices('#') {
-            let s = &src[i..];
-            let n = if s.starts_with("#import") { 7 } else if s.starts_with("#include") { 8 } else { continue };
-            if s.as_bytes().get(n).is_some_and(|c| c.is_ascii_alphanumeric() || *c == b'_') {
-                continue;
-            }
-            let Some(path) = s[n..].split('"').nth(1) else { continue };
-            if !path.is_empty() && !path.starts_with('@') && !path.contains('\n') {
-                out.push(path);
-            }
-        }
-        out
-    }
+    let Ok(src) = std::fs::read_to_string(input) else {
+        return Vec::new();
+    };
+    let base = input.parent().unwrap_or(Path::new("."));
     let mut out = Vec::new();
-    let mut layer = vec![input.to_path_buf()];
-    for depth in 0..2 {
-        let mut next = Vec::new();
-        for file in &layer {
-            let Ok(src) = std::fs::read_to_string(file) else { continue };
-            let base = file.parent().unwrap_or(Path::new("."));
-            for rel in paths_in(&src) {
-                let path = base.join(rel);
-                if out.contains(&path) {
-                    continue;
-                }
-                out.push(path.clone());
-                if depth == 0 {
-                    next.push(path);
-                }
-            }
+    for (i, _) in src.match_indices('#') {
+        let s = &src[i..];
+        let n = if s.starts_with("#import") {
+            7
+        } else if s.starts_with("#include") {
+            8
+        } else {
+            continue;
+        };
+        if s.as_bytes().get(n).is_some_and(|c| c.is_ascii_alphanumeric() || *c == b'_') {
+            continue;
         }
-        layer = next;
+        let Some(rel) = s[n..].split('"').nth(1).filter(|p| {
+            !p.is_empty() && !p.starts_with('@') && !p.contains('\n')
+        }) else {
+            continue;
+        };
+        let path = base.join(rel);
+        if !out.contains(&path) {
+            out.push(path);
+        }
     }
     out
 }

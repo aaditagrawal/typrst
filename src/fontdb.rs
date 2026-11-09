@@ -902,35 +902,44 @@ fn cmap12_lookup(t: &[u8], c: u32) -> u32 {
     }
 }
 
-/// Legacy OpenType `kern` version 0, format 0.
-///
-/// Coverage bits (OpenType): 8–15 format, 0 horizontal, 1 minimum,
-/// 2 cross-stream, 3 override. Only horizontal format 0 is applied.
-/// An Apple version-1.0 header or any other format yields an empty map,
-/// so widths stay hmtx-only. A single subtable whose `length` is shorter
-/// than its pairs (Open Sans, Calibri) is read to the end of the table.
+/// Horizontal format-0 pairs. One subtable whose `length` is shorter than
+/// its pairs is read to the end of the table. Any other header is empty.
 fn kern_format0(tab: &[u8]) -> HashMap<(u16, u16), i16> {
     let mut map = HashMap::new();
-    if u16be(tab, 0) != Some(0) {
-        return map;
-    }
     let Some(n_tables) = u16be(tab, 2) else {
         return map;
     };
-    let only = n_tables == 1;
     let mut off = 4usize;
     for _ in 0..n_tables {
-        if off.saturating_add(6) > tab.len() {
-            break;
-        }
         let (Some(length), Some(coverage)) = (u16be(tab, off + 2), u16be(tab, off + 4)) else {
             break;
         };
-        let format = coverage >> 8;
-        let flags = coverage & 0xff;
-        if format == 0 && flags & 0x1 != 0 && flags & 0x6 == 0 {
-            let end = kern_pair_end(tab, off, length as usize, only);
-            read_kern_pairs(tab, off, end, flags & 0x8 != 0, &mut map);
+        if (coverage & 0xFF07) == 1 {
+            let declared = off.saturating_add(length as usize).min(tab.len());
+            let end = match (n_tables == 1, u16be(tab, off + 6)) {
+                (true, Some(n)) => off
+                    .saturating_add(14 + 6 * n as usize)
+                    .min(tab.len())
+                    .max(declared),
+                _ => declared,
+            };
+            if let Some(n) = u16be(tab, off + 6) {
+                let mut p = off + 14;
+                for _ in 0..n {
+                    if p.saturating_add(6) > end {
+                        break;
+                    }
+                    let (Some(left), Some(right), Some(value)) =
+                        (u16be(tab, p), u16be(tab, p + 2), i16be(tab, p + 4))
+                    else {
+                        break;
+                    };
+                    if value != 0 {
+                        map.insert((left, right), value);
+                    }
+                    p += 6;
+                }
+            }
         }
         if length < 6 {
             break;
@@ -938,54 +947,6 @@ fn kern_format0(tab: &[u8]) -> HashMap<(u16, u16), i16> {
         off = off.saturating_add(length as usize);
     }
     map
-}
-
-fn kern_pair_end(tab: &[u8], off: usize, length: usize, only: bool) -> usize {
-    let declared = off.saturating_add(length).min(tab.len());
-    if !only {
-        return declared;
-    }
-    match u16be(tab, off + 6) {
-        Some(n) => off
-            .saturating_add(14 + 6 * n as usize)
-            .min(tab.len())
-            .max(declared),
-        None => declared,
-    }
-}
-
-fn read_kern_pairs(
-    tab: &[u8],
-    off: usize,
-    end: usize,
-    replace: bool,
-    map: &mut HashMap<(u16, u16), i16>,
-) {
-    if off.saturating_add(14) > end {
-        return;
-    }
-    let Some(n) = u16be(tab, off + 6) else {
-        return;
-    };
-    let mut p = off + 14;
-    for _ in 0..n {
-        if p.saturating_add(6) > end {
-            break;
-        }
-        let (Some(left), Some(right), Some(value)) =
-            (u16be(tab, p), u16be(tab, p + 2), i16be(tab, p + 4))
-        else {
-            break;
-        };
-        if replace {
-            map.insert((left, right), value);
-        } else if value != 0 {
-            map.entry((left, right))
-                .and_modify(|slot| *slot = slot.saturating_add(value))
-                .or_insert(value);
-        }
-        p += 6;
-    }
 }
 
 /// Parse cmap (fmt 4 + 12), hmtx, hhea, head, maxp, post, and kern for one face.
@@ -1182,7 +1143,7 @@ pub(crate) fn synth_kern(pairs: &[(u16, u16, i16)]) -> Vec<u8> {
     t.extend(1u16.to_be_bytes());
     t.extend(0u16.to_be_bytes());
     t.extend((sub_len as u16).to_be_bytes());
-    t.extend(0x0001u16.to_be_bytes()); // format 0, horizontal
+    t.extend(0x0001u16.to_be_bytes());
     t.extend(n.to_be_bytes());
     t.extend(0u16.to_be_bytes());
     t.extend(0u16.to_be_bytes());
@@ -1302,7 +1263,6 @@ mod tests {
         assert_eq!(m.char_width('\u{1F600}'), 700.0); // unmappable -> '?'
         assert_eq!(m.ascent(), 800.0);
         assert_eq!(m.descent(), 200.0);
-        // No kern table: the string width is the hmtx sum.
         assert_eq!(m.str_width(1000.0, "A?"), m.char_width('A') + m.char_width('?'));
         fs::remove_dir_all(&dir).ok();
     }
@@ -1338,21 +1298,13 @@ mod tests {
     #[test]
     fn kern_unknown_format_stays_hmtx() {
         assert!(kern_format0(&[]).is_empty());
-        // Apple version 1.0 header is not the legacy table.
         assert!(kern_format0(&0x00010000u32.to_be_bytes()).is_empty());
-        // Format 2 (high byte), horizontal bit set: not read.
-        let mut t = Vec::new();
-        t.extend(0u16.to_be_bytes());
-        t.extend(1u16.to_be_bytes());
-        t.extend(0u16.to_be_bytes());
-        t.extend(14u16.to_be_bytes());
-        t.extend(0x0201u16.to_be_bytes());
-        t.extend(0u16.to_be_bytes());
-        t.extend(0u16.to_be_bytes());
-        t.extend(0u16.to_be_bytes());
-        t.extend(0u16.to_be_bytes());
+        let mut t = [0u8; 18];
+        t[3] = 1;
+        t[7] = 14;
+        t[8] = 0x02;
+        t[9] = 0x01;
         assert!(kern_format0(&t).is_empty());
-        // Format 0 but vertical (horizontal bit clear).
         t[8] = 0;
         t[9] = 0;
         assert!(kern_format0(&t).is_empty());

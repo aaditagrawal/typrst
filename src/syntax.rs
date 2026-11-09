@@ -1628,122 +1628,51 @@ impl<'a> P<'a> {
         !self.bytes.get(s + b.len()).copied().map_or(false, is_ident_cont)
     }
 
-    /// Show-rule body. Same expression language as `rhs`, but a line
-    /// break ends it, so the next line's `*strong*` stays markup.
+    /// Show-rule body. A line break ends it, so the next line's markup stays.
     fn show_rhs(&mut self) -> Option<Rhs> {
-        let mut lhs = self.show_rhs_mul()?;
-        loop {
-            let save = self.pos;
-            self.skip_hspace();
-            let op = match self.peek() {
-                Some(b'+') => ArithOp::Add,
-                Some(b'-') => ArithOp::Sub,
-                _ => {
-                    self.pos = save;
-                    break;
-                }
-            };
-            self.pos += 1;
-            self.skip_hspace();
-            match self.show_rhs_mul() {
-                Some(r) => {
-                    lhs = Rhs::Bin {
-                        lhs: Box::new(lhs),
-                        op,
-                        rhs: Box::new(r),
-                    }
-                }
-                None => {
-                    self.pos = save;
-                    break;
-                }
-            }
-        }
-        Some(lhs)
-    }
-
-    fn show_rhs_mul(&mut self) -> Option<Rhs> {
-        let mut lhs = self.rhs_term()?;
-        loop {
-            let save = self.pos;
-            self.skip_hspace();
-            let op = match self.peek() {
-                Some(b'*') => ArithOp::Mul,
-                Some(b'/') if !matches!(self.at(1), Some(b'/') | Some(b'*')) => ArithOp::Div,
-                _ => {
-                    self.pos = save;
-                    break;
-                }
-            };
-            self.pos += 1;
-            self.skip_hspace();
-            match self.rhs_term() {
-                Some(r) => {
-                    lhs = Rhs::Bin {
-                        lhs: Box::new(lhs),
-                        op,
-                        rhs: Box::new(r),
-                    }
-                }
-                None => {
-                    self.pos = save;
-                    break;
-                }
-            }
-        }
-        Some(lhs)
+        self.fold_rhs(true, false)
     }
 
     /// Right-hand side: `mul-level` terms joined by `+`/`-`, folded left.
     fn rhs(&mut self) -> Option<Rhs> {
-        let mut lhs = self.rhs_mul()?;
-        loop {
-            let save = self.pos;
-            self.skip_ws();
-            let op = match self.peek() {
-                Some(b'+') => ArithOp::Add,
-                Some(b'-') => ArithOp::Sub,
-                _ => {
-                    self.pos = save;
-                    break;
-                }
-            };
-            self.pos += 1;
-            self.skip_ws();
-            match self.rhs_mul() {
-                Some(r) => {
-                    lhs = Rhs::Bin {
-                        lhs: Box::new(lhs),
-                        op,
-                        rhs: Box::new(r),
-                    }
-                }
-                None => {
-                    self.pos = save;
-                    break;
-                }
-            }
-        }
-        Some(lhs)
+        self.fold_rhs(false, false)
     }
 
-    /// `*`/`/` level of an rhs, folded left.
-    fn rhs_mul(&mut self) -> Option<Rhs> {
-        let mut lhs = self.rhs_term()?;
+    fn fold_rhs(&mut self, line: bool, mul: bool) -> Option<Rhs> {
+        let mut lhs = if mul {
+            self.rhs_term()?
+        } else {
+            self.fold_rhs(line, true)?
+        };
         loop {
             let save = self.pos;
-            self.skip_ws();
+            if line {
+                self.skip_hspace();
+            } else {
+                self.skip_ws();
+            }
             let op = match self.peek() {
-                Some(b'*') => ArithOp::Mul,
-                Some(b'/') if !matches!(self.at(1), Some(b'/') | Some(b'*')) => ArithOp::Div,
+                Some(b'+') if !mul => ArithOp::Add,
+                Some(b'-') if !mul => ArithOp::Sub,
+                Some(b'*') if mul => ArithOp::Mul,
+                Some(b'/') if mul && !matches!(self.at(1), Some(b'/') | Some(b'*')) => ArithOp::Div,
                 _ => {
                     self.pos = save;
                     break;
                 }
             };
             self.pos += 1;
-            self.skip_ws();
-            match self.rhs_term() {
+            if line {
+                self.skip_hspace();
+            } else {
+                self.skip_ws();
+            }
+            let next = if mul {
+                self.rhs_term()
+            } else {
+                self.fold_rhs(line, true)
+            };
+            match next {
                 Some(r) => {
                     lhs = Rhs::Bin {
                         lhs: Box::new(lhs),

@@ -165,46 +165,7 @@ enum ShowKind {
     Figure,
 }
 
-/// Slots for the five show targets. Each missing rule is a null check.
-struct ShowSlots {
-    heading: Option<Box<ShowRule>>,
-    strong: Option<Box<ShowRule>>,
-    emph: Option<Box<ShowRule>>,
-    link: Option<Box<ShowRule>>,
-    figure: Option<Box<ShowRule>>,
-}
-
-impl ShowSlots {
-    fn empty() -> Self {
-        Self {
-            heading: None,
-            strong: None,
-            emph: None,
-            link: None,
-            figure: None,
-        }
-    }
-
-    fn get(&self, kind: ShowKind) -> &Option<Box<ShowRule>> {
-        match kind {
-            ShowKind::Heading => &self.heading,
-            ShowKind::Strong => &self.strong,
-            ShowKind::Emph => &self.emph,
-            ShowKind::Link => &self.link,
-            ShowKind::Figure => &self.figure,
-        }
-    }
-
-    fn get_mut(&mut self, kind: ShowKind) -> &mut Option<Box<ShowRule>> {
-        match kind {
-            ShowKind::Heading => &mut self.heading,
-            ShowKind::Strong => &mut self.strong,
-            ShowKind::Emph => &mut self.emph,
-            ShowKind::Link => &mut self.link,
-            ShowKind::Figure => &mut self.figure,
-        }
-    }
-}
+type ShowSlots = [Option<Box<ShowRule>>; 5];
 
 struct Ev<'e, 'a> {
     st: Styles,
@@ -250,7 +211,7 @@ struct Ev<'e, 'a> {
     /// User-function recursion depth. Calls error at 64.
     fn_depth: u32,
     /// Active show rules. `None` until the first rule, so a document
-    /// with no `#show` does not allocate the map or take an extra walk.
+    /// with no `#show` does not allocate the slots or take an extra walk.
     show_rules: Option<Box<ShowSlots>>,
 }
 
@@ -537,7 +498,7 @@ impl<'e, 'a> Ev<'e, 'a> {
                 let f = self.vary(st.font, Some(true), None, None);
                 let styled = with_font(st, f);
                 if self.has_show(ShowKind::Strong) {
-                    self.apply_show_owned(ShowKind::Strong, ch, styled, out);
+                    self.apply_show(ShowKind::Strong, ch, styled, out);
                 } else {
                     self.eat_styled(ch, styled, out);
                 }
@@ -547,7 +508,7 @@ impl<'e, 'a> Ev<'e, 'a> {
                 let f = self.vary(st.font, None, Some(true), None);
                 let styled = with_font(st, f);
                 if self.has_show(ShowKind::Emph) {
-                    self.apply_show_owned(ShowKind::Emph, ch, styled, out);
+                    self.apply_show(ShowKind::Emph, ch, styled, out);
                 } else {
                     self.eat_styled(ch, styled, out);
                 }
@@ -565,7 +526,7 @@ impl<'e, 'a> Ev<'e, 'a> {
                 let mut c = Vec::new();
                 let st = self.cur();
                 if self.has_show(ShowKind::Heading) {
-                    self.apply_show_owned(ShowKind::Heading, body, st, &mut c);
+                    self.apply_show(ShowKind::Heading, body, st, &mut c);
                 } else {
                     self.eat_styled(body, st, &mut c);
                 }
@@ -601,7 +562,7 @@ impl<'e, 'a> Ev<'e, 'a> {
                     let f = self.vary(st.font, Some(true), None, None);
                     let styled = with_font(st, f);
                     if self.has_show(ShowKind::Strong) {
-                        self.apply_show_owned(ShowKind::Strong, ch, styled, out);
+                        self.apply_show(ShowKind::Strong, ch, styled, out);
                     } else {
                         self.eat_styled(ch, styled, out);
                     }
@@ -610,7 +571,7 @@ impl<'e, 'a> Ev<'e, 'a> {
                     let f = self.vary(st.font, None, Some(true), None);
                     let styled = with_font(st, f);
                     if self.has_show(ShowKind::Emph) {
-                        self.apply_show_owned(ShowKind::Emph, ch, styled, out);
+                        self.apply_show(ShowKind::Emph, ch, styled, out);
                     } else {
                         self.eat_styled(ch, styled, out);
                     }
@@ -757,7 +718,7 @@ impl<'e, 'a> Ev<'e, 'a> {
                 let f = self.vary(st.font, Some(true), None, None);
                 let styled = with_font(st, f);
                 if self.has_show(ShowKind::Strong) {
-                    self.apply_show_ref(ShowKind::Strong, ch, styled, out);
+                    self.apply_show(ShowKind::Strong, ch.to_vec(), styled, out);
                 } else {
                     inlines(ch, styled, out, self);
                 }
@@ -767,7 +728,7 @@ impl<'e, 'a> Ev<'e, 'a> {
                 let f = self.vary(st.font, None, Some(true), None);
                 let styled = with_font(st, f);
                 if self.has_show(ShowKind::Emph) {
-                    self.apply_show_ref(ShowKind::Emph, ch, styled, out);
+                    self.apply_show(ShowKind::Emph, ch.to_vec(), styled, out);
                 } else {
                     inlines(ch, styled, out, self);
                 }
@@ -785,7 +746,7 @@ impl<'e, 'a> Ev<'e, 'a> {
                 let mut c = Vec::new();
                 let st = self.cur();
                 if self.has_show(ShowKind::Heading) {
-                    self.apply_show_ref(ShowKind::Heading, body, st, &mut c);
+                    self.apply_show(ShowKind::Heading, body.to_vec(), st, &mut c);
                 } else {
                     inlines(body, st, &mut c, self);
                 }
@@ -879,14 +840,11 @@ impl<'e, 'a> Ev<'e, 'a> {
         self.with_scope(|this| this.frame_body(nodes, st, out))
     }
 
-    /// Missing rule: one null check when the document has no show rules,
-    /// and one null check on the target slot otherwise.
     #[inline(always)]
     fn has_show(&self, kind: ShowKind) -> bool {
-        let Some(slots) = self.show_rules.as_ref() else {
-            return false;
-        };
-        slots.get(kind).is_some()
+        self.show_rules
+            .as_ref()
+            .is_some_and(|s| s[kind as usize].is_some())
     }
 
     fn install_show(&mut self, target: &str, param: &str, body: &Rhs) {
@@ -904,60 +862,62 @@ impl<'e, 'a> Ev<'e, 'a> {
         });
         let slots = self
             .show_rules
-            .get_or_insert_with(|| Box::new(ShowSlots::empty()));
-        *slots.get_mut(kind) = Some(rule);
+            .get_or_insert_with(|| Box::new([None, None, None, None, None]));
+        slots[kind as usize] = Some(rule);
     }
 
     fn take_show(&mut self, kind: ShowKind) -> Option<Box<ShowRule>> {
-        self.show_rules.as_mut()?.get_mut(kind).take()
+        self.show_rules.as_mut()?.get_mut(kind as usize)?.take()
     }
 
     /// Put the rule back unless the body installed a replacement.
     fn put_show(&mut self, kind: ShowKind, rule: Box<ShowRule>) {
-        let Some(slots) = self.show_rules.as_mut() else {
+        let Some(slot) = self
+            .show_rules
+            .as_mut()
+            .and_then(|s| s.get_mut(kind as usize))
+        else {
             return;
         };
-        let cell = slots.get_mut(kind);
-        if cell.is_none() {
-            *cell = Some(rule);
+        if slot.is_none() {
+            *slot = Some(rule);
         }
     }
 
-    /// Evaluate `rule` with `param` bound to `nodes`. The rule is taken
-    /// out for the duration so it does not apply to its own output.
-    fn apply_show_owned(
+    /// Bind `param` to `nodes` and run `body`. The rule stays taken for the
+    /// call, so it does not apply to its own output.
+    fn bind_show<T>(
         &mut self,
         kind: ShowKind,
+        rule: Box<ShowRule>,
         nodes: Vec<Node>,
-        st: TextStyle,
-        out: &mut Vec<Inline>,
-    ) {
+        body: impl FnOnce(&mut Self, &Rhs) -> T,
+    ) -> T {
+        let v = self.with_scope(|this| {
+            this.bind(rule.param.clone(), Value::Content(nodes));
+            body(this, &rule.body)
+        });
+        self.put_show(kind, rule);
+        v
+    }
+
+    fn apply_show(&mut self, kind: ShowKind, nodes: Vec<Node>, st: TextStyle, out: &mut Vec<Inline>) {
         let Some(rule) = self.take_show(kind) else {
             inlines(&nodes, st, out, self);
             return;
         };
-        self.with_scope(|this| {
-            this.bind(rule.param.clone(), Value::Content(nodes));
-            this.exec_user_body(&rule.body, Some(st), out);
+        self.bind_show(kind, rule, nodes, |this, body| {
+            this.exec_user_body(body, Some(st), out);
         });
-        self.put_show(kind, rule);
     }
 
-    fn apply_show_ref(&mut self, kind: ShowKind, nodes: &[Node], st: TextStyle, out: &mut Vec<Inline>) {
-        self.apply_show_owned(kind, nodes.to_vec(), st, out);
-    }
-
-    /// Figure body: the rule's content becomes the figure's blocks.
     fn apply_show_blocks(&mut self, nodes: Vec<Node>) -> Vec<Block> {
         let Some(rule) = self.take_show(ShowKind::Figure) else {
             return self.capture_blocks(&nodes);
         };
-        let blocks = self.with_scope(|this| {
-            this.bind(rule.param.clone(), Value::Content(nodes));
-            this.show_rule_blocks(&rule.body)
-        });
-        self.put_show(ShowKind::Figure, rule);
-        blocks
+        self.bind_show(ShowKind::Figure, rule, nodes, |this, body| {
+            this.show_rule_blocks(body)
+        })
     }
 
     fn show_rule_blocks(&mut self, body: &Rhs) -> Vec<Block> {
@@ -1685,7 +1645,7 @@ impl<'e, 'a> Ev<'e, 'a> {
                     let f = self.vary(st.font, Some(true), None, None);
                     let styled = with_font(st, f);
                     if self.has_show(ShowKind::Strong) {
-                        self.apply_show_ref(ShowKind::Strong, c, styled, out);
+                        self.apply_show(ShowKind::Strong, c.to_vec(), styled, out);
                     } else {
                         self.scoped_inlines(c, styled, out);
                     }
@@ -1697,7 +1657,7 @@ impl<'e, 'a> Ev<'e, 'a> {
                     let f = self.vary(st.font, None, Some(true), None);
                     let styled = with_font(st, f);
                     if self.has_show(ShowKind::Emph) {
-                        self.apply_show_ref(ShowKind::Emph, c, styled, out);
+                        self.apply_show(ShowKind::Emph, c.to_vec(), styled, out);
                     } else {
                         self.scoped_inlines(c, styled, out);
                     }
@@ -1783,7 +1743,8 @@ impl<'e, 'a> Ev<'e, 'a> {
     }
 
     /// `#link(url)[text]` / `#link(url, [text])`. No url is an error and
-    /// the content is emitted as plain inline text.
+    /// the content is emitted as plain inline text. A show rule replaces
+    /// the visible content and keeps the url.
     fn do_link(
         &mut self,
         args: &[Arg],
@@ -1791,16 +1752,15 @@ impl<'e, 'a> Ev<'e, 'a> {
         st: TextStyle,
         out: &mut Vec<Inline>,
     ) {
-        if self.has_show(ShowKind::Link) {
-            self.link_shown(args, content, st, out);
-            return;
-        }
+        let shown = self.has_show(ShowKind::Link);
         let mut url: Option<String> = None;
+        let mut nodes = Vec::new();
         let mut body = Vec::new();
         for a in args {
             match a.name.as_deref() {
                 None => match &a.value {
                     Value::Str(s) if url.is_none() => url = Some(s.clone()),
+                    Value::Content(ns) if shown => nodes.extend(ns.iter().cloned()),
                     Value::Content(ns) => self.scoped_inlines(ns, st, &mut body),
                     Value::Str(_) => self.diag(Severity::Warning, "extra link url ignored"),
                     _ => self.diag(Severity::Warning, "link argument ignored"),
@@ -1815,51 +1775,15 @@ impl<'e, 'a> Ev<'e, 'a> {
             }
         }
         if let Some(c) = content {
-            self.scoped_inlines(c, st, &mut body);
-        }
-        match url {
-            Some(u) if !u.is_empty() => {
-                out.push(Inline::Link(Box::new(LinkRun { url: u, content: body })))
-            }
-            _ => {
-                self.diag(Severity::Error, "#link expects a url");
-                out.append(&mut body);
+            if shown {
+                nodes.extend(c.iter().cloned());
+            } else {
+                self.scoped_inlines(c, st, &mut body);
             }
         }
-    }
-
-    /// Same as `do_link`, but the visible content is the show-rule result.
-    fn link_shown(
-        &mut self,
-        args: &[Arg],
-        content: Option<&[Node]>,
-        st: TextStyle,
-        out: &mut Vec<Inline>,
-    ) {
-        let mut url: Option<String> = None;
-        let mut nodes = Vec::new();
-        for a in args {
-            match a.name.as_deref() {
-                None => match &a.value {
-                    Value::Str(s) if url.is_none() => url = Some(s.clone()),
-                    Value::Content(ns) => nodes.extend(ns.iter().cloned()),
-                    Value::Str(_) => self.diag(Severity::Warning, "extra link url ignored"),
-                    _ => self.diag(Severity::Warning, "link argument ignored"),
-                },
-                Some("dest") | Some("url") => match &a.value {
-                    Value::Str(s) => url = Some(s.clone()),
-                    _ => self.diag(Severity::Warning, "link url expects a string"),
-                },
-                Some(other) => {
-                    self.diag(Severity::Warning, format!("link argument '{other}' ignored"))
-                }
-            }
+        if shown {
+            self.apply_show(ShowKind::Link, nodes, st, &mut body);
         }
-        if let Some(c) = content {
-            nodes.extend(c.iter().cloned());
-        }
-        let mut body = Vec::new();
-        self.apply_show_owned(ShowKind::Link, nodes, st, &mut body);
         match url {
             Some(u) if !u.is_empty() => {
                 out.push(Inline::Link(Box::new(LinkRun { url: u, content: body })))
@@ -2150,7 +2074,7 @@ impl<'e, 'a> Ev<'e, 'a> {
                 let f = self.vary(st.font, Some(true), None, None);
                 let styled = with_font(st, f);
                 if self.has_show(ShowKind::Strong) {
-                    self.apply_show_ref(ShowKind::Strong, ch, styled, out);
+                    self.apply_show(ShowKind::Strong, ch.to_vec(), styled, out);
                     false
                 } else {
                     self.frame_body(ch, styled, out)
@@ -2160,7 +2084,7 @@ impl<'e, 'a> Ev<'e, 'a> {
                 let f = self.vary(st.font, None, Some(true), None);
                 let styled = with_font(st, f);
                 if self.has_show(ShowKind::Emph) {
-                    self.apply_show_ref(ShowKind::Emph, ch, styled, out);
+                    self.apply_show(ShowKind::Emph, ch.to_vec(), styled, out);
                     false
                 } else {
                     self.frame_body(ch, styled, out)
@@ -3373,7 +3297,7 @@ fn inlines(nodes: &[Node], st: TextStyle, out: &mut Vec<Inline>, cx: &mut Ev) {
                 let f = cx.vary(st.font, Some(true), None, None);
                 let styled = with_font(st, f);
                 if cx.has_show(ShowKind::Strong) {
-                    cx.apply_show_ref(ShowKind::Strong, ch, styled, out);
+                    cx.apply_show(ShowKind::Strong, ch.to_vec(), styled, out);
                 } else {
                     inlines(ch, styled, out, cx);
                 }
@@ -3382,7 +3306,7 @@ fn inlines(nodes: &[Node], st: TextStyle, out: &mut Vec<Inline>, cx: &mut Ev) {
                 let f = cx.vary(st.font, None, Some(true), None);
                 let styled = with_font(st, f);
                 if cx.has_show(ShowKind::Emph) {
-                    cx.apply_show_ref(ShowKind::Emph, ch, styled, out);
+                    cx.apply_show(ShowKind::Emph, ch.to_vec(), styled, out);
                 } else {
                     inlines(ch, styled, out, cx);
                 }
@@ -3457,7 +3381,7 @@ fn inline_expr(e: &Expr, st: TextStyle, out: &mut Vec<Inline>, cx: &mut Ev) {
                     let f = cx.vary(st.font, Some(true), None, None);
                     let styled = with_font(st, f);
                     if cx.has_show(ShowKind::Strong) {
-                        cx.apply_show_ref(ShowKind::Strong, c, styled, out);
+                        cx.apply_show(ShowKind::Strong, c.to_vec(), styled, out);
                     } else {
                         cx.scoped_inlines(c, styled, out);
                     }
@@ -3468,7 +3392,7 @@ fn inline_expr(e: &Expr, st: TextStyle, out: &mut Vec<Inline>, cx: &mut Ev) {
                     let f = cx.vary(st.font, None, Some(true), None);
                     let styled = with_font(st, f);
                     if cx.has_show(ShowKind::Emph) {
-                        cx.apply_show_ref(ShowKind::Emph, c, styled, out);
+                        cx.apply_show(ShowKind::Emph, c.to_vec(), styled, out);
                     } else {
                         cx.scoped_inlines(c, styled, out);
                     }
